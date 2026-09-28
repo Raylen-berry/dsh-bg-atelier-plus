@@ -30,20 +30,20 @@ const ROUTE_PREFIX = '/bga/wallpapers'
 // 两对贝利尔的基线：内容 sha256。
 // 旧名是 2026-09-08 那批、`2` 名是 09-14 改名时**拷贝**出来的（不是 move）⇒ 磁盘上曾并存两份同样字节。
 // 基线修订（2026-09-23，用户确认删名）：旧名 `贝利尔.png` 已在后续清理中删除，全盘 dedup 复查
-// （dedup-hardlink --pairs）确认再无同内容组；只剩 `贝利尔2.png` 一个名字。于是这里收敛为单名，
+// （dedup-hardlink --pairs）确认再无同内容组；只剩 `贝丽尔2.png` 一个名字。于是这里收敛为单名，
 // sha256/大小仍按原基线校验（内容没被动过），inode/nlink 类断言只对现存名字成立。
 const PAIRS = [
   {
     label: '高清/贝利尔',
     sha256: 'b725b8a3de22231df39ad7acaa1b711d5d7b0e7c280ac3156c1a089fb42859ec',
     bytes: 52738200,
-    names: ['高清/贝利尔2.png'],
+    names: ['高清/贝丽尔2.png'],
   },
   {
     label: '重返未来1999/贝利尔',
     sha256: 'febf88f66dc55b22d4db2603b96313826cbd5e857fdcda0ef911034875ddc30f',
     bytes: 4268873,
-    names: ['重返未来1999/贝利尔2.png'],
+    names: ['重返未来1999/贝丽尔2.png'],
   },
 ]
 
@@ -79,13 +79,13 @@ if (!haveWallpapers) {
   // 清单路径缺失 + 20 张未登记新图 ⇒ 全量必然不绿，那不是本套要守的回归）。这里只守贝利尔：
   // 它们在清单里、在磁盘上、sha256 没变 —— 去重/清理绝不允许悄悄弄坏清单在用的那份。
   const v = verifyLocal(ROOT)
-  for (const p of ['高清/贝利尔2.png', '重返未来1999/贝利尔2.png']) {
+  for (const p of ['高清/贝丽尔2.png', '重返未来1999/贝丽尔2.png']) {
     ok('清单内且在盘上: ' + p, !v.missing.includes(p) && !v.bad.includes(p),
       'missing=' + v.missing.join(',') + ' bad=' + v.bad.join(','))
   }
   if (manifest) {
     const paths = manifest.items.map((i) => i.path)
-    for (const p of ['高清/贝利尔2.png', '重返未来1999/贝利尔2.png']) {
+    for (const p of ['高清/贝丽尔2.png', '重返未来1999/贝丽尔2.png']) {
       ok('清单含 ' + p, paths.includes(p))
     }
     // 清单里**不该**有旧名：旧名是磁盘遗留，不是清单条目（否则就是 39 项里混进了重复计数）。
@@ -183,7 +183,7 @@ if (!haveWallpapers) {
   }
 
   // 旧格式（根目录名兜底查找）也要能找到现存名字 —— 老版本 URL 靠这条活着。
-  for (const rel of ['高清/贝利尔2.png', '重返未来1999/贝利尔2.png']) {
+  for (const rel of ['高清/贝丽尔2.png', '重返未来1999/贝丽尔2.png']) {
     const name = rel.split('/')[1]
     const want = PAIRS.map((p) => p.bytes)
     const r = await request(ROUTE_PREFIX + '/' + encodeURIComponent(name))

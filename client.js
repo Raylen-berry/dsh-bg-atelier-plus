@@ -134,6 +134,7 @@ var STORE = {
   total: 0,         // 全部类型图片总数
   listeners: [],
   set: function (patch) {
+    patch = migrateWallpaperNames(patch)
     // 清空或其它入口直接指定底图时，取消仍在解码的旧请求，防止稍后又盖回来。
     if (Object.prototype.hasOwnProperty.call(patch, 'wallpaper') || patch.weId) cancelWallpaperRequest()
     if (patch.wallpaper === null) decodedWallpaper=null
@@ -260,6 +261,41 @@ var pendingStep = null
 var queuedSwap = null
 var decodeJob = null
 var decodedWallpaper = null
+
+// 只迁移明确更名的图片引用，不改图单名称或多人组合图名。
+var WALLPAPER_RENAMES = []
+;['重返未来1999', '高清'].forEach(function (cat) {
+  ;['2', '5', '6'].forEach(function (n) { WALLPAPER_RENAMES.push([cat, '贝利尔'+n+'.png', '贝丽尔'+n+'.png']) })
+  WALLPAPER_RENAMES.push([cat, '以影像之2.png', '以影相之2.png'])
+})
+WALLPAPER_RENAMES.push(['重返未来1999', '维拉.png', '维拉2.png'])
+function migrateWallpaperNames(patch) {
+  var result = Object.assign({}, patch)
+  function ref(value) {
+    if (typeof value !== 'string') return value
+    WALLPAPER_RENAMES.forEach(function (entry) {
+      var cat=entry[0], old=entry[1], name=entry[2]
+      if (value === cat+'\0'+old) value=cat+'\0'+name
+      else if (value === '/bga/wallpapers/'+encodeURIComponent(cat)+'/'+encodeURIComponent(old)) value='/bga/wallpapers/'+encodeURIComponent(cat)+'/'+encodeURIComponent(name)
+    })
+    return value
+  }
+  if (patch.wallpaper) {
+    var w=patch.wallpaper
+    var entry=WALLPAPER_RENAMES.find(function (e) { return w.id===e[0]+'\0'+e[1] || w.url==='/bga/wallpapers/'+encodeURIComponent(e[0])+'/'+encodeURIComponent(e[1]) })
+    if (entry) result.wallpaper=Object.assign({},w,{id:entry[0]+'\0'+entry[2],cat:entry[0],file:entry[2],name:entry[2].slice(0,-4),url:'/bga/wallpapers/'+encodeURIComponent(entry[0])+'/'+encodeURIComponent(entry[2])})
+  }
+  if (Array.isArray(patch.playlists)) result.playlists=patch.playlists.map(function(p){return p&&Array.isArray(p.items)?Object.assign({},p,{items:p.items.map(ref)}):p})
+  if (Array.isArray(patch.recent)) result.recent=patch.recent.map(ref)
+  if (patch.imageFraming && typeof patch.imageFraming==='object') {
+    var map=Object.create(null)
+    Object.keys(patch.imageFraming).forEach(function(key){map[ref(key)]=patch.imageFraming[key]})
+    // 新旧引用同时存在时，优先保留新名字上已经调好的构图。
+    Object.keys(patch.imageFraming).forEach(function(key){if(ref(key)===key)map[key]=patch.imageFraming[key]})
+    result.imageFraming=map
+  }
+  return result
+}
 function cancelWallpaperRequest() {
   swapSeq++
   pendingStep = null
@@ -429,6 +465,7 @@ function canPreviousWallpaper() {
 }
 function previousWallpaper() { if(!STORE.state.weId&&!weActive())historyStep(-1) }
 function setWallpaper(item, navigation) {
+  if (wallpaperBackgrounded()) return
   navigation=navigation||{}
   // 时长在点击当下决定，不能把图片解码耗时算成用户的点击间隔。
   var timing=navigation.timing || (navigation.automatic ? normalFadeTiming() : manualFadeTiming())
@@ -449,7 +486,7 @@ function setWallpaper(item, navigation) {
   pumpWallpaperRequest()
 }
 function commitWallpaper(request, img) {
-  if(request.seq!==swapSeq)return
+  if(request.seq!==swapSeq || wallpaperBackgrounded())return
   var w=request.wallpaper,navigation=request.navigation
   if(navigation.source&&(navigation.source!==STORE.state.playbackSource||!sourceItems(navigation.source).some(function(it){return it.id===w.id}))){pendingStep=null;return}
   recordWallpaper(w.id,navigation.historyIndex)
@@ -460,7 +497,7 @@ function commitWallpaper(request, img) {
   decodedWallpaper=img?{url:w.url,img:img}:null
 }
 function pumpWallpaperRequest() {
-  if(decodeJob||!queuedSwap)return
+  if(wallpaperBackgrounded()||decodeJob||!queuedSwap)return
   // 当前画面还在过渡时，先完成并提速这段；之后只加载最新目标。
   // 这样大预览、STORE 与保存也不会追着每张尚未显示的图重绘。
   if(fadeEl&&STORE.state.fadeOn!==false&&!reducedMotion())return
@@ -602,11 +639,12 @@ function buildCycleDeck(ids) {
 }
 
 function cycleWallpaper(options) {
-  if (STORE.state.weId || weActive()) return
+  if (wallpaperBackgrounded() || STORE.state.weId || weActive()) return
+  var epoch = wallpaperEpoch
   var timing=options&&options.automatic===true ? normalFadeTiming() : manualFadeTiming()
   if(historyStep(1,timing))return
   function step(items) {
-    if (STORE.state.weId || weActive()) return
+    if (epoch !== wallpaperEpoch || wallpaperBackgrounded() || STORE.state.weId || weActive()) return
     items = sourceItems(STORE.state.playbackSource, items)
     if (!items.length) return
     var cur = STORE.state.wallpaper
@@ -657,6 +695,56 @@ function cycleWallpaper(options) {
 // 不会正好撞上刚走完的旧表被自动切换立刻换走(用户 2026-09-28 报的"我换到满意的又给我闪走")。
 var autoTimer = 0
 var autoSig = ''
+var autoGeneration = 0
+var wallpaperSuspended = false
+var wallpaperEpoch = 0
+
+function wallpaperBackgrounded() {
+  return wallpaperSuspended || (typeof document !== 'undefined' && document.hidden === true)
+}
+
+// 后台的 rAF/解码/定时器可以各自停在不同位置。丢弃未上屏工作，收拢到最后一张
+// 已成功提交的图；恢复时只重画这一张、重新计时，绝不补播离开期间的次数。
+function suspendWallpapers(suspended) {
+  if (wallpaperSuspended === suspended) return
+  wallpaperSuspended = suspended
+  wallpaperEpoch++
+  cancelWallpaperRequest()
+  fadeStop()
+  lastManualFadeAt = null
+  selectionFade = null
+  shownUrl = bgUrlOnScreen(STORE.state)
+  shownFrame = framingForUrl(STORE.state, shownUrl)
+  if (paintBackground) paintBackground(!suspended)
+  armAuto(true)
+}
+
+function watchWallpaperVisibility() {
+  var hidden = function () { suspendWallpapers(true) }
+  var visible = function () { suspendWallpapers(document.hidden === true || (typeof document.hasFocus === 'function' && !document.hasFocus())) }
+  document.addEventListener('visibilitychange', visible)
+  document.addEventListener('freeze', hidden)
+  document.addEventListener('resume', visible)
+  if (window.addEventListener) {
+    window.addEventListener('blur', hidden)
+    window.addEventListener('focus', visible)
+    window.addEventListener('pagehide', hidden)
+    window.addEventListener('pageshow', visible)
+  }
+  visible()
+  return function () {
+    document.removeEventListener('visibilitychange', visible)
+    document.removeEventListener('freeze', hidden)
+    document.removeEventListener('resume', visible)
+    if (window.removeEventListener) {
+      window.removeEventListener('blur', hidden)
+      window.removeEventListener('focus', visible)
+      window.removeEventListener('pagehide', hidden)
+      window.removeEventListener('pageshow', visible)
+    }
+    suspendWallpapers(true)
+  }
+}
 
 /** 间隔档位(分钟), **不平均**刻度。用户 2026-09-28 要求: 1..120 一档一分钟的均匀刻度里,
  *  最常改的 1–10 分钟只占 8% 行程, 拖着点不准; 换成"等距滑杆 + 查表"后每档行程一样宽,
@@ -683,17 +771,21 @@ function autoDelayMs() {
 
 /** 起/停定时器; force=true 时无条件重置(自动换图那一次用, 它自己先把 timer 置了 0)。 */
 function armAuto(force) {
-  var on = STORE.state.autoOn === true
+  var on = STORE.state.autoOn === true && !wallpaperBackgrounded()
   var sig = on ? String(autoDelayMs()) + ':' + STORE.state.playbackSource : ''
   if (!force && sig === autoSig) return
   autoSig = sig
+  var generation = ++autoGeneration
   if (autoTimer) { clearTimeout(autoTimer); autoTimer = 0 }
-  if (on) autoTimer = setTimeout(autoTick, autoDelayMs())
+  if (on) autoTimer = setTimeout(function () { autoTick(generation) }, autoDelayMs())
 }
 
-function autoTick() {
+function autoTick(generation) {
+  if ((generation !== undefined && generation !== autoGeneration) || wallpaperBackgrounded() || STORE.state.autoOn !== true) return
   autoTimer = 0
-  try { cycleWallpaper({automatic:true}) } catch (e) { console.error('[bg-atelier] auto cycle failed: ' + String(e)) }
+  try {
+    if (!decodeJob && !queuedSwap && !fadeEl) cycleWallpaper({automatic:true})
+  } catch (e) { console.error('[bg-atelier] auto cycle failed: ' + String(e)) }
   armAuto(true)   // 重新起表: 换图失败/池子为空也不该让自动切换悄悄停掉
 }
 
@@ -888,7 +980,12 @@ function fadeSweep() {
     pumpWallpaperRequest()
     return
   }
-  fadeTimer = setTimeout(fadeSweep, 100)
+  scheduleFadeSweep(100)
+}
+
+function scheduleFadeSweep(ms) {
+  var layer = fadeEl
+  fadeTimer = setTimeout(function () { if (fadeEl === layer) { fadeTimer = 0; fadeSweep() } }, ms)
 }
 
 /** 渐变时长 ms。坏值兜 900(默认手感), 并钳到 100..5000 —— 0 会让 transition 变成一个 tick 的硬切。
@@ -920,8 +1017,9 @@ function armFadeTimers(ms) {
   if(fadeBusyTimer)clearTimeout(fadeBusyTimer)
   if(fadeTimer)clearTimeout(fadeTimer)
   fadeBusy=true
-  fadeBusyTimer=setTimeout(function(){fadeBusyTimer=0;fadeBusy=false},ms)
-  fadeTimer=setTimeout(fadeSweep,ms+50)
+  var layer=fadeEl
+  fadeBusyTimer=setTimeout(function(){if(fadeEl===layer){fadeBusyTimer=0;fadeBusy=false}},ms)
+  scheduleFadeSweep(ms+50)
 }
 function writeFadeOpacity(motion, opacity, transition) {
   var layer=motion.layer
@@ -1044,7 +1142,7 @@ function fadeRun(s, prevUrl, prevFrame, timing) {
 function switchFade(prevUrl, url, timing) {
   timing=timing||(selectionFade&&selectionFade.wallpaper===STORE.state.wallpaper&&selectionFade.wallpaper.url===url?selectionFade.timing:normalFadeTiming())
   if (shownUrl === null) { shownUrl = prevUrl;shownFrame=framingForUrl(STORE.state,prevUrl) }
-  if (!url || !shownUrl || STORE.state.fadeOn === false || reducedMotion()) {
+  if (wallpaperBackgrounded() || !url || !shownUrl || STORE.state.fadeOn === false || reducedMotion()) {
     fadeStop()
     shownUrl = url
     shownFrame = framingForUrl(STORE.state,url)
@@ -1637,7 +1735,7 @@ function PlaybackPanel() {
       h('p',{className:'bga-muted'},s.playbackMode==='ordered'?'按图单排列顺序循环；文件夹按图库顺序播放。':'随机播放，同轮内尽量不重复。'),
       TinySwitch('自动轮播',s.autoOn===true,function(v){STORE.set({autoOn:v})}),
       h('fieldset',{className:'bga-control-grid',disabled:!s.autoOn},Slider('切换间隔',s.autoMin,1,120,function(v){STORE.set({autoMin:v})},'min',AUTO_STOPS)),
-      h('p',{className:'bga-muted'},'手动换图后，会重新计算轮播间隔。')),
+      h('p',{className:'bga-muted'},'手动换图后重新计时；后台暂停，回到前台后重新计算完整间隔。')),
     Section('渐变',null,TinySwitch('渐变切换',s.fadeOn!==false,function(v){STORE.set({fadeOn:v})}),
       h('fieldset',{className:'bga-control-grid',disabled:s.fadeOn===false},
         Slider('开始前等待',s.fadeDelayMs,0,1000,function(v){STORE.set({fadeDelayMs:v})},'ms'),
@@ -2328,7 +2426,9 @@ function apply(ctx) {
       if (el.textContent !== css) el.textContent = css
       return el
     }
-    function rebuildBackground() {
+    function rebuildBackground(force) {
+      // 恢复窗口时重建底图节点，让 Chromium 重新提交可能已回收的合成层。
+      if (force && bgEl) { if(bgEl.parentNode)bgEl.parentNode.removeChild(bgEl); bgEl = null }
       bgEl = updateStyle(bgEl, backgroundCss(STORE.state, renderedBgUrl(), renderedBgFrame()), 'data-bg-atelier-background')
     }
     function rebuildStyle() {
@@ -2394,6 +2494,8 @@ function apply(ctx) {
         autoSig = ''
       }
     }, 'bga-watch')
+
+    ctx.effect(watchWallpaperVisibility, 'bga-visibility')
 
     // WE 动效层的出现/消失要重建动态样式与 token (为什么: 见 WE_LAYER 上方的注释)
     ctx.effect(function () {

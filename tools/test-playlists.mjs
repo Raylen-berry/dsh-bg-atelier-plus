@@ -130,6 +130,21 @@ reads={};await S.load()
 assert.ok(S.saveStatus!=='load-error','fresh empty settings remain usable')
 console.log('PASS restoration / serialized writes / latest data wins / save failure and retry / fresh install')
 
+// Renaming a local image must preserve references in saved collections and framing.
+for(const [cat,old,name] of [['高清','贝利尔2','贝丽尔2'],['重返未来1999','以影像之2','以影相之2'],['重返未来1999','维拉','维拉2']]) {
+  const oldId=cat+'\0'+old+'.png',id=cat+'\0'+name+'.png'
+  const url=n=>'/bga/wallpapers/'+encodeURIComponent(cat)+'/'+encodeURIComponent(n+'.png')
+  reads={wallpaper:{id:oldId,cat,file:old+'.png',name:old,url:url(old),hd:cat==='高清'},
+    playlists:[{id:'favorites',name:'我喜欢',items:[oldId,id]},{id:'multi',name:'贝利尔与艾吉奥Apple',items:['高清\0艾吉奥Apple.png']}],
+    recent:[oldId,id],imageFraming:{[oldId]:{zoom:1.3,focus:'20% 50%'},[id]:{zoom:1.5,focus:'40% 60%'}}}
+  await S.load()
+  assert.equal(S.state.wallpaper.id,id);assert.equal(S.state.wallpaper.url,url(name));assert.equal(S.state.wallpaper.name,name)
+  assert.deepEqual(plain(S.state.playlists[0].items),[id]);assert.deepEqual(plain(S.state.recent),[id])
+  assert.equal(S.state.playlists[1].name,'贝利尔与艾吉奥Apple');assert.equal(S.state.playlists[1].items[0],'高清\0艾吉奥Apple.png')
+  assert.equal(S.state.imageFraming[id].zoom,1.5);assert.equal(S.state.imageFraming[oldId],undefined)
+}
+console.log('PASS renamed wallpaper references migrate on load; favorites, recent, framing and multi-character names preserved')
+
 // Exercise the actual host handler with a realistic collection bigger than the old 8 KB cap.
 const tempRoot=fs.mkdtempSync(path.join(os.tmpdir(),'bga-playlist-settings-'))
 const previousHome=process.env.DSH_HOME

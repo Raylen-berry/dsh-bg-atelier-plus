@@ -183,10 +183,10 @@ try {
   for(let i=0;i<45;i++){await page.evaluate(()=>document.getElementById('manual-next').click());await page.waitForTimeout(14)}
   assert.equal(await page.evaluate(el=>el.isConnected,burstLayer),false,'continuous clicks must allow the current transition to finish')
   await page.waitForFunction(()=>!api.wallpaperRequestPending()&&api.renderedBgUrl()===api.STORE.state.wallpaper.url&&!document.querySelector('[data-bg-atelier-fade]'),null,{timeout:1400})
-  await page.evaluate(()=>api.autoTick())
+  await page.evaluate(()=>{api.STORE.set({autoOn:true});api.autoTick()})
   await page.waitForFunction(()=>api.fadeMotionStatus()?.started)
   assert.equal(await page.evaluate(()=>api.fadeMotionStatus().duration),2800,'automatic transition cannot inherit manual fast mode')
-  await page.evaluate(()=>api.STORE.set({fadeOn:false}))
+  await page.evaluate(()=>api.STORE.set({fadeOn:false,autoOn:false}))
   await page.waitForTimeout(1600)
   await page.evaluate(()=>api.STORE.set({fadeOn:true,fadeDelayMs:800}))
   await page.locator('#manual-next').click()
@@ -230,6 +230,66 @@ try {
   await page.waitForFunction(()=>!api.wallpaperRequestPending()&&api.renderedBgUrl()===api.STORE.state.wallpaper.url&&!document.querySelector('[data-bg-atelier-fade]'),null,{timeout:1400})
   await page.evaluate(()=>delete document.body.getAnimations)
   console.log('PASS real CSS fallback preserves alpha and finishes when animation-rate API is unavailable')
+
+  // Clock time advances ten minutes while the document is hidden. Pixel samples
+  // come from actual Chromium screenshots, not from computed background URLs.
+  async function pixel() {
+    const png=await page.screenshot()
+    return page.evaluate(async data=>{
+      const img=new Image();img.src=data;await img.decode()
+      const canvas=document.createElement('canvas');canvas.width=img.width;canvas.height=img.height
+      const ctx=canvas.getContext('2d');ctx.drawImage(img,0,0)
+      return Array.from(ctx.getImageData(30,500,1,1).data).slice(0,3)
+    },'data:image/png;base64,'+png.toString('base64'))
+  }
+  await page.clock.install()
+  await page.evaluate(()=>{
+    window.testHidden=false
+    Object.defineProperty(document,'hidden',{configurable:true,get:()=>testHidden})
+    window.setHidden=value=>{testHidden=value;document.dispatchEvent(new Event('visibilitychange'))}
+    api.STORE.set({fadeOn:false,wallpaper:{id:'a',url:'/a.svg'},autoOn:true,autoMin:1,fadeMs:400,fadeDelayMs:0,veil:0})
+    api.setPlaybackSource('all');api.setPlaybackMode('ordered');api.STORE.set({fadeOn:true})
+    window.hiddenCommits=0
+    let last=api.STORE.state.wallpaper.url
+    api.STORE.subscribe(()=>{if(last!==api.STORE.state.wallpaper.url){hiddenCommits++;last=api.STORE.state.wallpaper.url}})
+    setHidden(true)
+  })
+  assert.equal(await page.evaluate(()=>api.autoPending()),false)
+  await page.clock.runFor(600000)
+  assert.equal(await page.evaluate(()=>hiddenCommits),0)
+  await page.evaluate(()=>setHidden(false))
+  await page.clock.runFor(59000)
+  assert.deepEqual(await pixel(),[255,0,0],'resume must preserve the current picture, not expose black')
+  assert.equal(await page.evaluate(()=>hiddenCommits),0,'no catch-up during the fresh interval')
+  await page.clock.runFor(1000)
+  await page.waitForFunction(()=>api.STORE.state.wallpaper.id==='b')
+  await page.waitForFunction(()=>!document.querySelector('[data-bg-atelier-fade]'))
+  assert.deepEqual(await pixel(),[0,255,0])
+  assert.equal(await page.evaluate(()=>hiddenCommits),1,'only one automatic change after a full new interval')
+  await page.locator('#manual-next').click()
+  await page.waitForFunction(()=>api.STORE.state.wallpaper.id==='c'&&!document.querySelector('[data-bg-atelier-fade]'))
+  assert.deepEqual(await pixel(),[0,0,255],'manual switch still paints after background recovery')
+  console.log('PASS ten-minute hidden interval / zero catch-up / one full interval on return / screenshot pixels after auto and manual changes')
+
+  await page.evaluate(()=>{
+    api.STORE.set({autoOn:false,fadeMs:2000})
+    api.setWallpaper({id:'slow',url:'/slow.svg?background=1'})
+    setHidden(true);setHidden(false)
+  })
+  await page.waitForTimeout(2200)
+  assert.equal(await page.evaluate(()=>api.STORE.state.wallpaper.id),'c','late hidden decode must be ignored')
+  assert.deepEqual(await pixel(),[0,0,255])
+  await page.locator('#manual-next').click()
+  await page.waitForFunction(()=>api.fadeMotionStatus()?.started)
+  await page.evaluate(()=>setHidden(true))
+  assert.equal(await page.locator('[data-bg-atelier-fade]').count(),0)
+  await page.evaluate(()=>setHidden(false))
+  await page.waitForTimeout(80)
+  assert.deepEqual(await pixel(),[255,255,255],'resume during a fade paints its decoded destination')
+  await page.locator('#manual-next').click()
+  await page.waitForFunction(()=>api.STORE.state.wallpaper.id==='a'&&!document.querySelector('[data-bg-atelier-fade]'))
+  assert.deepEqual(await pixel(),[255,0,0])
+  console.log('PASS late slow decode / suspend mid-fade / resumed screenshot / subsequent manual fade')
   await page.evaluate(() => cleanups.reverse().forEach(off=>off()))
   assert.equal(await page.locator('[data-bg-atelier-background],[data-bg-atelier-dynamic],[data-bg-atelier-fade]').count(),0)
   assert.deepEqual(errors,[])

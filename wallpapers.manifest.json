@@ -1,13 +1,13 @@
 {
   "format": "dsh-bg-atelier-wallpapers/1",
-  "generatedAt": "2026-09-28T10:51:06.062Z",
+  "generatedAt": "2026-09-28T11:02:38.316Z",
   "release": {
     "tag": "wallpapers-v1",
     "repo": "Raylen-berry/dsh-desktop-wallpaper",
     "base": "https://github.com/Raylen-berry/dsh-desktop-wallpaper/releases/download/wallpapers-v1"
   },
-  "total": 227,
-  "totalBytes": 6810723894,
+  "total": 229,
+  "totalBytes": 6879600261,
   "policy": "lossless：一律上传原始文件（PNG/JPG 原样，不缩放、不重编码）",
   "items": [
     {
@@ -54,7 +54,7 @@
     },
     {
       "asset": "w08.png",
-      "path": "重返未来1999/贝利尔2.png",
+      "path": "重返未来1999/贝丽尔2.png",
       "bytes": 4268873,
       "sha256": "febf88f66dc55b22d4db2603b96313826cbd5e857fdcda0ef911034875ddc30f"
     },
@@ -96,7 +96,7 @@
     },
     {
       "asset": "w16.png",
-      "path": "高清/贝利尔2.png",
+      "path": "高清/贝丽尔2.png",
       "bytes": 52738200,
       "sha256": "b725b8a3de22231df39ad7acaa1b711d5d7b0e7c280ac3156c1a089fb42859ec"
     },
@@ -522,7 +522,7 @@
     },
     {
       "asset": "w94.png",
-      "path": "重返未来1999/维拉.png",
+      "path": "重返未来1999/维拉2.png",
       "bytes": 5114127,
       "sha256": "d490d69dcdd84d5f59a762cde759b3e76aee3f2146de877bdf096d77fe765645"
     },
@@ -1008,13 +1008,13 @@
     },
     {
       "asset": "w175.png",
-      "path": "重返未来1999/贝利尔5.png",
+      "path": "重返未来1999/贝丽尔5.png",
       "bytes": 5321118,
       "sha256": "464c83dc945352c50bef896bcfa25477704ee6a389e3ea16dac65767d764f0ae"
     },
     {
       "asset": "w176.png",
-      "path": "重返未来1999/贝利尔6.png",
+      "path": "重返未来1999/贝丽尔6.png",
       "bytes": 7279421,
       "sha256": "0bbf87d305541621483489a79640a1ce39b721489800076c067930c19cebed8c"
     },
@@ -1302,13 +1302,13 @@
     },
     {
       "asset": "w224.png",
-      "path": "高清/贝利尔5.png",
+      "path": "高清/贝丽尔5.png",
       "bytes": 58947612,
       "sha256": "9736d6cca6bdc076a7ebb1e3954293025d20d19843b15160bedff7d0b6f4efb2"
     },
     {
       "asset": "w225.png",
-      "path": "高清/贝利尔6.png",
+      "path": "高清/贝丽尔6.png",
       "bytes": 64990669,
       "sha256": "d00fe1ff8152aaea0b6f92074e592e8f62928802808195335a3a33f079b658ab"
     },
@@ -1371,6 +1371,18 @@
       "path": "重返未来1999/VVV·1.png",
       "bytes": 4704269,
       "sha256": "d2379baf65c54ad744a52bf028e73f0025174c93ca0cda1bb4c55547e44a2de1"
+    },
+    {
+      "asset": "w236.png",
+      "path": "重返未来1999/以影相之2.png",
+      "bytes": 6190435,
+      "sha256": "afdeae336bd53275350ea809f788e65f1fccf96215ee43581257191dadc7862a"
+    },
+    {
+      "asset": "w237.png",
+      "path": "高清/以影相之2.png",
+      "bytes": 62685932,
+      "sha256": "9a9f0ca2abd34c4279edc4100e0c89b7ba06a2b93b1ad7045185ae64f8ed19ae"
     }
   ]
 }
