@@ -267,6 +267,7 @@ var WALLPAPER_RENAMES = []
 ;['重返未来1999', '高清'].forEach(function (cat) {
   ;['2', '5', '6'].forEach(function (n) { WALLPAPER_RENAMES.push([cat, '贝利尔'+n+'.png', '贝丽尔'+n+'.png']) })
   WALLPAPER_RENAMES.push([cat, '以影像之2.png', '以影相之2.png'])
+  ;['冷周六', '图图星锑'].forEach(function (name) { WALLPAPER_RENAMES.push([cat, name+'.png', name+'1.png']) })
 })
 WALLPAPER_RENAMES.push(['重返未来1999', '维拉.png', '维拉2.png'])
 function migrateWallpaperNames(patch) {

@@ -1,13 +1,13 @@
 {
   "format": "dsh-bg-atelier-wallpapers/1",
-  "generatedAt": "2026-09-28T11:02:38.316Z",
+  "generatedAt": "2026-09-28T12:34:20.228Z",
   "release": {
     "tag": "wallpapers-v1",
     "repo": "Raylen-berry/dsh-desktop-wallpaper",
     "base": "https://github.com/Raylen-berry/dsh-desktop-wallpaper/releases/download/wallpapers-v1"
   },
-  "total": 229,
-  "totalBytes": 6879600261,
+  "total": 261,
+  "totalBytes": 7936638502,
   "policy": "lossless：一律上传原始文件（PNG/JPG 原样，不缩放、不重编码）",
   "items": [
     {
@@ -426,7 +426,7 @@
     },
     {
       "asset": "w78.png",
-      "path": "重返未来1999/图图星锑.png",
+      "path": "重返未来1999/图图星锑1.png",
       "bytes": 5409417,
       "sha256": "96b194d49a43de7772d817ee018ae04c95266bdafa4c5751df63a6a445f90c86"
     },
@@ -648,7 +648,7 @@
     },
     {
       "asset": "w115.png",
-      "path": "高清/图图星锑.png",
+      "path": "高清/图图星锑1.png",
       "bytes": 60244411,
       "sha256": "c93eb78002a175d3c82a7df9283e74ac724611dc3dbdbd300d57e124d62712fa"
     },
@@ -822,7 +822,7 @@
     },
     {
       "asset": "w144.png",
-      "path": "重返未来1999/冷周六.png",
+      "path": "重返未来1999/冷周六1.png",
       "bytes": 5667344,
       "sha256": "64a4001b766cda09922f22d73d55ee556e43e2f8285ae511641f0334ee3700dc"
     },
@@ -1110,7 +1110,7 @@
     },
     {
       "asset": "w192.png",
-      "path": "高清/冷周六.png",
+      "path": "高清/冷周六1.png",
       "bytes": 59766652,
       "sha256": "31fdb6fe283d6ec16caf51bf20432c59a769fc00af8f3a196beed98ae24ada32"
     },
@@ -1383,6 +1383,198 @@
       "path": "高清/以影相之2.png",
       "bytes": 62685932,
       "sha256": "9a9f0ca2abd34c4279edc4100e0c89b7ba06a2b93b1ad7045185ae64f8ed19ae"
+    },
+    {
+      "asset": "w238.png",
+      "path": "重返未来1999/14V·5.png",
+      "bytes": 5693958,
+      "sha256": "0fee440e0fe0ca588e66606ddd82c0a838d3a0c91446fd3813869360af71c5db"
+    },
+    {
+      "asset": "w239.png",
+      "path": "高清/14V·5.png",
+      "bytes": 61370690,
+      "sha256": "d28824ea3c3db0f2933f79b5c67813bcd006ad4d5d0321a51db181a143f887d6"
+    },
+    {
+      "asset": "w240.png",
+      "path": "重返未来1999/伊索尔德3.png",
+      "bytes": 5123232,
+      "sha256": "56e5647ed77e154093f1442480b8fb00f2ebc9f15d9ea76628e7993436481ab2"
+    },
+    {
+      "asset": "w241.png",
+      "path": "高清/伊索尔德3.png",
+      "bytes": 57382400,
+      "sha256": "92bad5043e0c6199a66dcd710a5d2e0d0803897477f0d37ea57fb6896cdbe7e0"
+    },
+    {
+      "asset": "w242.png",
+      "path": "重返未来1999/伊索尔德4.png",
+      "bytes": 3904842,
+      "sha256": "85e49aa8a9463365b233bbe84abec5b448886986fb4545b023edc4c9e337e532"
+    },
+    {
+      "asset": "w243.png",
+      "path": "高清/伊索尔德4.png",
+      "bytes": 53362080,
+      "sha256": "aa8f8ef7d8044b027406f30233e5353c2a39d90e92611ab6290ba10906d273dc"
+    },
+    {
+      "asset": "w244.png",
+      "path": "重返未来1999/冷周六2.png",
+      "bytes": 7053488,
+      "sha256": "14a46fa13e06c6d415813a89eaae272f4cc7ac60fb13b463d645a727cd73eb28"
+    },
+    {
+      "asset": "w245.png",
+      "path": "高清/冷周六2.png",
+      "bytes": 61150738,
+      "sha256": "e254a864e2632a371d6f8fcc1d3c1759b6389087f4a313a9bf4138481a90cd0b"
+    },
+    {
+      "asset": "w246.png",
+      "path": "重返未来1999/图图星锑2.png",
+      "bytes": 5194969,
+      "sha256": "88f2257b795ecdac6ae5b0d67f0312f5496171108444fc1ad4fb2e8ce1862e0d"
+    },
+    {
+      "asset": "w247.png",
+      "path": "高清/图图星锑2.png",
+      "bytes": 58307753,
+      "sha256": "4ee0773cb99949022a43ac4fab71c1b81ad2a30cdf2f797437b26a410774702e"
+    },
+    {
+      "asset": "w248.png",
+      "path": "重返未来1999/天使娜娜.png",
+      "bytes": 5211809,
+      "sha256": "1ebce554fa3b006e65e2341367c64b3863da57e0a2c86781eabddaf4df17c82b"
+    },
+    {
+      "asset": "w249.png",
+      "path": "高清/天使娜娜.png",
+      "bytes": 57997143,
+      "sha256": "001529df4e9aa3d53999afeeca0ca1bb32f444539896e7cf75acdce0962a83a0"
+    },
+    {
+      "asset": "w250.png",
+      "path": "重返未来1999/星锑.png",
+      "bytes": 6377859,
+      "sha256": "91ac23cffc45a851130a21d809975f11d9560488afd70328ad90328ba20fb83d"
+    },
+    {
+      "asset": "w251.png",
+      "path": "高清/星锑.png",
+      "bytes": 63631389,
+      "sha256": "cc0ce739618ed8c08374c231676dada6d63d3807c63ddbb87145edbd51f60e51"
+    },
+    {
+      "asset": "w252.png",
+      "path": "重返未来1999/朔日手记.png",
+      "bytes": 6523229,
+      "sha256": "a2fc0cb73b519f717f8eed60beadef2b08919362343067c49553f194029f214d"
+    },
+    {
+      "asset": "w253.png",
+      "path": "高清/朔日手记.png",
+      "bytes": 81741540,
+      "sha256": "61ab207a44f2e7b430a9bfa7e92b2fa658384248900a8f5268da453e1f4d552b"
+    },
+    {
+      "asset": "w254.png",
+      "path": "重返未来1999/温妮弗雷德.png",
+      "bytes": 4111655,
+      "sha256": "0ccc5f8effd9ec0e48f6a8e55c6e10f9d275c3481d92ed140bd10b174b6d417b"
+    },
+    {
+      "asset": "w255.png",
+      "path": "高清/温妮弗雷德.png",
+      "bytes": 58213235,
+      "sha256": "9c66f25166a15dd30349899bd14e2d562aa9e1e6c72f6c25363e232824b32b36"
+    },
+    {
+      "asset": "w256.png",
+      "path": "重返未来1999/烽火.png",
+      "bytes": 6406188,
+      "sha256": "8bfe22bd1dde666f71959b30a2b383ffb0d1e5d909990eded479277899724560"
+    },
+    {
+      "asset": "w257.png",
+      "path": "高清/烽火.png",
+      "bytes": 63148001,
+      "sha256": "dac13c2e3f79e016afbd49dc743ab6c992167550b3c17fb39fbd69498cee0edb"
+    },
+    {
+      "asset": "w258.png",
+      "path": "重返未来1999/玛丽安娜.png",
+      "bytes": 6301931,
+      "sha256": "b7e2c8eb5f439d5c320e5ba65ff9e3f6a98f61de92de559c9f0eda8a10069841"
+    },
+    {
+      "asset": "w259.png",
+      "path": "高清/玛丽安娜.png",
+      "bytes": 61829867,
+      "sha256": "ec2a7c81c657abbcb611c5a1039383fbb151d3b1bc42d8a891c8ba6785169c5d"
+    },
+    {
+      "asset": "w260.png",
+      "path": "重返未来1999/瓦伦缇娜.png",
+      "bytes": 2841123,
+      "sha256": "83b4beab965d8da284c99a75e2d040c72752e8e9698a305999560a62c69833a1"
+    },
+    {
+      "asset": "w261.png",
+      "path": "高清/瓦伦缇娜.png",
+      "bytes": 50769150,
+      "sha256": "229e9afadde4f21ada4b745e75872ec45a16fff7b3d5239ce117b6320f1a8bf9"
+    },
+    {
+      "asset": "w262.png",
+      "path": "重返未来1999/纳西索斯.png",
+      "bytes": 5789855,
+      "sha256": "b25d07ed5825db2f17f2e4881e5241e3be488780301fc042cc5610d0f4012f10"
+    },
+    {
+      "asset": "w263.png",
+      "path": "高清/纳西索斯.png",
+      "bytes": 58613511,
+      "sha256": "6147081d18eec978cdc6cc8f9352117de2be7ff430ca66593a00a3ce7e33d4e4"
+    },
+    {
+      "asset": "w264.png",
+      "path": "重返未来1999/致自由的灵魂.png",
+      "bytes": 5820153,
+      "sha256": "ddbaf94ff7d754472abfedd2e315325b20422330ddf03564ea815f4975ef6821"
+    },
+    {
+      "asset": "w265.png",
+      "path": "高清/致自由的灵魂.png",
+      "bytes": 56949529,
+      "sha256": "862b13c1145b278c95aac31743c771fba506d8ce92c6e903bfda4758f49c6fc1"
+    },
+    {
+      "asset": "w266.png",
+      "path": "重返未来1999/苏菲亚.png",
+      "bytes": 6202981,
+      "sha256": "c112b20e749df57bc3a2913d02ba7f1fb85281d0f281e29f8c27d70675949793"
+    },
+    {
+      "asset": "w267.png",
+      "path": "高清/苏菲亚.png",
+      "bytes": 59000382,
+      "sha256": "423fd65441ad8b0be7ed8cb76f758b40b30ead3e19041e6944466731fa1c05e8"
+    },
+    {
+      "asset": "w268.png",
+      "path": "重返未来1999/重燃！流金之海.png",
+      "bytes": 6784848,
+      "sha256": "f17e206c4b126895102d0855c5e6aa0d639c9205566f3983a2eb84d3c6701111"
+    },
+    {
+      "asset": "w269.png",
+      "path": "高清/重燃！流金之海.png",
+      "bytes": 64228713,
+      "sha256": "19e5a7c589706618fa3dc35999e957d1ae36ddaebbb8390dfe6cb76c7c1faab1"
     }
   ]
 }

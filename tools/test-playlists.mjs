@@ -131,7 +131,7 @@ assert.ok(S.saveStatus!=='load-error','fresh empty settings remain usable')
 console.log('PASS restoration / serialized writes / latest data wins / save failure and retry / fresh install')
 
 // Renaming a local image must preserve references in saved collections and framing.
-for(const [cat,old,name] of [['高清','贝利尔2','贝丽尔2'],['重返未来1999','以影像之2','以影相之2'],['重返未来1999','维拉','维拉2']]) {
+for(const [cat,old,name] of [['高清','贝利尔2','贝丽尔2'],['重返未来1999','以影像之2','以影相之2'],['重返未来1999','维拉','维拉2'],...['高清','重返未来1999'].flatMap(cat=>['冷周六','图图星锑'].map(name=>[cat,name,name+'1']))]) {
   const oldId=cat+'\0'+old+'.png',id=cat+'\0'+name+'.png'
   const url=n=>'/bga/wallpapers/'+encodeURIComponent(cat)+'/'+encodeURIComponent(n+'.png')
   reads={wallpaper:{id:oldId,cat,file:old+'.png',name:old,url:url(old),hd:cat==='高清'},
