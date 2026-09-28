@@ -137,13 +137,20 @@ for (const m of missing) {
   // 间歇 ECONNRESET（见 fetch-wallpapers.js 头部注释），HEAD 回验会假报"已传但失败"，
   // 而 release 资产表里的 size 就是 GitHub 收到的字节数，且这条链路实测稳定。
   let verified = false, remoteSize = null
-  for (let t = 0; t < 5 && !verified; t++) {
+  for (let t = 0; t < 4 && !verified; t++) {
     if (t) await new Promise((r) => setTimeout(r, 1000 * t))
     try {
-      const av = await fetch('https://api.github.com/repos/' + repo + '/releases/' + releaseId + '/assets?per_page=100', { headers: { 'user-agent': 'dsh-bg-atelier-make-release', authorization: 'Bearer ' + TOKEN_FINAL } })
-      if (!av.ok) continue
-      const hit = (await av.json()).find((a) => a.name === m.asset)
-      remoteSize = hit ? hit.size : null
+      // **必须翻页找**：/assets 不给 page 时只回第一页，给 per_page=100 也只是"第一页最多 100 条"。
+      // 资产数超过 100 之后，刚传的那张根本不在第一页里 ⇒ size 永远读到 null，
+      // 实测 w182.png 就是这么"已传但回验失败"的（不是 GitHub 慢，是没翻页）。
+      for (let page = 1; page <= 10; page++) {
+        const av = await fetch('https://api.github.com/repos/' + repo + '/releases/' + releaseId + '/assets?per_page=100&page=' + page, { headers: { 'user-agent': 'dsh-bg-atelier-make-release', authorization: 'Bearer ' + TOKEN_FINAL } })
+        if (!av.ok) break
+        const list = await av.json()
+        const hit = list.find((a) => a.name === m.asset)
+        if (hit) { remoteSize = hit.size; break }
+        if (list.length < 100) break
+      }
       verified = remoteSize === m.diskBytes
     } catch { /* 重试 */ }
   }

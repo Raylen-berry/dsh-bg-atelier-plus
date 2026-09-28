@@ -1,13 +1,13 @@
 {
   "format": "dsh-bg-atelier-wallpapers/1",
-  "generatedAt": "2026-09-25T19:22:15.300Z",
+  "generatedAt": "2026-09-28T08:13:17.615Z",
   "release": {
     "tag": "wallpapers-v1",
     "repo": "Raylen-berry/dsh-desktop-wallpaper",
     "base": "https://github.com/Raylen-berry/dsh-desktop-wallpaper/releases/download/wallpapers-v1"
   },
-  "total": 135,
-  "totalBytes": 3805175058,
+  "total": 229,
+  "totalBytes": 6829025084,
   "policy": "lossless：一律上传原始文件（PNG/JPG 原样，不缩放、不重编码）",
   "items": [
     {
@@ -78,7 +78,7 @@
     },
     {
       "asset": "w12.png",
-      "path": "高清/梅蕾尔.png",
+      "path": "高清/梅蕾尔线稿.png",
       "bytes": 45787386,
       "sha256": "23d1d2855484b48a2e266fd5e3ee651310ed2f23cc47b7ab769546f3a3364baa"
     },
@@ -123,12 +123,6 @@
       "path": "高清/青缭.jpg",
       "bytes": 8048120,
       "sha256": "5b2d7fd3ac030d71aec540eebeece05f2220531cd01d709b8cc42b495eea7736"
-    },
-    {
-      "asset": "w20.png",
-      "path": "重返未来1999/Vertin1.png",
-      "bytes": 3622457,
-      "sha256": "3230075b5f17e9f399029e586f9d4712d646b2240e45d8552fdce8f2106660c9"
     },
     {
       "asset": "w21.png",
@@ -183,12 +177,6 @@
       "path": "重返未来1999/贝丽尔4.png",
       "bytes": 4615152,
       "sha256": "f4ea159fd56056c23b08659ee3846376720d1400417e5b9c765127108ad56a01"
-    },
-    {
-      "asset": "w30.png",
-      "path": "高清/Vertin1.png",
-      "bytes": 48903135,
-      "sha256": "0e8f7d5ed7bacbe0ea75952e199dc353634603a31bd444143da803f745b9e057"
     },
     {
       "asset": "w31.png",
@@ -389,12 +377,6 @@
       "sha256": "c5e9217d652b28fde9857a2c49de2d8e712579900c2b880bbf4dfe961d978d78"
     },
     {
-      "asset": "w67.png",
-      "path": "高清/阿尔卡纳.png",
-      "bytes": 50822349,
-      "sha256": "fd9bf830ca5100268ccaa8d3e9778245b9bbe848534f34d1457beacd1bdc429b"
-    },
-    {
       "asset": "w68.png",
       "path": "重返未来1999/14V·2.png",
       "bytes": 4001202,
@@ -420,7 +402,7 @@
     },
     {
       "asset": "w72.png",
-      "path": "重返未来1999/6.png",
+      "path": "重返未来1999/6·1.png",
       "bytes": 4988749,
       "sha256": "71dda4453fdd5b10c50a97717e27752aea851d8cfffb6795d2f28db19eb85819"
     },
@@ -432,7 +414,7 @@
     },
     {
       "asset": "w74.png",
-      "path": "重返未来1999/以影相之.png",
+      "path": "重返未来1999/以影相之1.png",
       "bytes": 5829061,
       "sha256": "0c1bd6b003dfbe6096e4e1768b2a1b8b32cbae579233a87cd4ef1b7865437263"
     },
@@ -600,13 +582,13 @@
     },
     {
       "asset": "w102.png",
-      "path": "重返未来1999/阿尔卡纳.png",
+      "path": "重返未来1999/阿尔卡纳1.png",
       "bytes": 4462493,
       "sha256": "06b3d73d6b80594a88b87bee3352b32025c4d5a514e8559d8930092c01a85e01"
     },
     {
       "asset": "w103.png",
-      "path": "重返未来1999/阿莱夫1_upscayl_4x_high-fidelity-4x.png",
+      "path": "高清/阿莱夫1.png",
       "bytes": 54977917,
       "sha256": "246cf50c3ecfc354c43f8d27679497ef2b593c8d6193e6934b7d876f17213bfc"
     },
@@ -642,7 +624,7 @@
     },
     {
       "asset": "w109.png",
-      "path": "高清/6.png",
+      "path": "高清/6·1.png",
       "bytes": 57494850,
       "sha256": "ed8f8442b06ca408ac0c12221805913a1932d7f4c4af113f2558d4a4c1fe9eaa"
     },
@@ -654,7 +636,7 @@
     },
     {
       "asset": "w111.png",
-      "path": "高清/以影相之.png",
+      "path": "高清/以影相之1.png",
       "bytes": 62452986,
       "sha256": "4178649d039ca16f042c5f476a75279b53c25d44d5270596d12fd9e0eb12c8fa"
     },
@@ -768,7 +750,7 @@
     },
     {
       "asset": "w130.png",
-      "path": "高清/维拉.png",
+      "path": "高清/维拉2.png",
       "bytes": 58618636,
       "sha256": "cc8e6c7684e766f0a2a5f1ee48b21aa8e5070576cbcdbf4127fed414ded2b57d"
     },
@@ -819,6 +801,588 @@
       "path": "高清/露西2.png",
       "bytes": 58478809,
       "sha256": "e99b64b73518ef7f90b73f936d8729b32e6084a663a9e84a92f4da186dfffb5e"
+    },
+    {
+      "asset": "w139.png",
+      "path": "重返未来1999/VVV·2.png",
+      "bytes": 5467298,
+      "sha256": "83363f26791baf7d89e5374ffe8f8f4f80ee7311e14977b0ae25565b0640df53"
+    },
+    {
+      "asset": "w140.png",
+      "path": "重返未来1999/Vertin1.png",
+      "bytes": 5176166,
+      "sha256": "7104df9e846f5f0963aba45437c94f17a258362be9b1bd5de93d0cbf7f989493"
+    },
+    {
+      "asset": "w141.png",
+      "path": "重返未来1999/Vertin3.png",
+      "bytes": 6190963,
+      "sha256": "ab5a5493d78d379de6367d28d85588ea7fbf831977c99af7de5a35cbe882ae8c"
+    },
+    {
+      "asset": "w142.png",
+      "path": "重返未来1999/Vertin4.png",
+      "bytes": 5361180,
+      "sha256": "2619497da66969182740c5627021b4fb4c512db43e691b40790469b965c7b364"
+    },
+    {
+      "asset": "w143.png",
+      "path": "重返未来1999/伊戈尔.png",
+      "bytes": 4278241,
+      "sha256": "1cb25e4546f929aed16a8b15e6a1147c5dcf153af9d45ff6fd9be8a3ef3bb2d9"
+    },
+    {
+      "asset": "w144.png",
+      "path": "重返未来1999/冷周六.png",
+      "bytes": 5667344,
+      "sha256": "64a4001b766cda09922f22d73d55ee556e43e2f8285ae511641f0334ee3700dc"
+    },
+    {
+      "asset": "w145.png",
+      "path": "重返未来1999/卡戎.png",
+      "bytes": 3684764,
+      "sha256": "8402424821d7f4dbe8afc4948a68b7c51d8e2eec6728c6de0c0239000e9b4afb"
+    },
+    {
+      "asset": "w146.png",
+      "path": "重返未来1999/命名日.png",
+      "bytes": 4773614,
+      "sha256": "856ab85d29deff4b4160da9f600ebd49ef73a236cca30b3c4b53bfde9c32dddc"
+    },
+    {
+      "asset": "w147.png",
+      "path": "重返未来1999/哑谜3.png",
+      "bytes": 4421054,
+      "sha256": "47b776c6b7cd961092a082c2ffc663d8c6550a4f3519caf8ac80badce4796440"
+    },
+    {
+      "asset": "w148.png",
+      "path": "重返未来1999/坎吉拉.png",
+      "bytes": 5558311,
+      "sha256": "916b2952088aeae76da4afa7535324f70cccb466f01af6dbaa721f26e6ea109f"
+    },
+    {
+      "asset": "w149.png",
+      "path": "重返未来1999/复兴！乌卢鲁运动会.png",
+      "bytes": 5526793,
+      "sha256": "90e2b12c787aed8defc12f9e7e0b6c9484c78c52f150601ac60da8621bfbe6dd"
+    },
+    {
+      "asset": "w150.png",
+      "path": "重返未来1999/奠基石.png",
+      "bytes": 5532971,
+      "sha256": "fbb2a8a9e5573e2223aa85ef3f0c6c2fb53b9acb64bd6f7d3fd158037fd482f7"
+    },
+    {
+      "asset": "w151.png",
+      "path": "重返未来1999/孤独之歌.png",
+      "bytes": 5222225,
+      "sha256": "c78bea8b074d9b7b3f16e68d0ac45a2b876dbdbdbba810e5d7213da31c88d26e"
+    },
+    {
+      "asset": "w152.png",
+      "path": "重返未来1999/宽帽牙仙.png",
+      "bytes": 5174107,
+      "sha256": "ef2fb971d61b295d75cecbeb0f0111e49e4f14336e3d9c9002c227210def1334"
+    },
+    {
+      "asset": "w153.png",
+      "path": "重返未来1999/拉普拉斯.png",
+      "bytes": 4012559,
+      "sha256": "6c710608fcaf1ae29f7a7be9f8a69ee693d88256061a35266aabbcbdb11e3361"
+    },
+    {
+      "asset": "w154.png",
+      "path": "重返未来1999/拉莫纳.png",
+      "bytes": 5009877,
+      "sha256": "0cb0d3d07a5917a087e8fedb9fe79483ea6e6fb19773ed99dc9497a6b3c4d510"
+    },
+    {
+      "asset": "w155.png",
+      "path": "重返未来1999/星锑乌尔.png",
+      "bytes": 5453674,
+      "sha256": "da5170023db77246b348fc36d21fc9e968e2e1a1b386d1e4926e39ab6528b0b2"
+    },
+    {
+      "asset": "w156.png",
+      "path": "重返未来1999/梁月7.png",
+      "bytes": 4817415,
+      "sha256": "258116ea417c52e5468a5b2bd2d6f754c207aa170b61b069504452962127a7d9"
+    },
+    {
+      "asset": "w157.png",
+      "path": "重返未来1999/梅蕾尔.png",
+      "bytes": 5640272,
+      "sha256": "134e99349d24f74a91c14445141985ce817367b1e183f69a9cec2ffa24909947"
+    },
+    {
+      "asset": "w158.png",
+      "path": "重返未来1999/牙仙1.png",
+      "bytes": 2588578,
+      "sha256": "47e880dda8a49e93ba8274a47e2832f1263abe8a63251aa57b229d392a16f711"
+    },
+    {
+      "asset": "w159.png",
+      "path": "重返未来1999/玛尔莎.png",
+      "bytes": 3861065,
+      "sha256": "16081c8af9b11424e8c8f75150b3afc53e1763c804b9b3865925dbfb577216be"
+    },
+    {
+      "asset": "w160.png",
+      "path": "重返未来1999/环状水星1.png",
+      "bytes": 4895748,
+      "sha256": "a6a7057051a5ae37bedebab5172e8e2ba3fcc718eee11d446258cd2bc51e46e1"
+    },
+    {
+      "asset": "w161.png",
+      "path": "重返未来1999/环状水星2.png",
+      "bytes": 3827707,
+      "sha256": "fc89621c02a41ae5795d0ddcdec3e4189f261230ba931c1e07db08c8ab015fc9"
+    },
+    {
+      "asset": "w162.png",
+      "path": "重返未来1999/笃笃骨圈.png",
+      "bytes": 4447553,
+      "sha256": "b1413d2d02c29719b57606fd8d4401714b9d511c73b25db0bd3ce13e463aae66"
+    },
+    {
+      "asset": "w163.png",
+      "path": "重返未来1999/艾吉奥.png",
+      "bytes": 6657597,
+      "sha256": "8d35cf2658f3f6d4201a2a2a693f40e4b3aeb6d88c0a33e3c000f40a022c3662"
+    },
+    {
+      "asset": "w164.png",
+      "path": "重返未来1999/艾吉奥Apple.png",
+      "bytes": 3484532,
+      "sha256": "d76cd465729dc273ed4232eec3aab23aa41dd5a3c26a24835d36044fdb6883c9"
+    },
+    {
+      "asset": "w165.png",
+      "path": "重返未来1999/芭卡洛儿1.png",
+      "bytes": 2670933,
+      "sha256": "a3dd7d4d5d7a13ef6ff0a239cadcb9c7664092ea4f6c135dc422a0ce2ef0ce1a"
+    },
+    {
+      "asset": "w166.png",
+      "path": "重返未来1999/芭卡洛儿2.png",
+      "bytes": 1894678,
+      "sha256": "159f6d8846b7f4aeaa1ebbc15341fbb2ea02fe94c3c64cca597ae95aa8cbd559"
+    },
+    {
+      "asset": "w167.png",
+      "path": "重返未来1999/芭卡洛儿3.png",
+      "bytes": 3780603,
+      "sha256": "0012d75e4c6c4cbaa37cfaa1be683babeee333d826d08f5323b57970cee1a625"
+    },
+    {
+      "asset": "w168.png",
+      "path": "重返未来1999/花环2.png",
+      "bytes": 5282490,
+      "sha256": "7982fa8ad3a300920320b14e3a547099030972cab8712d51014814a783fb2747"
+    },
+    {
+      "asset": "w169.png",
+      "path": "重返未来1999/花环3.png",
+      "bytes": 5708293,
+      "sha256": "53c255c17cf5d5491464c997fc9f5e6352bdfe687fe754d8cd71a875ad8a1243"
+    },
+    {
+      "asset": "w170.png",
+      "path": "重返未来1999/花环4.png",
+      "bytes": 5668104,
+      "sha256": "24d967b89ee384753ffe1d41c9af15119f176a8201d3ff2c7fd65cff2705b186"
+    },
+    {
+      "asset": "w171.png",
+      "path": "重返未来1999/茉莉伊戈尔.png",
+      "bytes": 5962130,
+      "sha256": "d686a1b32dfd9448f7174b24f2114a5143cd67a8457b28c59996941010c8edd7"
+    },
+    {
+      "asset": "w172.png",
+      "path": "重返未来1999/蓝手帕.png",
+      "bytes": 4646551,
+      "sha256": "46a0c9065aacd9d4524f2d653a09ead9535e33b5c8a42addd376d0e81d2c6e7c"
+    },
+    {
+      "asset": "w173.png",
+      "path": "重返未来1999/诺V.png",
+      "bytes": 5400819,
+      "sha256": "07be7b5d6facf74019d2a6f60be608f462fa477a197bece6ca660bca099421a0"
+    },
+    {
+      "asset": "w174.png",
+      "path": "重返未来1999/诺谛卡3.png",
+      "bytes": 4969038,
+      "sha256": "445f50d336d15280b5391b2e8a5e573879fbc085ce1a192880f7674fbe79d0ca"
+    },
+    {
+      "asset": "w175.png",
+      "path": "重返未来1999/贝利尔5.png",
+      "bytes": 5321118,
+      "sha256": "464c83dc945352c50bef896bcfa25477704ee6a389e3ea16dac65767d764f0ae"
+    },
+    {
+      "asset": "w176.png",
+      "path": "重返未来1999/贝利尔6.png",
+      "bytes": 7279421,
+      "sha256": "0bbf87d305541621483489a79640a1ce39b721489800076c067930c19cebed8c"
+    },
+    {
+      "asset": "w177.png",
+      "path": "重返未来1999/酒神颂.png",
+      "bytes": 4006546,
+      "sha256": "0156f8c1f01ba64100718aabf9d27ce292fbbbd2bc2ef83ff134dd202096cf18"
+    },
+    {
+      "asset": "w178.png",
+      "path": "重返未来1999/镜映.png",
+      "bytes": 4902678,
+      "sha256": "349d9d581a4214ee8bc6b855b7d3b833bd35ba4a8b5e71854146e7f8050af275"
+    },
+    {
+      "asset": "w179.png",
+      "path": "重返未来1999/阿莱夫1.png",
+      "bytes": 4690440,
+      "sha256": "e049c2c739d47df4fef94f87ffdc312bf2cbed24858043127bbedab4388bee2a"
+    },
+    {
+      "asset": "w180.png",
+      "path": "重返未来1999/阿莱夫2.png",
+      "bytes": 4697479,
+      "sha256": "9bea3af9eca00e9c8932eea061c37d68ae88197eb797fb274f8a82d0b09da29c"
+    },
+    {
+      "asset": "w181.png",
+      "path": "重返未来1999/露西3.png",
+      "bytes": 3887118,
+      "sha256": "db59f29796d674376cc53b40e0ffb1d90c8cb91711ca21210f3be1a8d2a87724"
+    },
+    {
+      "asset": "w182.png",
+      "path": "重返未来1999/鹭鸶剪.png",
+      "bytes": 6568989,
+      "sha256": "24a5ea9d7ba3b4ad42058f046fefc6aa2055bd74aa3be9db0042f9e0abe9bbba"
+    },
+    {
+      "asset": "w183.png",
+      "path": "重返未来1999/鹰与众神的时代.png",
+      "bytes": 6983000,
+      "sha256": "5453421f1f53eed3ee39b3d97094879020f6887edc4f4202cc3c963c99ee085a"
+    },
+    {
+      "asset": "w184.png",
+      "path": "高清/V14VVV.png",
+      "bytes": 57263835,
+      "sha256": "c39651d3f784b703a5205149b23e4e63f0dc526d727b7e6b71eb234b14bd0e42"
+    },
+    {
+      "asset": "w185.png",
+      "path": "高清/VVVVV.png",
+      "bytes": 59795169,
+      "sha256": "14d8b4611a9383c648ba4d0320e971ec9a1a0fe3ae0f57ceb02cb055e5077ec6"
+    },
+    {
+      "asset": "w186.png",
+      "path": "高清/VVV·1.png",
+      "bytes": 56756523,
+      "sha256": "0cd51982b50580c6d618465d8960ddcbaca9d8a071f35aa04e5b45cc2bf99355"
+    },
+    {
+      "asset": "w187.png",
+      "path": "高清/VVV·2.png",
+      "bytes": 59021416,
+      "sha256": "147b4baa51c68e25b12db54d8dc0a9de7249714ec57af36f2d9a4d49d5d8dcc9"
+    },
+    {
+      "asset": "w188.png",
+      "path": "高清/Vertin1.png",
+      "bytes": 61705560,
+      "sha256": "3362b40d0f9f581da4e4994ecea9d8fb4960a47b6f577406b36a103ed8ce078e"
+    },
+    {
+      "asset": "w189.png",
+      "path": "高清/Vertin3.png",
+      "bytes": 61415071,
+      "sha256": "24c7d1434bdb861c349a0ebd086ad22b992b920284433871b0a5faf694d47bbc"
+    },
+    {
+      "asset": "w190.png",
+      "path": "高清/Vertin4.png",
+      "bytes": 57074271,
+      "sha256": "29bba5d5910f8a0240385b611f04b625000483da99bc49c6a566668095b2ebad"
+    },
+    {
+      "asset": "w191.png",
+      "path": "高清/伊戈尔.png",
+      "bytes": 57304643,
+      "sha256": "833211cb14f8562d8bfa85d34ec053d137ea430a1219ea976ed4ab7362e3fc34"
+    },
+    {
+      "asset": "w192.png",
+      "path": "高清/冷周六.png",
+      "bytes": 59766652,
+      "sha256": "31fdb6fe283d6ec16caf51bf20432c59a769fc00af8f3a196beed98ae24ada32"
+    },
+    {
+      "asset": "w193.png",
+      "path": "高清/卡戎.png",
+      "bytes": 54612951,
+      "sha256": "0f9340d8422da186d6268bbbd5c1298ff987f8d1362e94605ef3b6d3d85d57d0"
+    },
+    {
+      "asset": "w194.png",
+      "path": "高清/命名日.png",
+      "bytes": 58918323,
+      "sha256": "5668580602bc47cd4cde43de7670aec521dde71d6056f9585a0ad37ec288fffc"
+    },
+    {
+      "asset": "w195.png",
+      "path": "高清/哑谜3.png",
+      "bytes": 55591182,
+      "sha256": "b4cffa861c94cfc06aa9911905f28ce6b2e26f2ffb00c2d4356ea31d12e687fc"
+    },
+    {
+      "asset": "w196.png",
+      "path": "高清/坎吉拉.png",
+      "bytes": 60572902,
+      "sha256": "f58ab0dcab3301611e7bc9ca866e0c7d189f7828f48c600b905751af7e411c19"
+    },
+    {
+      "asset": "w197.png",
+      "path": "高清/复兴！乌卢鲁运动会.png",
+      "bytes": 60855489,
+      "sha256": "8842fec72c7a4acc07bd3a13f5aee35882bf44ce9a9c2857d75618000a4cd977"
+    },
+    {
+      "asset": "w198.png",
+      "path": "高清/奠基石.png",
+      "bytes": 63251679,
+      "sha256": "7f30dccd0e862f33988dbf84a5ec4cc9f41b5d389e67579ba7fed6e5c100ae37"
+    },
+    {
+      "asset": "w199.png",
+      "path": "高清/孤独之歌.png",
+      "bytes": 59150537,
+      "sha256": "3fef61d2542a9224fcda5a56cf1c5ee417fdadb56047e56240c76967b12071a2"
+    },
+    {
+      "asset": "w200.png",
+      "path": "高清/宽帽牙仙.png",
+      "bytes": 57185827,
+      "sha256": "fd53f67aaea9b74355262992f0ca2c8ba8837b1cf98e282edf64856f13d05912"
+    },
+    {
+      "asset": "w201.png",
+      "path": "高清/拉普拉斯.png",
+      "bytes": 59508452,
+      "sha256": "d79df7cde364db9ecd3fbe40deac6e1dcc6b748ca537b3ee31578e8b76068e4c"
+    },
+    {
+      "asset": "w202.png",
+      "path": "高清/拉莫纳.png",
+      "bytes": 59702724,
+      "sha256": "a4297365d0cac74b3b8d100da7e43e37cd9e6b0ad676b5cf9130f364486fb558"
+    },
+    {
+      "asset": "w203.png",
+      "path": "高清/星锑乌尔.png",
+      "bytes": 64169456,
+      "sha256": "3f8d0147559da441339f105c323a3b0468b1c94a388481ac4af511270803c289"
+    },
+    {
+      "asset": "w204.png",
+      "path": "高清/梁月6.png",
+      "bytes": 61288139,
+      "sha256": "68bbb16a5eae1c77db5afced4b8c31c3ffc7510d2978fba54e92ec5c3b03e923"
+    },
+    {
+      "asset": "w205.png",
+      "path": "高清/梁月7.png",
+      "bytes": 58998328,
+      "sha256": "9d1c1880af1e5fd5e6c544c94fb876e84763f213a3015c669195958202d17dd9"
+    },
+    {
+      "asset": "w206.png",
+      "path": "高清/梅蕾尔.png",
+      "bytes": 61487975,
+      "sha256": "0e18dc9e72c21d3cb45d7a4af248cac628ad8ab650aa77ca06bcf89cdad2fe74"
+    },
+    {
+      "asset": "w207.png",
+      "path": "高清/牙仙1.png",
+      "bytes": 54845198,
+      "sha256": "49493143303d5f9d8500f50827a8c3ef13cc4d494e19baa115e0aa58a8c237cf"
+    },
+    {
+      "asset": "w208.png",
+      "path": "高清/玛尔莎.png",
+      "bytes": 56304791,
+      "sha256": "fcaf42a4eb689b0570eacf5ddbec0e698a0b0cc19b88d30a71aa5e9d2cb9b5d3"
+    },
+    {
+      "asset": "w209.png",
+      "path": "高清/环状水星1.png",
+      "bytes": 59035264,
+      "sha256": "4a859a8d44daea2533d78b51a881b922623b17e703ef96e7bbed8c80cb595958"
+    },
+    {
+      "asset": "w210.png",
+      "path": "高清/环状水星2.png",
+      "bytes": 56497630,
+      "sha256": "099a17b0e42db4bd837f6472bfb0685d67b9d351ac1fb64c9e5232f6e8e21a2c"
+    },
+    {
+      "asset": "w211.png",
+      "path": "高清/笃笃骨圈.png",
+      "bytes": 56046371,
+      "sha256": "6701886cd5bfd8ab58b4c1e58d6b7f6e0548ae2b9fff8965bb9ef57588fd90bc"
+    },
+    {
+      "asset": "w212.png",
+      "path": "高清/艾吉奥.png",
+      "bytes": 62083389,
+      "sha256": "88a8b23b313aed043bcea1ab6cb307ee233f8eb71c694b0a4a19a7412bbbea41"
+    },
+    {
+      "asset": "w213.png",
+      "path": "高清/艾吉奥Apple.png",
+      "bytes": 56462339,
+      "sha256": "1f2e268c71f391089f862f3a78f6bde25954bbb6e8d303ba6d4f0b041b3d2d03"
+    },
+    {
+      "asset": "w214.png",
+      "path": "高清/芭卡洛儿1.png",
+      "bytes": 50535704,
+      "sha256": "db97252851c11666924f3415ee475ac454326ce68b59cdab52b68770c36826de"
+    },
+    {
+      "asset": "w215.png",
+      "path": "高清/芭卡洛儿2.png",
+      "bytes": 53005361,
+      "sha256": "12d4c1a6ec26232c103459de793dd8cec1896a81ce2a54460963d71576885728"
+    },
+    {
+      "asset": "w216.png",
+      "path": "高清/芭卡洛儿3.png",
+      "bytes": 54562087,
+      "sha256": "d34dea7f07faba68144e00ce822511f27b5b06df31e9d81cd4ee9992246d55ee"
+    },
+    {
+      "asset": "w217.png",
+      "path": "高清/花环2.png",
+      "bytes": 56723826,
+      "sha256": "83db215788afcd03f60a9b7037158a30a2c88445f77d7b1e4712347ad1773e5d"
+    },
+    {
+      "asset": "w218.png",
+      "path": "高清/花环3.png",
+      "bytes": 59937744,
+      "sha256": "d56130a62621d662be4e445d5b39223572206ab3dbd50a1645794d3183e345c1"
+    },
+    {
+      "asset": "w219.png",
+      "path": "高清/花环4.png",
+      "bytes": 59741274,
+      "sha256": "c5031f248471b08dae5a9d7b6a4bd0d3bc699524e4e76a950baa1e6a46598480"
+    },
+    {
+      "asset": "w220.png",
+      "path": "高清/茉莉伊戈尔.png",
+      "bytes": 64252978,
+      "sha256": "33bff0e199e841679b34d614c789ce9c6b80627b6cf22a30355c166f09c5148c"
+    },
+    {
+      "asset": "w221.png",
+      "path": "高清/蓝手帕.png",
+      "bytes": 57574471,
+      "sha256": "73921c24834c13b2ff11416573ae2170a585b1a58136f8281d6d90ac6e02ab46"
+    },
+    {
+      "asset": "w222.png",
+      "path": "高清/诺V.png",
+      "bytes": 61843868,
+      "sha256": "3a525b1f98fc3ac073aeaf58c051c794d093741dc05150ead171fb43baf7dcd4"
+    },
+    {
+      "asset": "w223.png",
+      "path": "高清/诺谛卡3.png",
+      "bytes": 59867894,
+      "sha256": "5f64b79ed4d28f7506006ea4e90f95230d91fa9c98078a774d69abe7e1996bee"
+    },
+    {
+      "asset": "w224.png",
+      "path": "高清/贝利尔5.png",
+      "bytes": 58947612,
+      "sha256": "9736d6cca6bdc076a7ebb1e3954293025d20d19843b15160bedff7d0b6f4efb2"
+    },
+    {
+      "asset": "w225.png",
+      "path": "高清/贝利尔6.png",
+      "bytes": 64990669,
+      "sha256": "d00fe1ff8152aaea0b6f92074e592e8f62928802808195335a3a33f079b658ab"
+    },
+    {
+      "asset": "w226.png",
+      "path": "高清/酒神颂.png",
+      "bytes": 56825170,
+      "sha256": "c6b462b5fea4f02d960fa9575893c0de5cc1f7b46b4407d22965ae2e5b8fffdf"
+    },
+    {
+      "asset": "w227.png",
+      "path": "高清/镜映.png",
+      "bytes": 60560080,
+      "sha256": "de4b0028724ea35ebc63f06be7b68d7142d605529492e2019205f6b4dc9804dc"
+    },
+    {
+      "asset": "w228.png",
+      "path": "高清/阿尔卡纳1.png",
+      "bytes": 59597602,
+      "sha256": "cbbc7509346fcbb32561e53ec3e2c0d877bb20e0e127e608336542cb9bad985b"
+    },
+    {
+      "asset": "w229.png",
+      "path": "高清/阿莱夫2.png",
+      "bytes": 58758557,
+      "sha256": "323f91871341198463cd9c363ed77cba9901a44e1af50f6a049e18c126fbb8b8"
+    },
+    {
+      "asset": "w230.png",
+      "path": "高清/露西3.png",
+      "bytes": 56414707,
+      "sha256": "b61546574df4cd366cbd69df724c9f0a6f9f8212a2b03f2d9edaa909a8ee49f8"
+    },
+    {
+      "asset": "w231.png",
+      "path": "高清/鹭鸶剪.png",
+      "bytes": 63606074,
+      "sha256": "4a76d4bde67b950515b719b3cd7f61d480520b6122524bdda98b3af279744a11"
+    },
+    {
+      "asset": "w232.png",
+      "path": "高清/鹰与众神的时代.png",
+      "bytes": 66194101,
+      "sha256": "c7c19845995557d10fef41d0ba149f200d0c301d9ef872ed923b1366114fae1e"
+    },
+    {
+      "asset": "w233.png",
+      "path": "重返未来1999/V14VVV.png",
+      "bytes": 4945818,
+      "sha256": "d7be99548cc684e17f5672534999ec17cf01dfd5267ffa8284e20e13fcd8fb7d"
+    },
+    {
+      "asset": "w234.png",
+      "path": "重返未来1999/VVVVV.png",
+      "bytes": 5883979,
+      "sha256": "aab2d02c38f5baa3c469dfdb7b3067c50846a28b0ef3481ecacb89625d82e3b3"
+    },
+    {
+      "asset": "w235.png",
+      "path": "重返未来1999/VVV·1.png",
+      "bytes": 4704269,
+      "sha256": "d2379baf65c54ad744a52bf028e73f0025174c93ca0cda1bb4c55547e44a2de1"
     }
   ]
 }

@@ -67,25 +67,41 @@ for (const f of files) {
   if (bySha.has(f.sha256)) console.error('  警告：两处内容相同 ' + f.path + ' 与 ' + bySha.get(f.sha256).path)
   bySha.set(f.sha256, f)
 }
-const used = new Set()
-const items = []
+const used = new Set(), usedNames = new Set(), items = [], renamed = []
 for (const it of prev.items) {
   const hit = bySha.get(it.sha256)
   if (!hit) { console.error('  ! ' + it.asset + '（' + it.path + '）在本机找不到相同内容 —— 它的资产需要重新上传'); continue }
   if (used.has(hit.sha256)) { console.error('  ! ' + it.asset + ' 与前面某项内容重复，跳过'); continue }
   used.add(hit.sha256)
+  // 旧清单里可能就有**重名**（曾经的续编起点是"上一版的条数"，而旧清单最大号是 w138 ⇒ 撞出三个 w136/w137/w138）。
+  // 名字必须唯一：同名不同内容上传时 GitHub 直接 422（实测 w136.png），留在清单里就是永远传不完。
+  // 先到先得 —— 占住这个名字的不动，后来的挪到末尾重新编号。
+  if (usedNames.has(it.asset)) { console.error('  ! ' + it.asset + '（' + hit.path + '）与前面的资产重名 —— 挪到末尾重新编号'); renamed.push(hit); continue }
+  usedNames.add(it.asset)
   items.push({ asset: it.asset, path: hit.path, bytes: hit.bytes, sha256: hit.sha256 })
   console.log('  = ' + it.asset + '  ← ' + hit.path + '  ' + mb(hit.bytes) + (hit.path === it.path ? '' : '（由 ' + it.path + ' 改名）'))
 }
 
 // ---- 4) 新图续编 ----
+// 起点取**已用编号的最大值**，不是条数：旧清单 135 条但最大号 w138，按条数续编必然撞号。
+const maxNum = (list) => list.reduce((max, it) => Math.max(max, parseInt(String(it.asset).replace(/\D/g, ''), 10) || 0), 0)
+let n = maxNum(prev.items)
+const nextAsset = (ext) => {
+  let name
+  do { n += 1; name = 'w' + String(n).padStart(2, '0') + ext } while (usedNames.has(name))
+  usedNames.add(name)
+  return name
+}
 const rest = files.filter((f) => !used.has(f.sha256))
-let n = prev.items.length
-for (const f of rest) {
-  n += 1
-  const asset = 'w' + String(n).padStart(2, '0') + f.ext
+for (const f of [...rest, ...renamed]) {
+  const asset = nextAsset(f.ext)
   items.push({ asset, path: f.path, bytes: f.bytes, sha256: f.sha256 })
   console.log('  + ' + asset + '  ← ' + f.path + '  ' + mb(f.bytes))
+}
+// 自检：名字重复就直接失败 —— 这种清单能写出来但永远传不完（GitHub 422），越早炸越好。
+if (usedNames.size !== items.length) {
+  console.error('内部错误：算出来的资产名有重复（' + usedNames.size + ' 个名字 / ' + items.length + ' 项），拒绝写出')
+  process.exit(1)
 }
 
 // ---- 5) 写出 ----
@@ -102,6 +118,6 @@ const manifest = {
 fs.writeFileSync(OUT, JSON.stringify(manifest, null, 2), 'utf8')
 console.log('\n已写出 ' + OUT)
 console.log('  ' + manifest.total + ' 张 · ' + mb(manifest.totalBytes) +
-  '（本次要新传 ' + rest.length + ' 张 · ' + mb(rest.reduce((s, f) => s + f.bytes, 0)) + '）')
+  '（本次要新传 ' + (rest.length + renamed.length) + ' 张 · ' + mb([...rest, ...renamed].reduce((s, f) => s + f.bytes, 0)) + '）')
 console.log('  基址 ' + manifest.release.base)
 console.log('  下一步：node tools/make-release.mjs')
