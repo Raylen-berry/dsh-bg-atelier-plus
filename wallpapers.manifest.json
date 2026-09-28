@@ -1,13 +1,13 @@
 {
   "format": "dsh-bg-atelier-wallpapers/1",
-  "generatedAt": "2026-09-28T08:13:17.615Z",
+  "generatedAt": "2026-09-28T10:51:06.062Z",
   "release": {
     "tag": "wallpapers-v1",
     "repo": "Raylen-berry/dsh-desktop-wallpaper",
     "base": "https://github.com/Raylen-berry/dsh-desktop-wallpaper/releases/download/wallpapers-v1"
   },
-  "total": 229,
-  "totalBytes": 6829025084,
+  "total": 227,
+  "totalBytes": 6810723894,
   "policy": "lossless：一律上传原始文件（PNG/JPG 原样，不缩放、不重编码）",
   "items": [
     {
@@ -59,12 +59,6 @@
       "sha256": "febf88f66dc55b22d4db2603b96313826cbd5e857fdcda0ef911034875ddc30f"
     },
     {
-      "asset": "w09.jpg",
-      "path": "重返未来1999/金蜜卡.jpg",
-      "bytes": 160116,
-      "sha256": "bd8a65c19f0d41dbeb06ef13472e9f993f347a678e15782109b4b17f3ca2cfdb"
-    },
-    {
       "asset": "w10.png",
       "path": "高清/亚丝娜.png",
       "bytes": 18644181,
@@ -111,12 +105,6 @@
       "path": "高清/远坂凛.png",
       "bytes": 63283616,
       "sha256": "45521214204d8cf158b128f63ca109e001e9dce9300830b626d5a3d9a43b56ad"
-    },
-    {
-      "asset": "w18.png",
-      "path": "高清/金蜜卡.png",
-      "bytes": 18141074,
-      "sha256": "86ca7710d0233f88b002e7b7871861bc7e7cdbde629924ece11306041202ba3d"
     },
     {
       "asset": "w19.jpg",

@@ -36,10 +36,10 @@ dsh plugin --profile web add link:D:\DeepSeek\dsh-plugins\dsh-desktop-wallpaper
 
 ## 放入/更换底图（按类型）
 
-**开箱即用**：插件内置 **4 个类型共 229 张底图**（二次元 2 / 线稿风 5 / 重返未来1999 107 / 高清 115）。
+**开箱即用**：插件内置 **4 个类型共 227 张底图**（二次元 2 / 线稿风 5 / 重返未来1999 106 / 高清 114）。
 clone 完先在插件目录跑一次 `node tools/fetch-wallpapers.mjs`（或设置页点「**下载底图**」）把图取回来，再重启 DSH；
 设置 → 底图工坊 → 点类型卡进入图库即可选。**图片不进 git**（v1.5.5 起改走 Release 资产，见下面 A 节），
-所以 clone 只有代码、很快；`wallpapers/` 里是**原始文件**（无损，约 6.36 GB，口径见 A 节）。
+所以 clone 只有代码、很快；`wallpapers/` 里是**原始文件**（无损，约 6.34 GB，口径见 A 节）。
 
 **加一个新类型/新图**：把图片放进「放图目录」下**一个子文件夹 = 一个类型**，例如：
 
@@ -161,7 +161,7 @@ CI 用 Node 20/22/24 三档矩阵、windows-latest。
 | `tools/verify-dockfx-bounds.mjs` | 全部 PASS |
 
 **未纳入 CI** 的步骤（原因同时写在 `tools/run-all.mjs` 的 `EXCLUDED` 里）：
-`tools/fetch-wallpapers.mjs --check`（要本机已备好 229 张约 6.36GB 底图，图片不进 git ⇒ CI 上必然失败；
+`tools/fetch-wallpapers.mjs --check`（要本机已备好 227 张约 6.34GB 底图，图片不进 git ⇒ CI 上必然失败；
 而且这个脚本本身就会**真实下载**，绝不能进 CI）、
 `tools/test-served-bytes.mjs`（要 `wallpapers/` 里的真实图片才能起供图路由断言，离线实测退出码 1）。
 
@@ -172,7 +172,7 @@ CI 用 Node 20/22/24 三档矩阵、windows-latest。
 > （起因：用户 2026-09-12 反馈"工作电脑上传、回家发现可用性很差、必须手动操作"。）
 
 **A. 克隆体积（v1.5.5 起：图不进 git，改为 Release 资产 + 按需下载）**
-底图合计约 **6.36 GB**（现 229 张；Release tag `wallpapers-v1` 与清单同步为 229 个资产），长期放在 git 里会让每次克隆都变成几百 MB（用户换机时"装个插件要拉几百兆"就是这么来的）。
+底图合计约 **6.34 GB**（现 227 张；Release tag `wallpapers-v1` 与清单同步为 227 个资产），长期放在 git 里会让每次克隆都变成几百 MB（用户换机时"装个插件要拉几百兆"就是这么来的）。
 加图后的发版流程：`node tools/make-manifest-append.mjs --from <上一版清单>` → `node tools/make-release.mjs`（对账+补传+逐张回验，可断点续传）。
 仓库只留 `wallpapers.manifest.json`（每张图的路径 + 字节数 + sha256），图片作为 Release 资产发布（tag `wallpapers-v1`）：
 
@@ -183,7 +183,7 @@ node tools/fetch-wallpapers.mjs --check                               # 只校�
 ```
 
 **画质口径：完全无损 —— 不缩放、不重编码。** Release 资产就是原始文件（PNG / JPG 原样），逐张 sha256 与清单一致。
-下载量确实大（6.36 GB），这是有意换来的：底图是长期资产，宁可下载慢，也不要在存档上留一次有损编码。
+下载量确实大（6.34 GB），这是有意换来的：底图是长期资产，宁可下载慢，也不要在存档上留一次有损编码。
 
 **显示这一侧现在也不打折（v1.6.1 起）**：host 供图**不设尺寸上限**，把原图**字节**直接送给浏览器 ——
 5120 / 7680 长边的超宽屏、8K 屏全都吃满，不会再被 3840 拉成放大模糊（此前 `SERVED_MAX_DIM = 3840`
