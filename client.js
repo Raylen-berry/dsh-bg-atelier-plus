@@ -3,7 +3,7 @@
 // 职责: 底图绘制 + 主题 token 染色 + 琉璃卡面与 dock 特效 + WE 动效层 + 设置页。
 //   · 底图按"类型"两级浏览: 一级 = 放图目录下每个子文件夹一个类型, 二级 = 该类型图库
 //     (缩略图即点即换, №编号角标, 全部/高清/普通筛选)。
-//   · 换图宝珠 = 跨全部类型随机, 轮次式 2/3 不重复洗牌 (见 cycleWallpaper 注释)。
+//   · 换图宝珠 / 手动 / 自动共享选定范围与随机或顺序播放；图单可排序，构图按图片保存。
 //   · 粒子数量随画布宽度按固定间距缩放 (countFor/DENSITY); 特效与底图解耦 (无底图也照画)。
 //   · 清单与设置走 /bga/* HTTP 路由, 样式自包含注入。
 // 历史流水账的唯一真源在 README「更新记录」；此处只留**解释当前行为**的注释。
@@ -109,6 +109,17 @@ var STORE = {
     focus: '50% 50%',     // 底图焦点 (九宫格), 裁剪时保住画面主体
     zoom: 1,              // 底图缩放 1..2.2 (绕焦点放大)
     preset: 'sakura',
+    // v1.10.0 自动切换 / 渐变过渡; v1.11.0 起间隔走 AUTO_STOPS 档位, 过渡的时长与响应时间可调
+    autoOn: false,        // 定时自动换图开关 (默认关: 不请自来的换图很烦)
+    autoMin: 30,          // 自动切换间隔, 取 AUTO_STOPS 里的一档 (读的时候按 autoDelayMs 再吸附一次)
+    fadeOn: true,         // 换图时淡入淡出, 全局生效 (点图卡 / 宝珠随机 / 自动切换都走它)
+    fadeDelayMs: 0,       // 响应时间 ms 0..1000: 换图后旧图先原样多盖一会儿, 到点才开始淡出
+    fadeMs: 900,          // 渐变时长 ms 100..5000: 旧图淡出那一段的长度
+    playlists: [{ id: 'favorites', name: '我喜欢', items: [] }],
+    playbackSource: 'all', // all | cat:<目录名> | list:<图单 id>
+    playbackMode: 'random', // random | ordered
+    imageFraming: {},       // 稳定图片 id → {zoom, focus}；未单独调整的图沿用旧版默认构图
+    recent: [],
     // v1.7.0 WE 动效底图: 只存 entry id, 真实 entry (封面/取色/相对路径) 每次启动从 host 的
     // /bga/we/library.json 重新解析 —— 壁纸在 WE 侧取消订阅后这里自然解析不到, 静默跳过。
     weId: null,
@@ -123,9 +134,17 @@ var STORE = {
   total: 0,         // 全部类型图片总数
   listeners: [],
   set: function (patch) {
+    // 清空或其它入口直接指定底图时，取消仍在解码的旧请求，防止稍后又盖回来。
+    if (Object.prototype.hasOwnProperty.call(patch, 'wallpaper') || patch.weId) cancelWallpaperRequest()
+    if (patch.wallpaper === null) decodedWallpaper=null
     var next = {}
     for (var k in this.state) next[k] = this.state[k]
     for (var p in patch) next[p] = patch[p]
+    if (Object.prototype.hasOwnProperty.call(patch, 'playlists')) next.playlists = normalizePlaylists(patch.playlists)
+    if (Object.prototype.hasOwnProperty.call(patch, 'recent')) next.recent = uniqueImageIds(patch.recent).slice(0, 36)
+    if (Object.prototype.hasOwnProperty.call(patch, 'playbackSource')) next.playbackSource = normalizeSource(patch.playbackSource)
+    if (Object.prototype.hasOwnProperty.call(patch, 'playbackMode')) next.playbackMode = patch.playbackMode === 'ordered' ? 'ordered' : 'random'
+    if (Object.prototype.hasOwnProperty.call(patch, 'imageFraming')) next.imageFraming = normalizeImageFraming(patch.imageFraming)
     this.state = next
     STORE.save()
     for (var i = 0; i < this.listeners.length; i++) this.listeners[i]()
@@ -142,32 +161,45 @@ var STORE = {
     // 整份 PUT 覆盖掉你的真实配置 —— 这正是"底图 / 特效突然全没了"的成因之一。
     // dsh-cache-control 早就有这道闸（它 state 里的 loaded），本插件一直缺。
     if (!stateLoaded) return
+    STORE.saveStatus = 'saving'
+    STORE._savePending = true
     if (STORE._saveTimer) { clearTimeout(STORE._saveTimer); STORE._saveTimer = null }
     STORE._saveTimer = setTimeout(function () {
-      try {
-        fetch('/bga/settings.json', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(STORE.state),
-        }).catch(function () {})
-      } catch (e) { /* ignore */ }
+      STORE._saveTimer = null
+      STORE.flushSave()
     }, 300)
+  },
+  // 保存串行化：上一份写完才发最新状态，避免迟到请求覆盖新图单。
+  flushSave: function () {
+    if (STORE._saving || !STORE._savePending) return
+    STORE._saving = true
+    STORE._savePending = false
+    Promise.resolve().then(function () {
+      return fetch('/bga/settings.json', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(STORE.state) })
+    }).then(function (r) {
+      if (!r.ok) throw new Error('save failed')
+      STORE.saveStatus = STORE._savePending ? 'saving' : 'saved'
+    }).catch(function () { STORE.saveStatus = 'error' }).then(function () {
+      STORE._saving = false
+      if (STORE._savePending) STORE.flushSave()
+      STORE.touch()
+    })
   },
   load: function () {
     return fetch('/bga/settings.json', { cache: 'no-store' })
-      .then(function (r) { return r.ok ? r.json() : {} })
-      .catch(function () { return {} })
+      .then(function (r) { if (!r.ok) throw new Error('settings unavailable'); return r.json() })
       .then(function (saved) {
-        if (!saved || typeof saved !== 'object') return
+        if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw new Error('invalid settings')
         var patch = {}
         for (var k in STORE.state) if (k in saved) patch[k] = saved[k]
         // 一份"真设置"至少要能对上我们认识的一个字段；对不上就是 {} / 路由没就绪
         // ⇒ 保持"未装载"、不许写盘（见 save 里的闸）。
-        if (!Object.keys(patch).length) return
+        // 成功的空对象代表新安装；只有 HTTP/解析失败时禁止保存。
         if (patch.effect !== undefined) patch.effect = normalizeEffect(patch.effect)
         stateLoaded = true                    // 先开闸，再 set（set 内部会 save）
         STORE.set(patch)                      // 触发监听→重绘
       })
+      .catch(function () { STORE.saveStatus = 'load-error'; STORE.touch() })
   },
   subscribe: function (fn) {
     this.listeners.push(fn)
@@ -216,6 +248,249 @@ function wallpaperOf(item) {
     hd: !!item.hd,
     no: item.no || 0,
   }
+}
+
+/** 换底图的唯一入口（点图卡 / 侧栏宝珠 / 自动切换都走它）：**先把新图解码好再切**。
+ *  列表里显示的是 640px 预览，底图是几十 MB 的原图；不等它解码就切，body::before 还是空的，
+ *  而上一张正在 900ms 里淡出 ⇒ 中间几帧透出深色底（先变暗再回来，就是"不自然"的来源）。
+ *  等到解码成功才切；失败/超时保留现有底图，不把尚未可画的图片硬塞到渐变下面。
+ *  swapSeq：连着点两张时，慢的那张不许盖掉后点的快图。 */
+var swapSeq = 0
+var pendingStep = null
+var queuedSwap = null
+var decodeJob = null
+var decodedWallpaper = null
+function cancelWallpaperRequest() {
+  swapSeq++
+  pendingStep = null
+  queuedSwap = null
+  if(decodeJob){var job=decodeJob;decodeJob=null;job.cancel()}
+  if(!STORE.state.wallpaper)decodedWallpaper=null
+}
+
+// 图单只保存稳定图片 id，不移动原图；缺失图片仍留在图单，文件恢复后自动可用。
+function uniqueImageIds(value) {
+  if (!Array.isArray(value)) return []
+  return Array.from(new Set(value.filter(function (id) { return typeof id === 'string' && id.length > 0 && id.length <= 512 }))).slice(0, 2000)
+}
+function normalizePlaylists(value) {
+  var seen = new Set(), result = []
+  if (Array.isArray(value)) value.slice(0, 64).forEach(function (p) {
+    if (!p || typeof p.id !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(p.id) || seen.has(p.id)) return
+    var name = typeof p.name === 'string' ? p.name.trim().slice(0, 40) : ''
+    if (!name && p.id !== 'favorites') return
+    seen.add(p.id)
+    result.push({ id: p.id, name: p.id === 'favorites' ? '我喜欢' : name, items: uniqueImageIds(p.items) })
+  })
+  if (!seen.has('favorites')) result.unshift({ id: 'favorites', name: '我喜欢', items: [] })
+  return result
+}
+function normalizeSource(value) {
+  return typeof value === 'string' && value.length <= 520 && /^(all|cat:.+|list:[a-zA-Z0-9_-]{1,80})$/.test(value) ? value : 'all'
+}
+function playlistById(id) { return STORE.state.playlists.find(function (p) { return p.id === id }) }
+function normalizeFrame(value) {
+  value = value || {}
+  var zoom = Number(value.zoom), match = typeof value.focus === 'string' && value.focus.trim().match(/^(\d+(?:\.\d+)?)% (\d+(?:\.\d+)?)%$/)
+  return {zoom:isFinite(zoom)?Math.max(1,Math.min(2.2,zoom)):1,
+    focus:match?Math.min(100,Number(match[1]))+'% '+Math.min(100,Number(match[2]))+'%':'50% 50%'}
+}
+function normalizeImageFraming(value) {
+  var result = Object.create(null)
+  if (value && typeof value === 'object' && !Array.isArray(value)) Object.keys(value).slice(0,2000).forEach(function(id){
+    if(id && id.length<=512 && value[id] && typeof value[id]==='object' && !Array.isArray(value[id])) result[id]=normalizeFrame(value[id])
+  })
+  return result
+}
+function framingOf(s, wallpaper) {
+  var id = wallpaper && (wallpaper.id || wallpaper.url)
+  var map=s.imageFraming||{},url=wallpaper&&wallpaper.url
+  return normalizeFrame(id && Object.prototype.hasOwnProperty.call(map,id) ? map[id] : url && Object.prototype.hasOwnProperty.call(map,url) ? map[url] : s)
+}
+function framingForUrl(s,url) {
+  var w = s.wallpaper && s.wallpaper.url === url ? s.wallpaper : STORE.list.find(function(it){return it.url===url})
+  return framingOf(s,w)
+}
+function setImageFraming(patch) {
+  var s=STORE.state,w=s.wallpaper,id=w&&(w.id||w.url)
+  if(!id)return
+  var map=Object.assign(Object.create(null),s.imageFraming)
+  map[id]=normalizeFrame(Object.assign({},framingOf(s,w),patch))
+  STORE.set({imageFraming:map})
+}
+function resetImageFraming() { setImageFraming({zoom:1,focus:'50% 50%'}) }
+function sourceItems(source, items) {
+  source = source || 'all'
+  items = items || STORE.list
+  if (source === 'all') return items
+  if (source.indexOf('cat:') === 0) return items.filter(function (it) { return it.cat === source.slice(4) })
+  var ids = source === 'recent' ? STORE.state.recent : (playlistById(source.slice(5)) || {}).items || []
+  var byId = new Map(items.map(function (it) { return [it.id, it] }))
+  return ids.map(function (id) { return byId.get(id) }).filter(Boolean)
+}
+function sourceLabel(source) {
+  if (source === 'all') return '全部壁纸'
+  if (source === 'recent') return '最近使用'
+  if (source.indexOf('cat:') === 0) return source.slice(4)
+  return (playlistById(source.slice(5)) || {}).name || '图单已不存在'
+}
+function createPlaylist(name, ids) {
+  name = String(name || '').trim().slice(0, 40)
+  if (!name) throw new Error('给图单起个名字吧')
+  if (STORE.state.playlists.some(function (p) { return p.name.toLocaleLowerCase() === name.toLocaleLowerCase() })) throw new Error('已有同名图单，换个名字吧')
+  if (STORE.state.playlists.length >= 64) throw new Error('图单已达 64 个，请先整理现有图单')
+  var id = 'p-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+  STORE.set({ playlists: STORE.state.playlists.concat([{ id: id, name: name, items: uniqueImageIds(ids) }]) })
+  return id
+}
+function renamePlaylist(id, name) {
+  if (id === 'favorites') return
+  name = String(name || '').trim().slice(0, 40)
+  if (!name) throw new Error('图单名称不能为空')
+  if (STORE.state.playlists.some(function (p) { return p.id !== id && p.name.toLocaleLowerCase() === name.toLocaleLowerCase() })) throw new Error('已有同名图单')
+  STORE.set({playlists: STORE.state.playlists.map(function (p) { return p.id === id ? { id: p.id, name: name, items: p.items } : p })})
+}
+function removePlaylist(id) {
+  if (id === 'favorites') return
+  var patch = {playlists: STORE.state.playlists.filter(function (p) { return p.id !== id })}
+  if (STORE.state.playbackSource === 'list:' + id) { patch.playbackSource = 'all'; patch.autoOn = false; cancelWallpaperRequest(); nextUrl = null }
+  STORE.set(patch)
+}
+function changeMembership(ids, listIds, replace) {
+  ids = uniqueImageIds(ids)
+  STORE.set({playlists: STORE.state.playlists.map(function (p) {
+    var add = listIds.indexOf(p.id) >= 0
+    if (!add && !replace) return p
+    return {id:p.id, name:p.name, items: add ? uniqueImageIds(p.items.concat(ids)) : p.items.filter(function (id) { return ids.indexOf(id) < 0 })}
+  })})
+}
+function removeFromPlaylist(id, ids) {
+  STORE.set({playlists: STORE.state.playlists.map(function (p) { return p.id === id ? {id:p.id,name:p.name,items:p.items.filter(function (i) {return ids.indexOf(i)<0})} : p })})
+}
+function toggleFavorite(id) {
+  var fav = playlistById('favorites')
+  if (fav.items.indexOf(id) >= 0) removeFromPlaylist('favorites', [id])
+  else changeMembership([id], ['favorites'], false)
+}
+function setPlaybackSource(source) {
+  cancelWallpaperRequest(); nextUrl = null
+  nextFade=null;lastManualFadeAt=null
+  if(normalizeSource(source)!==STORE.state.playbackSource){playbackTrail=[];playbackCursor=-1;trailSource=''}
+  STORE.set({playbackSource: normalizeSource(source)})
+}
+function reorderPlaylist(id, moving, target) {
+  var list=playlistById(id)
+  if(!list || moving===target)return
+  var from=list.items.indexOf(moving),to=list.items.indexOf(target)
+  if(from<0||to<0)return
+  var ids=list.items.slice();ids.splice(from,1);ids.splice(to,0,moving)
+  if(STORE.state.playbackSource==='list:'+id)playbackTrail=playbackTrail.slice(0,playbackCursor+1)
+  STORE.set({playlists:STORE.state.playlists.map(function(p){return p.id===id?{id:p.id,name:p.name,items:ids}:p})})
+}
+function setPlaybackMode(mode) {
+  cancelWallpaperRequest();cycleDeck=[];cycleSig=''
+  playbackTrail=playbackTrail.slice(0,playbackCursor+1)
+  STORE.set({playbackMode:mode})
+}
+// 浏览历史保留重复经过的图；最近使用的去重列表不能用来实现连续后退。
+var playbackTrail=[],playbackCursor=-1,trailSource=''
+function syncPlaybackTrail() {
+  var source=STORE.state.playbackSource,allowed=new Set(sourceItems(source).map(function(it){return it.id}))
+  if(trailSource!==source){playbackTrail=[];playbackCursor=-1;trailSource=source}
+  var kept=[],cursor=-1
+  playbackTrail.forEach(function(id,i){if(allowed.has(id)){kept.push(id);if(i<=playbackCursor)cursor=kept.length-1}})
+  playbackTrail=kept;playbackCursor=cursor
+  var cur=STORE.state.wallpaper
+  if(!playbackTrail.length&&cur&&allowed.has(cur.id)){playbackTrail=[cur.id];playbackCursor=0}
+}
+function recordWallpaper(id, historyIndex) {
+  syncPlaybackTrail()
+  if(!sourceItems(STORE.state.playbackSource).some(function(it){return it.id===id}))return
+  if(typeof historyIndex==='number'&&playbackTrail[historyIndex]===id){playbackCursor=historyIndex;return}
+  if(playbackTrail[playbackCursor]===id)return
+  playbackTrail=playbackTrail.slice(0,playbackCursor+1).concat(id).slice(-100)
+  playbackCursor=playbackTrail.length-1
+}
+function historyStep(direction, timing) {
+  syncPlaybackTrail()
+  var cursor=pendingStep&&typeof pendingStep.historyIndex==='number'?pendingStep.historyIndex:playbackCursor
+  var cur=STORE.state.wallpaper
+  if(!pendingStep&&cur&&!sourceItems(STORE.state.playbackSource).some(function(it){return it.id===cur.id}))cursor=playbackTrail.length
+  var index=cursor+direction
+  if(index<0||index>=playbackTrail.length)return false
+  var item=sourceItems(STORE.state.playbackSource).find(function(it){return it.id===playbackTrail[index]})
+  if(!item)return false
+  setWallpaper(item,{historyIndex:index,source:STORE.state.playbackSource,timing:timing});return true
+}
+function canPreviousWallpaper() {
+  syncPlaybackTrail()
+  var cur=STORE.state.wallpaper
+  return playbackCursor>0 || playbackTrail.length>0&&cur&&!sourceItems(STORE.state.playbackSource).some(function(it){return it.id===cur.id})
+}
+function previousWallpaper() { if(!STORE.state.weId&&!weActive())historyStep(-1) }
+function setWallpaper(item, navigation) {
+  navigation=navigation||{}
+  // 时长在点击当下决定，不能把图片解码耗时算成用户的点击间隔。
+  var timing=navigation.timing || (navigation.automatic ? normalFadeTiming() : manualFadeTiming())
+  pendingStep={id:item.id,historyIndex:navigation.historyIndex}
+  var request={seq:++swapSeq,wallpaper:wallpaperOf(item),navigation:navigation,timing:timing}
+  // 每次点击推进逻辑位置；同一时刻只解码一张，再留一个可替换的最新目标。
+  // 不为注定赶不上屏幕的中间图开一批无法真正停止的 decode()。
+  queuedSwap=request
+  if(decodeJob&&decodeJob.request.wallpaper.url===request.wallpaper.url){decodeJob.request=request;queuedSwap=null;return}
+  var current=STORE.state.wallpaper
+  if(current&&current.id===request.wallpaper.id&&current.url===request.wallpaper.url){
+    queuedSwap=null;pendingStep=null
+    // 已显示的图无需再解码，但旧设置补全名称、历史返回的位置仍须更新。
+    if(Object.keys(request.wallpaper).some(function(key){return current[key]!==request.wallpaper[key]}))commitWallpaper(request,decodedWallpaper&&decodedWallpaper.url===current.url?decodedWallpaper.img:null)
+    else recordWallpaper(request.wallpaper.id,navigation.historyIndex)
+    return
+  }
+  pumpWallpaperRequest()
+}
+function commitWallpaper(request, img) {
+  if(request.seq!==swapSeq)return
+  var w=request.wallpaper,navigation=request.navigation
+  if(navigation.source&&(navigation.source!==STORE.state.playbackSource||!sourceItems(navigation.source).some(function(it){return it.id===w.id}))){pendingStep=null;return}
+  recordWallpaper(w.id,navigation.historyIndex)
+  selectionFade={wallpaper:w,timing:request.timing}
+  var patch={wallpaper:w}
+  if(w.id&&w.url)patch.recent=[w.id].concat(STORE.state.recent.filter(function(id){return id!==w.id})).slice(0,36)
+  STORE.set(patch)
+  decodedWallpaper=img?{url:w.url,img:img}:null
+}
+function pumpWallpaperRequest() {
+  if(decodeJob||!queuedSwap)return
+  // 当前画面还在过渡时，先完成并提速这段；之后只加载最新目标。
+  // 这样大预览、STORE 与保存也不会追着每张尚未显示的图重绘。
+  if(fadeEl&&STORE.state.fadeOn!==false&&!reducedMotion())return
+  var request=queuedSwap;queuedSwap=null
+  if(request.seq!==swapSeq)return
+  var w=request.wallpaper
+  if(!w.url||typeof Image!=='function'){commitWallpaper(request,null);return}
+  if(decodedWallpaper&&decodedWallpaper.url===w.url){commitWallpaper(request,decodedWallpaper.img);return}
+  var img=new Image(),done=false,timer=0
+  var job={request:request,img:img,cancel:function(){finish(false,true)}}
+  decodeJob=job
+  function finish(ok, aborted){
+    if(done)return
+    done=true
+    if(timer){clearTimeout(timer);timer=0}
+    img.onload=img.onerror=null
+    if(decodeJob===job)decodeJob=null
+    var latest=job.request.seq===swapSeq
+    if(ok&&latest&&!aborted)commitWallpaper(job.request,img)
+    else {
+      // 显式清空/卸载/换范围时连 src 一并解除，释放加载引用；迟到回调被 done 拦住。
+      try{img.src=''}catch(e){}
+      if(latest&&!aborted){pendingStep=null;console.warn('[bg-atelier] 图片未能解码，保留当前底图')}
+    }
+    if(!aborted)pumpWallpaperRequest()
+  }
+  img.onload=function(){if(typeof img.decode!=='function')finish(true)}
+  img.onerror=function(){finish(false)}
+  timer=setTimeout(function(){finish(false)},15000)
+  try{img.src=w.url;if(typeof img.decode==='function')img.decode().then(function(){finish(true)},function(){finish(false)})}catch(e){finish(false)}
 }
 
 function fetchList() {
@@ -273,7 +548,7 @@ function rehydrateWallpaper() {
     if (w.url && it.url === w.url) { hit = it; break }
     if (!hit && dec && it.file === dec) { hit = it }
   }
-  if (hit) STORE.set({ wallpaper: wallpaperOf(hit) })
+  if (hit) setWallpaper(hit,{automatic:true})
 }
 
 // 持久化的旧选择可能只存了 url/name (旧版根目录图, 甚至乱码文件名)。
@@ -292,11 +567,11 @@ function rehydrateWallpaper() {
     if (w.url && it.url === w.url) { hit = it; break }
     if (!hit && dec && it.file === dec) { hit = it }
   }
-  if (hit) STORE.set({ wallpaper: wallpaperOf(hit) })
+  if (hit) setWallpaper(hit,{automatic:true})
 }
 
-// ---- 随机换图: 跨全部类型的轮次式 2/3 不重复 ----
-// 规则: 每轮从"所有类型的全部图"里随机抽出 ceil(2/3 × 总数) 张排成随机序列
+// ---- 当前范围内换图：按图单顺序循环，或轮次式 2/3 不重复随机 ----
+// 随机规则: 每轮从当前范围里随机抽出 ceil(2/3 × 总数) 张排成随机序列
 // 逐张播放; 同一轮内绝不重复 (即至少播完约 2/3 之后才可能出现重复)。一轮放完
 // "放回"再从总体随机取 2/3 开新一轮。换轮衔接处只避免与上一轮最后一张紧挨着。
 // 池子 (新增/删除图) 变化时自动重新洗一轮。每张图按 类型+文件名 有稳定 id,
@@ -326,17 +601,27 @@ function buildCycleDeck(ids) {
   return deck
 }
 
-function cycleWallpaper() {
+function cycleWallpaper(options) {
+  if (STORE.state.weId || weActive()) return
+  var timing=options&&options.automatic===true ? normalFadeTiming() : manualFadeTiming()
+  if(historyStep(1,timing))return
   function step(items) {
+    if (STORE.state.weId || weActive()) return
+    items = sourceItems(STORE.state.playbackSource, items)
     if (!items.length) return
     var cur = STORE.state.wallpaper
+    var currentId=pendingStep?pendingStep.id:cur&&cur.id
+    if(STORE.state.playbackMode==='ordered'){
+      var at=items.findIndex(function(it){return it.id===currentId})
+      setWallpaper(items[(at+1)%items.length],{source:STORE.state.playbackSource,timing:timing});return
+    }
     var byId = {}
     var ids = []
     for (var i = 0; i < items.length; i++) {
       byId[items[i].id] = items[i]
       ids.push(items[i].id)
     }
-    var sig = ids.slice().sort().join('\u0001') + '\u0001' + ids.length
+    var sig = STORE.state.playbackSource + '\u0001' + ids.slice().sort().join('\u0001') + '\u0001' + ids.length
     if (!cycleDeck.length || sig !== cycleSig) {
       cycleDeck = buildCycleDeck(ids)
       cycleSig = sig
@@ -345,7 +630,7 @@ function cycleWallpaper() {
     for (var guard = 0; guard < 2 && !picked; guard++) {
       while (cycleDeck.length) {
         var id = cycleDeck.shift()
-        if (cur && cur.id === id) continue   // 不与当前显示的同张
+        if (currentId === id) continue   // 不与当前选择或正在解码的同张
         var it = byId[id]
         if (!it) continue
         picked = it
@@ -357,12 +642,59 @@ function cycleWallpaper() {
     if (!picked) return
     cycleTail.push(picked.id)
     while (cycleTail.length > 12) cycleTail.shift()
-    STORE.set({ wallpaper: wallpaperOf(picked) })
+    setWallpaper(picked,{source:STORE.state.playbackSource,timing:timing})
   }
   if (STORE.list.length) { step(STORE.list); return }
   fetchList().then(step).catch(function (e) {
     console.error('[bg-atelier] cycle failed: ' + String(e))
   })
+}
+
+// ---- 自动切换 (v1.10.0): 间隔 1..120 分钟; v1.11.0 起是 AUTO_STOPS 那 14 个**不平均**档位 ----
+// 定时器只有一根、在模块作用域。**为什么带 signature**: 改个暗纱/配色也会走 STORE 监听,
+// 若监听里无条件重起定时器, 间隔就永远走不满(每隔几秒动一下滑块就归零)。signature = 开关 + 间隔。
+// 但**换图**是另一回事(v1.11.0 改): 上一次换图之后就重新起表 —— 手动换到满意的那张时,
+// 不会正好撞上刚走完的旧表被自动切换立刻换走(用户 2026-09-28 报的"我换到满意的又给我闪走")。
+var autoTimer = 0
+var autoSig = ''
+
+/** 间隔档位(分钟), **不平均**刻度。用户 2026-09-28 要求: 1..120 一档一分钟的均匀刻度里,
+ *  最常改的 1–10 分钟只占 8% 行程, 拖着点不准; 换成"等距滑杆 + 查表"后每档行程一样宽,
+ *  档位本身按手感取(前段密、后段疏)。改这张表 = 改 UI 的全部档位, 别处不用动。 */
+var AUTO_STOPS = [1, 2, 3, 4, 5, 7, 10, 15, 20, 30, 45, 60, 90, 120]
+
+/** 升序表里离 v 最近的一档。非有限值取第一档; 等距时取小的那个(结果确定, 不来回跳)。 */
+function nearestStop(list, v) {
+  var n = Number(v)
+  if (!isFinite(n)) return list[0]
+  var best = list[0]
+  for (var i = 1; i < list.length; i++) if (Math.abs(list[i] - n) < Math.abs(best - n)) best = list[i]
+  return best
+}
+
+/** 间隔毫秒数。读的时候也吸附一遍: 坏值(NaN/0/越界)会让 setTimeout(fn,NaN) 变成 0ms 死循环换图,
+ *  那是刷爆 CPU 与 settings.json 的写法, 不能只靠 UI 滑杆的范围兜底。
+ *  坏值兜 30 分钟而不是"最近档 1": 坏值绝不该变成一分钟一换。 */
+function autoDelayMs() {
+  var m = Number(STORE.state.autoMin)
+  if (!isFinite(m)) m = 30
+  return nearestStop(AUTO_STOPS, m) * 60000
+}
+
+/** 起/停定时器; force=true 时无条件重置(自动换图那一次用, 它自己先把 timer 置了 0)。 */
+function armAuto(force) {
+  var on = STORE.state.autoOn === true
+  var sig = on ? String(autoDelayMs()) + ':' + STORE.state.playbackSource : ''
+  if (!force && sig === autoSig) return
+  autoSig = sig
+  if (autoTimer) { clearTimeout(autoTimer); autoTimer = 0 }
+  if (on) autoTimer = setTimeout(autoTick, autoDelayMs())
+}
+
+function autoTick() {
+  autoTimer = 0
+  try { cycleWallpaper({automatic:true}) } catch (e) { console.error('[bg-atelier] auto cycle failed: ' + String(e)) }
+  armAuto(true)   // 重新起表: 换图失败/池子为空也不该让自动切换悄悄停掉
 }
 
 // ---------------------------------------------------------------- 颜色工具 --
@@ -454,7 +786,7 @@ function effectCss(s, accent, deep) {
   return 'body [data-composer-card]{box-shadow:' + parts.join(',') + '}\n'
 }
 
-function dynamicCss(s) {
+function dynamicCss(s, withoutBackground) {
   var accent = hexRgb(s.accent)
   var deep = hexRgb(s.deep)
   var css = ':root{\n' +
@@ -469,24 +801,270 @@ function dynamicCss(s) {
   if (s.wallpaper) {
     // WE 动效层接管背景时不再画底图: 两者同在根层叠上下文, 底图(-1)会盖住动效层(-2),
     // 所以这里跳过底图那两条规则（卡面染色照旧, 见下）。
-    if (!weActive()) {
-      var veil1 = rgba(deep, s.veil)
-      var veil2 = rgba(deep, s.veil * 0.55)
-      var img = 'url("' + s.wallpaper.url + '")'
-      var zoom = Math.max(1, Math.min(2.2, s.zoom || 1))
-      // 底图统一绘制在视口固定的 ::before 层: cover 裁剪 + 焦点定位 + 绕焦点缩放
-      css += 'body{background-color:' + s.deep + '}\n' +
-        'body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;' +
-        'background-image:linear-gradient(' + veil1 + ',' + veil2 + '),' + img + ';' +
-        'background-size:cover;background-repeat:no-repeat;background-position:' + s.focus + ';' +
-        'transform:scale(' + zoom.toFixed(2) + ');transform-origin:' + s.focus + '}\n'
-    }
+    if (!withoutBackground) css += backgroundCss(s, s.wallpaper.url)
     css += glassCardCss(s, accent, deep)
   }
   // 卡面染色只在"有底图"时才加，但**特效与阴影不要求有底图**（解耦, 原因见 DockFx 注释）；
   // 阴影有自己的开关, 选「关闭」特效时这条规则仍要写出来。
   css += effectCss(s, accent, deep)
   return css
+}
+
+function backgroundCss(s, url, frame) {
+  if (!url || weActive()) return ''
+  var deep = hexRgb(s.deep)
+  return 'body{background-color:' + s.deep + '}\n' +
+    bgLayerCss('body::before', Object.assign({},s,frame||framingForUrl(s,url)), url, rgba(deep, s.veil) + ',' + rgba(deep, s.veil * 0.55))
+}
+
+/** 两层共用 cover 绘制配方；调用方传入各自图片的缩放和焦点，旧层保留切换前的构图。 */
+function bgLayerCss(sel, s, url, veil) {
+  var zoom = Math.max(1, Math.min(2.2, s.zoom || 1))
+  return sel + '{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;' +
+    'background-image:linear-gradient(' + veil + '),url("' + url + '");' +
+    'background-size:cover;background-repeat:no-repeat;background-position:' + s.focus + ';' +
+    'transform:scale(' + zoom.toFixed(2) + ');transform-origin:' + s.focus + '}\n'
+}
+
+// ------------------------------------------------ 渐变切换 (v1.10.0, 全局) --
+// 「换图时上一张淡出、新图露出」。**全局生效**的手段是"只接一个口": 点图卡、侧栏宝珠随机、
+// 自动切换最终都走到 STORE → apply 里那个 subscribe, 所以那里挂一次就全覆盖, 各换图处一行不改。
+// 做法: 把上一张画在 body::after(伪元素顺序保证它在 ::before 之上 = 新图之上), 下一帧把它的
+// opacity 过渡到 0。两层都是 position:fixed ⇒ 不会撑大任何祖先的 scrollWidth, v1.4.2 那条
+// 「对话区横向滚动条不许被顶出来」的约束照旧安全。
+// v1.11.0: 时长与「响应时间」都从设置里读 —— 响应时间 = 换图后旧图**原样**多盖一会儿(wait>0 时
+// 先只插层不动它), 到点才开始淡出。
+var fadeEl = null
+var fadeWaitTimer = 0    // 起手延迟那一段(响应时间)
+var fadeTimer = 0        // 看它淡完没 / 拆层
+var fadeBusyTimer = 0    // 这一层"还在动"的截止时刻(插入后 wait+dur): 只在没有 getComputedStyle 的地方退化用
+var fadeBusy = false
+var fadeMotion = null
+var lastManualFadeAt = null
+var selectionFade = null
+// STORE 是最后一次选择；shownUrl 是正在淡入的图。连点只能更新 nextUrl，
+// 不能直接改 ::before：半透明旧图下面换图仍然是一次可见的硬切。
+var shownUrl = null
+var shownFrame = null
+var nextUrl = null
+var nextFade = null
+var paintBackground = null
+
+function renderedBgUrl() {
+  return shownUrl === null ? bgUrlOnScreen(STORE.state) : shownUrl
+}
+function renderedBgFrame() {
+  var url=renderedBgUrl()
+  if(!shownFrame || (STORE.state.wallpaper&&STORE.state.wallpaper.url===url)) shownFrame=framingForUrl(STORE.state,url)
+  return shownFrame
+}
+
+function reducedMotion() {
+  return typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+}
+
+/** 这一层此刻是否还看得见(computed opacity > 0)。**不许只信墙钟**: 换大图时主线程会被
+ *  "上万像素的图重新上屏"卡住(本机实测 long task 504ms、rAF 停 ~0.9s), 过渡的起手随之推迟 ——
+ *  按插入时刻 + 时长就摘层, 会在它还剩 0.3 不透明度时把层摘掉, 屏幕上就是**闪变**(用户报的"卡没渐变")。 */
+function fadeVisible() {
+  if (!fadeEl) return false
+  if (typeof getComputedStyle !== 'function') return fadeBusy
+  try {
+    var cs = getComputedStyle(document.body, '::after')
+    return cs.content !== 'none' && Number(cs.opacity) > 0.001
+  } catch (e) { return fadeBusy }
+}
+
+/** 看不见了才拆层，然后从刚淡入的图继续渐变到最新选择。 */
+function fadeSweep() {
+  if (!fadeEl) { fadeTimer = 0; return }
+  if (!fadeVisible()) {
+    var queued = nextUrl, timing = nextFade
+    fadeStop()
+    if (queued !== null && queued !== shownUrl) {
+      switchFade(shownUrl, queued, timing)
+      if (paintBackground) paintBackground()
+    }
+    pumpWallpaperRequest()
+    return
+  }
+  fadeTimer = setTimeout(fadeSweep, 100)
+}
+
+/** 渐变时长 ms。坏值兜 900(默认手感), 并钳到 100..5000 —— 0 会让 transition 变成一个 tick 的硬切。
+ *  上限 5000 是"够慢还能看"的位置: 再长就是两张图长时间叠在一起, 调到这个数就够判断了。 */
+function fadeDurMs(s) {
+  var v = Number(s.fadeMs)
+  if (!isFinite(v)) return 900
+  return Math.max(100, Math.min(5000, Math.round(v)))
+}
+
+// 点击节奏只影响本次播放，不修改用户设定或保存文件；自动切换/恢复不参加计频。
+function adaptiveFadeMs(s, gap) {
+  var base=fadeDurMs(s)
+  if(gap===null || !isFinite(gap) || gap<0 || gap>=1500)return base
+  return Math.min(base,gap>=800?1000:gap>=400?500:300)
+}
+function normalFadeTiming() { return {duration:fadeDurMs(STORE.state),wait:fadeWaitMs(STORE.state)} }
+function manualFadeTiming() {
+  var now=typeof performance!=='undefined'&&typeof performance.now==='function'?performance.now():Date.now()
+  var gap=lastManualFadeAt===null?null:now-lastManualFadeAt
+  lastManualFadeAt=now
+  var rapid=gap!==null&&gap>=0&&gap<1500
+  var timing={duration:adaptiveFadeMs(STORE.state,gap),wait:rapid?0:fadeWaitMs(STORE.state)}
+  if(rapid&&STORE.state.fadeOn!==false&&!reducedMotion())accelerateFade(timing.duration)
+  return timing
+}
+
+function armFadeTimers(ms) {
+  if(fadeBusyTimer)clearTimeout(fadeBusyTimer)
+  if(fadeTimer)clearTimeout(fadeTimer)
+  fadeBusy=true
+  fadeBusyTimer=setTimeout(function(){fadeBusyTimer=0;fadeBusy=false},ms)
+  fadeTimer=setTimeout(fadeSweep,ms+50)
+}
+function writeFadeOpacity(motion, opacity, transition) {
+  var layer=motion.layer
+  if(layer.sheet&&layer.sheet.cssRules[1]){
+    layer.sheet.cssRules[1].style.transition=transition
+    layer.sheet.cssRules[1].style.opacity=String(opacity)
+  }else layer.textContent=motion.base+'body::after{opacity:'+opacity+';transition:'+transition+'}'+motion.rest
+}
+function activeFadeAnimation() {
+  if(typeof document==='undefined'||!document.body||typeof document.body.getAnimations!=='function')return null
+  return document.body.getAnimations({subtree:true}).find(function(a){
+    return a.transitionProperty==='opacity'&&a.effect&&a.effect.target===document.body&&a.effect.pseudoElement==='::after'&&a.playState!=='finished'&&a.playState!=='idle'
+  })||null
+}
+function accelerateFade(ms) {
+  var motion=fadeMotion
+  if(!motion||fadeEl!==motion.layer)return
+  // 快点时不再等“开始前等待”；同一档连点不重启、不延长已加速的动画。
+  if(fadeWaitTimer){clearTimeout(fadeWaitTimer);fadeWaitTimer=0;motion.duration=Math.min(ms,motion.duration);motion.start();return}
+  if(ms>=motion.duration)return
+  motion.duration=ms
+  if(!motion.started)return // 已排好的首帧会读取最新时长
+  try{
+    var animation=activeFadeAnimation()
+    if(animation&&typeof animation.updatePlaybackRate==='function'){
+      var span=Number(animation.effect.getComputedTiming().duration)
+      var rate=span/Math.max(1,ms*motion.distance)
+      if(isFinite(rate)&&rate>0){
+        // 同步合成线程上的播放位置后改速度，避免重设起点造成闪回。
+        animation.updatePlaybackRate(rate)
+        armFadeTimers(Math.max(0,span-Number(animation.currentTime||0))/rate)
+        animation.finished.then(function(){if(fadeMotion===motion&&fadeEl===motion.layer){if(fadeTimer)clearTimeout(fadeTimer);fadeTimer=0;fadeSweep()}},function(){})
+        return
+      }
+    }
+  }catch(e){/* 旧运行时退回到保留当前透明度的 CSS 过渡。 */}
+  if(typeof getComputedStyle!=='function')return
+  var opacity=Number(getComputedStyle(document.body,'::after').opacity)
+  if(!isFinite(opacity))return
+  if(opacity<=0.001){fadeSweep();return}
+  if(fadeBusyTimer){clearTimeout(fadeBusyTimer);fadeBusyTimer=0}
+  if(fadeTimer){clearTimeout(fadeTimer);fadeTimer=0}
+  motion.distance=Math.max(0,Math.min(1,opacity));motion.started=false
+  writeFadeOpacity(motion,motion.distance,'none')
+  getComputedStyle(document.body,'::after').opacity // 提交同一透明度的起点，不退回 1
+  motion.start()
+}
+
+/** 响应时间 ms(开始淡出前先等多久)。坏值兜 0 = 不延迟, 与 v1.10.0 行为一致。
+ *  钳制范围与滑杆一致(0..1000): 手改 settings.json 塞个 3000 时, 滑杆上也得能指到那个位置。 */
+function fadeWaitMs(s) {
+  var v = Number(s.fadeDelayMs)
+  if (!isFinite(v)) return 0
+  return Math.max(0, Math.min(1000, Math.round(v)))
+}
+
+function fadeStop() {
+  if (fadeWaitTimer) { clearTimeout(fadeWaitTimer); fadeWaitTimer = 0 }
+  if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = 0 }
+  if (fadeBusyTimer) { clearTimeout(fadeBusyTimer); fadeBusyTimer = 0 }
+  fadeBusy = false
+  fadeMotion = null
+  nextUrl = null
+  nextFade = null
+  if (fadeEl) { if (fadeEl.parentNode) fadeEl.parentNode.removeChild(fadeEl); fadeEl = null }
+}
+
+function fadeRun(s, prevUrl, prevFrame, timing) {
+  if (typeof document === 'undefined' || !document.head || !prevUrl) return
+  // 连点护栏(v1.11.0 修): 这一层**还看得见**就别拆它、也别再插一层。
+  // 拆了重来插的那层画的是同一张旧图, 但它是从 opacity:1 重新开始的 —— 而屏幕上那一刻
+  // 是"旧图 × 当前透明度"(可能已经是 0.4), 于是画面先闪回全不透明、再从头淡一趟。
+  // 连点时每次点击都这么闪一下 + 倒计时归零 ⇒ 看着就像渐变没生效、点的图迟迟不出现。
+  // switchFade 同时冻结 ::before，等本段淡完才接上最后一次选择。
+  if (fadeEl && fadeVisible()) return
+  fadeStop()
+  var dur = timing?timing.duration:fadeDurMs(s), wait = timing?timing.wait:fadeWaitMs(s)
+  var d = hexRgb(s.deep)
+  var base = bgLayerCss('body::after', Object.assign({},s,prevFrame||framingForUrl(s,prevUrl)), prevUrl, rgba(d, s.veil) + ',' + rgba(d, s.veil * 0.55))
+  // 关掉动画偏好的人: 两条目标值之间没有 transition ⇒ 直接切, 不留一段糊影。
+  var rest = '@media (prefers-reduced-motion:reduce){body::after{transition:none}}'
+  var layer = document.createElement('style')
+  layer.setAttribute('data-bg-atelier-fade', '1')
+  // 接续下一段时，::after 仍可能保留上一段的 computed opacity=0。
+  // 起点必须禁用 transition，否则 0→1 会反向动画，先露出新图再闪回旧图。
+  layer.textContent = base + 'body::after{opacity:1;transition:none}' + rest
+  document.head.appendChild(layer)
+  fadeEl = layer
+  fadeBusy = true
+  var motion={layer:layer,base:base,rest:rest,duration:dur,distance:1,started:false,startQueued:false,start:null}
+  fadeMotion=motion
+  // 两次 rAF 确保起点先画过一帧。计时从终点提交后才开始，主线程卡顿不能吃掉渐变时间。
+  var raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : function (fn) { return setTimeout(fn, 16) }
+  // `fadeEl !== layer` 是连换两次的护栏: 迟到的回调只许动自己那一层, 不许把新层提前推进终点帧。
+  var flip = function () {
+    if (fadeEl !== layer || motion.startQueued) return
+    motion.startQueued=true
+    raf(function () {
+      if (fadeEl !== layer) return
+      raf(function () {
+        if (fadeEl !== layer) return
+        motion.startQueued=false;motion.started=true
+        var duration=Math.max(1,Math.round(motion.duration*motion.distance))
+        // 只改 opacity 的声明，不重建过渡样式表。
+        writeFadeOpacity(motion,0,'opacity '+duration+'ms '+(motion.distance===1?'ease':'linear'))
+        armFadeTimers(duration)
+      })
+    })
+  }
+  motion.start=flip
+  if (wait > 0) {
+    fadeWaitTimer = setTimeout(function () { if (fadeEl !== layer) return; fadeWaitTimer = 0; flip() }, wait)
+  } else { flip() }
+}
+
+/** 屏幕上的底图**换了**之后要做的事（从订阅里抽出来：离线套件跑不到那个 effect，抽出来才测得到）。
+ *  ① 只在"图 → 图"时过渡 —— 从无到有、清空底图、WE 接管/退出时旧图并不在屏幕上，淡它没意义；
+ *  ② 重起自动切换的表：间隔从**这一次换图**算起（谁换的都算），手动换到满意的那张就不会
+ *     正好撞上刚走完的旧表被自动切换立刻换走。 */
+function switchFade(prevUrl, url, timing) {
+  timing=timing||(selectionFade&&selectionFade.wallpaper===STORE.state.wallpaper&&selectionFade.wallpaper.url===url?selectionFade.timing:normalFadeTiming())
+  if (shownUrl === null) { shownUrl = prevUrl;shownFrame=framingForUrl(STORE.state,prevUrl) }
+  if (!url || !shownUrl || STORE.state.fadeOn === false || reducedMotion()) {
+    fadeStop()
+    shownUrl = url
+    shownFrame = framingForUrl(STORE.state,url)
+    if(!url){lastManualFadeAt=null;selectionFade=null}
+  } else if (fadeVisible()) {
+    nextUrl = url === shownUrl ? null : url
+    nextFade = nextUrl===null?null:timing
+  } else {
+    fadeStop()
+    if (shownUrl !== url) fadeRun(STORE.state, shownUrl, shownFrame, timing)
+    shownUrl = url
+    shownFrame = framingForUrl(STORE.state,url)
+  }
+  armAuto(true)
+}
+
+/** 此刻**真的画在屏幕上**的底图 url; 没底图或 WE 动效层接管时为空(那时旧图并不在屏幕上, 淡它没意义)。*/
+function bgUrlOnScreen(s) {
+  if (!s.wallpaper || weActive()) return ''
+  return s.wallpaper.url
 }
 
 // -------------------------------------------------------------- 静态样式表 --
@@ -704,6 +1282,10 @@ function staticCss() {
   '.bga-field{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary)}',
   '.bga-field input[type=color]{width:34px;height:26px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:none;padding:1px;cursor:pointer}',
   '.bga-field input[type=range]{width:130px;accent-color:var(--bga-accent,var(--dsw-alias-brand-primary))}',
+  // 取值格定宽右对齐: "0 毫秒" → "950 毫秒" → "1 秒" 字数一变, 同一行后面的控件就横着跳
+  // (响应时间旁边紧挨着渐变时长)。58px 按最长的 "1000 毫秒" 定 —— 实际取值到不了这么长,
+  // 留的是余量。等宽数字防抖。
+  '.bga-field .bga-val{flex:0 0 auto;min-width:58px;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}',
   '.bga-fxopts{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}',
   '.bga-fxopt{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:10px 12px;cursor:pointer;background:var(--dsw-alias-bg-layer-1);text-align:left;color:var(--dsw-alias-label-primary)}',
   '.bga-fxopt.on{border-color:var(--bga-accent);box-shadow:0 0 0 1px var(--bga-accent) inset}',
@@ -773,8 +1355,32 @@ function staticCss() {
   '.bga-tiny{display:inline-flex;align-items:center;gap:6px;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);cursor:pointer;user-select:none}',
   '.bga-tiny:hover{color:var(--dsw-alias-label-primary)}',
   '.bga-tiny input{width:13px;height:13px;margin:0;accent-color:var(--bga-accent,var(--dsw-alias-brand-primary));cursor:pointer}',
-  ].join('\n')
+  ].join('\n') + '\n' + studioCss()
 }
+
+function studioCss() { return `
+.bga-studio{--bga-panel:rgba(250,252,255,.9);--bga-panel-soft:rgba(238,242,250,.78);--bga-line:rgba(110,132,168,.23);--bga-text:#182337;--bga-muted:#596780;max-width:1080px;width:100%;gap:18px;color:var(--bga-text);font-size:14px;line-height:1.55;container-type:inline-size}
+body[data-ds-dark-theme] .bga-studio{--bga-panel:rgba(16,23,37,.94);--bga-panel-soft:rgba(30,42,61,.83);--bga-line:rgba(152,174,208,.23);--bga-text:#edf2fa;--bga-muted:#a5b3c9}
+.bga-studio *,.bga-dialog *{box-sizing:border-box}.bga-studio button,.bga-dialog button{font:inherit}.bga-studio button:focus-visible,.bga-studio input:focus-visible,.bga-studio select:focus-visible,.bga-studio summary:focus-visible,.bga-dialog :focus-visible{outline:2px solid var(--bga-accent,#7190cb);outline-offset:3px}
+.bga-studio button:disabled{cursor:default;opacity:.45}.bga-studio .bga-btn.bga-active:disabled{opacity:1;background:transparent}.bga-muted{color:var(--bga-muted,#a5b3c9);font-size:12px;line-height:1.65}.bga-error{color:#df655b;font-size:13px}
+.bga-studio-heading{display:flex;align-items:center;gap:14px}.bga-studio-heading>div{flex:1}.bga-studio-heading h2{font-size:24px;line-height:1.3;margin:0;letter-spacing:.04em}.bga-studio-heading p{margin:5px 0 0}.bga-save-state{font-size:12px;color:var(--bga-muted);white-space:nowrap}
+.bga-hero{position:relative;overflow:hidden;aspect-ratio:2.75;min-height:210px;max-height:360px;border-radius:20px;background:linear-gradient(125deg,#233550,#10192a);border:1px solid var(--bga-line);isolation:isolate}.bga-hero-image{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.bga-hero-shade{position:absolute;inset:0;background:linear-gradient(0deg,rgba(5,12,23,.9),rgba(5,12,23,.1) 80%)}.bga-hero-info{position:absolute;inset:auto 26px 22px;display:flex;flex-direction:column;gap:4px;color:#fff}.bga-hero-info strong{font-size:25px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-shadow:0 1px 15px #0006}.bga-hero-info>span:last-child{font-size:12px;color:#e0e8f4}.bga-eyebrow{font-size:11px;letter-spacing:.14em;color:#d2dded}
+.bga-player{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:16px 18px;margin-top:-4px;border:1px solid var(--bga-line);border-radius:14px;background:var(--bga-panel)}.bga-studio .bga-btn,.bga-dialog .bga-btn{min-height:36px;padding:7px 13px;border:1px solid var(--bga-line,rgba(140,165,200,.3));border-radius:9px;background:var(--bga-panel-soft,rgba(120,145,185,.1));color:inherit;white-space:nowrap;font-size:13px;cursor:pointer;transition:background .15s,border-color .15s}.bga-studio .bga-btn:hover:not(:disabled),.bga-dialog .bga-btn:hover:not(:disabled){border-color:var(--bga-accent,#7190cb)}.bga-studio .bga-primary,.bga-dialog .bga-primary{background:#426cb4;border-color:#426cb4;color:#fff}.bga-studio .bga-active{color:var(--bga-accent,#7190cb);border-color:var(--bga-accent,#7190cb)}
+.bga-player-source{display:flex;flex-direction:column;align-items:flex-start;gap:3px;max-width:100%}.bga-source-control{display:flex;align-items:center;gap:10px;font-size:12px;max-width:100%}.bga-source-control>span{color:var(--bga-muted);flex:none}.bga-studio select,.bga-input{min-height:36px;min-width:0;border:1px solid var(--bga-line,rgba(140,165,200,.3));border-radius:8px;background:var(--bga-panel,rgba(120,145,185,.1));color:var(--bga-text,inherit);padding:7px 10px;font:inherit;font-size:13px}.bga-studio select{max-width:100%}.bga-source-control select{max-width:260px;width:100%}.bga-studio option,.bga-studio optgroup{background:var(--bga-panel);color:var(--bga-text)}.bga-input::placeholder{color:var(--bga-muted,#8896ae)}
+.bga-tabs{display:flex;gap:6px;padding:5px;background:var(--bga-panel);border:1px solid var(--bga-line);border-radius:12px}.bga-tabs button{flex:1;min-height:39px;border:0;border-radius:8px;background:transparent;color:var(--bga-muted);font-size:13px;cursor:pointer}.bga-tabs button[aria-selected=true]{color:var(--bga-text);background:var(--bga-panel-soft);box-shadow:inset 0 -2px var(--bga-accent,#7190cb)}
+.bga-tab-panel{min-width:0}.bga-library{display:grid;grid-template-columns:168px minmax(0,1fr);gap:20px}.bga-library-nav{padding:12px 8px;background:var(--bga-panel);border:1px solid var(--bga-line);border-radius:14px;align-self:start;min-width:0}.bga-nav-item{display:flex;align-items:center;gap:8px;width:100%;min-height:38px;padding:8px 10px;border:0;border-radius:8px;color:var(--bga-muted);background:transparent;cursor:pointer;text-align:left;font-size:13px!important}.bga-nav-item>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;flex:1}.bga-nav-item small{font-size:11px;opacity:.8}.bga-nav-item.on{color:var(--bga-text);background:var(--bga-panel-soft);box-shadow:inset 2px 0 var(--bga-accent,#7190cb)}.bga-nav-item:hover{color:var(--bga-text);background:var(--bga-panel-soft)}.bga-nav-heading{display:flex;align-items:center;justify-content:space-between;margin:15px 8px 5px;font-size:11px;letter-spacing:.06em;color:var(--bga-muted)}.bga-nav-hint{font-size:12px;color:var(--bga-muted);margin:6px 10px 14px}.bga-folder-list{margin-top:16px;border-top:1px solid var(--bga-line);padding-top:12px}.bga-folder-list summary{font-size:12px;padding:4px 9px 9px;color:var(--bga-muted);cursor:pointer}
+.bga-sort-bar{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px}.bga-picture.drop-target{border-color:var(--bga-accent);box-shadow:inset 0 0 0 3px var(--bga-accent)}.bga-order-number{position:absolute;top:7px;left:7px;padding:2px 7px;border-radius:6px;background:#11233bdd;color:white;font-size:12px}.bga-order-actions{justify-content:flex-end}.bga-order-actions .bga-drag-handle{margin-right:auto;cursor:grab}.bga-drag-handle:active{cursor:grabbing}.bga-framing-controls{border:0;padding:0;margin:0;min-width:0}.bga-frame-reset{margin-top:16px}.bga-framing-controls:disabled{opacity:.5}.bga-player-source>.bga-row{gap:12px;max-width:100%}.bga-player-source .bga-source-control{min-width:0}.bga-sort-bar+.bga-library-toolbar input:disabled,.bga-sort-bar+.bga-library-toolbar select:disabled{opacity:.45}
+.bga-library-main{min-width:0}.bga-library-heading{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:14px}.bga-library-heading h3{font-size:17px;line-height:1.4;margin:0 0 3px;overflow-wrap:anywhere}.bga-library-heading>.bga-row{gap:4px}.bga-library-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:14px;min-width:0}.bga-library-toolbar .bga-input{flex:1;width:100px}.bga-library-toolbar select{width:118px;flex:none}.bga-library-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:13px;max-height:560px;overflow:auto;align-content:start;padding:2px 3px 5px;scrollbar-width:thin;scrollbar-color:var(--bga-accent) transparent}
+.bga-picture{border:1px solid var(--bga-line);background:var(--bga-panel);border-radius:12px;overflow:hidden;min-width:0;transition:border-color .15s}.bga-picture:hover{border-color:var(--bga-accent)}.bga-picture.current,.bga-picture.picked{border-color:var(--bga-accent);box-shadow:0 0 0 1px var(--bga-accent)}.bga-picture-pick{display:block;padding:0;width:100%;border:0;color:inherit;background:transparent;cursor:pointer;text-align:left}.bga-picture-image{position:relative;display:block;aspect-ratio:16/10;overflow:hidden;background:var(--bga-panel-soft)}.bga-picture-image img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .2s}.bga-picture-pick:hover img{transform:scale(1.03)}.bga-picture-name{display:block;font-size:13px;font-weight:600;padding:9px 10px 1px;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}.bga-picture-badge{position:absolute;left:7px;bottom:7px;padding:3px 7px;border:1px solid #ffffff35;border-radius:6px;color:#fff;background:#11233bdd;font-size:10px;line-height:1.4}.bga-check{position:absolute;right:8px;top:8px;background:#152238b3;border:1px solid #e1e9f1;border-radius:5px;width:23px;height:23px;text-align:center;color:#fff}.bga-picture.picked .bga-check{background:#426cb4}.bga-picture-foot{display:flex;align-items:center;padding:0 6px 5px 10px;gap:2px}.bga-picture-foot>.bga-muted{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:11px}.bga-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex:none;border:0;border-radius:7px;background:transparent;color:inherit;font-size:20px!important;cursor:pointer}.bga-icon-btn:hover{background:rgba(120,145,185,.15)}.bga-icon-btn.active{color:var(--bga-accent,#7190cb)}
+.bga-batch{display:flex;align-items:center;gap:7px;flex-wrap:wrap;background:var(--bga-panel);border:1px solid var(--bga-line);border-radius:10px;padding:9px;margin-bottom:12px;font-size:12px}.bga-batch>span{margin-right:auto}.bga-empty{text-align:center;padding:48px 20px;border:1px dashed var(--bga-line);border-radius:14px;background:var(--bga-panel);color:var(--bga-muted);font-size:13px}.bga-empty b{color:var(--bga-text);font-size:15px}.bga-empty p{margin:8px 0 16px}
+.bga-details{margin-top:18px;border-top:1px solid var(--bga-line);padding-top:12px;font-size:12px}.bga-details>summary{color:var(--bga-muted);cursor:pointer;min-height:30px}.bga-details[open]>summary{margin-bottom:12px}.bga-directory{padding:10px;background:var(--bga-panel-soft);border-radius:8px;overflow-wrap:anywhere;margin-bottom:12px;font-size:12px}.bga-studio-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;color:var(--bga-muted);font-size:11px;padding:2px 0 12px}.bga-text-btn{border:0;background:transparent;color:inherit;cursor:pointer;font-size:12px!important;text-decoration:underline;text-underline-offset:4px}
+.bga-panel-stack{display:grid;gap:16px}.bga-panel-stack>section,.bga-tab-panel>section{background:var(--bga-panel);border:1px solid var(--bga-line);border-radius:14px;padding:22px}.bga-studio .bga-h{font-size:16px;color:var(--bga-text);margin:0 0 10px}.bga-studio .bga-sub{color:var(--bga-muted);font-size:12px;margin:0 0 18px}.bga-control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 30px;margin:16px 0;border:0;padding:0;min-width:0}.bga-control-grid .bga-field{display:grid;grid-template-columns:minmax(0,1fr) 65px;gap:10px;color:var(--bga-muted);font-size:13px}.bga-control-grid .bga-field input[type=range]{grid-row:2;grid-column:1/-1;width:100%;margin:0;height:18px}.bga-control-grid .bga-val{grid-row:1;grid-column:2;font-size:12px}.bga-control-grid:disabled{opacity:.45}.bga-studio .bga-tiny{font-size:13px;color:var(--bga-text);gap:9px;margin:8px 0}.bga-studio .bga-tiny input{width:16px;height:16px}.bga-focus-row{display:flex;gap:20px;justify-content:space-between;align-items:center;border-top:1px solid var(--bga-line);padding-top:16px}.bga-focus-row b{font-size:13px;font-weight:500}.bga-focus-row p{margin:4px 0 0}.bga-studio .bga-fxopts{grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:10px}.bga-studio .bga-fxopt{padding:15px 12px;background:var(--bga-panel-soft);color:var(--bga-text)}.bga-studio .bga-fxopt span{color:var(--bga-muted);font-size:12px}.bga-studio .bga-swatch{flex:1;min-width:62px;background:var(--bga-panel-soft);color:var(--bga-text);padding:12px 8px}.bga-studio .bga-swatches{gap:8px}
+.bga-dialog{width:min(460px,calc(100vw - 32px));max-height:85vh;overflow:auto;padding:25px;border:1px solid rgba(140,165,200,.35);border-radius:18px;background:#f5f8fd;color:#1e2d44;font-family:inherit;box-shadow:0 24px 100px #0006}.bga-dialog::backdrop{background:rgba(4,9,18,.65);backdrop-filter:blur(5px)}body[data-ds-dark-theme] .bga-dialog{background:#131f31;color:#eef3fa}.bga-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:20px}.bga-dialog h3{font-size:19px;margin:0}.bga-form-label{display:grid;gap:9px;font-size:13px}.bga-dialog .bga-input{width:100%;color:inherit;background:rgba(120,145,185,.1);margin:0}.bga-dialog-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:24px}.bga-dialog-actions>.bga-danger{margin-right:auto}.bga-danger{color:#d56868!important}.bga-list-choices{display:grid;gap:5px;max-height:260px;overflow:auto}.bga-list-choice{display:flex;align-items:center;gap:12px;padding:12px 10px;border-radius:8px;background:rgba(120,145,185,.08);cursor:pointer;font-size:14px}.bga-list-choice input{width:17px;height:17px;accent-color:#7190cb}.bga-list-choice span{flex:1;overflow-wrap:anywhere}.bga-list-choice small{opacity:.65;flex:none}.bga-create-inline{display:flex;gap:8px;border-top:1px solid rgba(140,165,200,.25);padding-top:18px;margin-top:18px}.bga-delete-confirm{border-top:1px solid rgba(140,165,200,.25);margin-top:20px;padding-top:12px;font-size:13px}
+@container(max-width:700px){.bga-library{grid-template-columns:140px minmax(0,1fr);gap:14px}.bga-library-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bga-player{gap:14px}.bga-player-source{width:100%}.bga-hero{min-height:185px}.bga-hero-info strong{font-size:21px}.bga-control-grid{gap:18px}}
+@container(max-width:500px){.bga-library{grid-template-columns:1fr}.bga-library-nav{display:flex;gap:4px;flex-wrap:wrap}.bga-nav-item{width:auto;max-width:100%;flex:1 1 110px}.bga-nav-heading{width:100%;margin:8px 8px 0}.bga-nav-hint{width:100%;margin:2px 10px}.bga-folder-list{width:100%;margin-top:8px;padding-top:8px}.bga-library-toolbar{flex-wrap:wrap}.bga-library-toolbar .bga-input{flex-basis:100%}.bga-library-toolbar select{flex:1}.bga-control-grid{grid-template-columns:1fr}.bga-player>.bga-row{display:grid;grid-template-columns:1fr 1fr;width:100%}.bga-player>.bga-row .bga-btn{width:100%}.bga-hero-info{inset:auto 17px 17px}.bga-studio-heading h2{font-size:21px}.bga-panel-stack>section,.bga-tab-panel>section{padding:16px}.bga-source-control{width:100%}.bga-source-control select{flex:1;max-width:100%}}
+@media(prefers-reduced-motion:reduce){.bga-studio *{transition:none!important}.bga-picture-pick:hover img{transform:none}}
+` }
+
 
 // ---------------------------------------------- 画布实宽 → 重建样式表 --
 // **必须在模块作用域**：DockFx（模块级组件）每次渲染后要调 syncCanvasWidth，
@@ -848,7 +1454,8 @@ function Orb() {
   var s = useBga()
   return h('button', {
     className: 'bga-orb',
-    title: '底图工坊 · 随机换一张 (全部类型, 同轮 2/3 内不重复)' + (s.wallpaper ? ' (当前: ' + curLabel(s.wallpaper) + ')' : ''),
+    title: '换一张 · ' + sourceLabel(s.playbackSource) + (s.wallpaper ? '（当前：' + curLabel(s.wallpaper) + '）' : ''),
+    'aria-label': '换一张 · ' + sourceLabel(s.playbackSource),
     onClick: cycleWallpaper,
   }, h('span', {
     className: 'bga-orb-core',
@@ -873,14 +1480,26 @@ function Section(title, sub) {
     h.apply(null, ['div', null].concat(kids)))
 }
 
-function Slider(label, value, min, max, onChange, unit) {
-  var shown = unit === 'px' ? Math.round(value) + 'px'
-    : unit === 'x' ? '×' + Number(value).toFixed(2)
-    : Math.round(value * 100) + '%'
+/** 滑杆。给了 stops = **不平均档位**滑杆: 控件是等距的 0..n-1 档, 真正的值查表(见 AUTO_STOPS),
+ *  回调交出去的也是表里的值。原生 step 表达不了不平均刻度, 所以映射放在这里。 */
+function Slider(label, value, min, max, onChange, unit, stops) {
+  var val = value, lo = min, hi = max
+  // 分钟要的是整数刻度; 毫秒 50ms 一档(够细, 又不至于拖半天才能从 900 挪到 5000);
+  // 其余(0..1 / px / 倍率)保留 0.01 的细档。
+  var step = unit === 'min' ? '1' : unit === 'ms' ? '50' : '0.01'
+  if (stops) { val = stops.indexOf(nearestStop(stops, value)); lo = 0; hi = stops.length - 1; step = '1' }
+  // 显示用的是**值**：有 stops 时 val 是档位序号，直接显示就成了"9 分钟"这种事。
+  var shownVal = stops ? stops[val] : val
+  var shown = unit === 'px' ? Math.round(shownVal) + 'px'
+    : unit === 'ms' ? (shownVal >= 1000 ? (shownVal / 1000) + ' 秒' : Math.round(shownVal) + ' 毫秒')
+    : unit === 'x' ? '×' + Number(shownVal).toFixed(2)
+    : unit === 'min' ? (shownVal >= 60 ? (shownVal / 60) + ' 小时' : Math.round(shownVal) + ' 分钟')
+    : Math.round(shownVal * 100) + '%'
   return h('label', { className: 'bga-field' }, label + ' ',
-    h('input', { type: 'range', min: String(min), max: String(max), step: '0.01', value: String(value),
-      onChange: function (e) { onChange(Number(e.target.value)) } }),
-    shown)
+    h('input', { type: 'range', 'aria-label': label, min: String(lo), max: String(hi), step: step, value: String(val),
+      onChange: function (e) { onChange(stops ? stops[Number(e.target.value)] : Number(e.target.value)) } }),
+    // 定宽格子(见 .bga-val): 拖动时数字长短变化不许把后面的控件挤走
+    h('span', { className: 'bga-val' }, shown))
 }
 
 /** 一行小字 + 原生勾选框的小开关（「卡面阴影」用, 它从特效里独立出来）。 */
@@ -894,335 +1513,271 @@ function TinySwitch(label, value, onChange) {
 // 底图列表卡片多(几十~上百张)时, 拖动滑杆/改颜色等操作会让 SettingsPage 频繁
 // 重渲染; 用 React.memo 让"数据引用、筛选、选中项都没变"的网格跳过重渲染,
 // 图卡本身不重建, 显著减卡顿。点击卡片直接写 STORE, 不依赖父级回调。
+// 图库卡片的选择、收藏和图单操作使用独立按钮，避免嵌套按钮。
 var ItemGrid = React.memo(function ItemGrid(props) {
-  var items = props.items
-  var filter = props.filter
-  var curId = props.curId
-  var showNo = props.showNo
-  var mixed = props.mixed
-  var cards = []
-  for (var i = 0; i < items.length; i++) {
-    ;(function (it) {
-      if (filter === 'hd' && !it.hd) return
-      if (filter === 'plain' && it.hd) return
-      var on = !!(curId && curId === it.id)
-      cards.push(h('button', {
-        key: it.id,
-        className: 'bga-card' + (on ? ' on' : ''),
-        title: '选择 ' + it.base + (it.hd ? ' (高清)' : ''),
-        onClick: function () { STORE.set({ wallpaper: wallpaperOf(it) }) },
-      },
-        h('span', { className: 'bga-thumbwrap' },
-          // 图库主图用 640px 派生图: 网格卡约 150–260 CSS 宽, 2x 屏也不糊。
-          h('img', { className: 'bga-thumb', src: it.url + '?sz=preview', alt: it.base, loading: 'lazy', decoding: 'async' }),
-          showNo ? h('span', { className: 'bga-no' }, '№' + it.no) : null),
-        h('div', { className: 'bga-name' }, it.base,
-          it.hd ? h('em', null, '高清') : (mixed ? h('em', null, '普通') : null))))
-    })(items[i])
-  }
-  return h('div', { className: 'bga-grid tall' }, cards)
+  var drag=React.useRef(null),overPair=React.useState(null),over=overPair[0],setOver=overPair[1]
+  function move(it,index){if(props.items[index])props.onReorder(it.id,props.items[index].id)}
+  return h('div', {className:'bga-library-grid'}, props.items.map(function (it,index) {
+    var current = props.curId === it.id, checked = props.selected.indexOf(it.id) >= 0, favorite = props.favorites.indexOf(it.id) >= 0
+    return h('article', {key:it.id, className:'bga-picture' + (current ? ' current' : '') + (checked ? ' picked' : '') + (over===it.id?' drop-target':''),
+      onDragOver:function(e){if(props.reordering&&drag.current&&drag.current!==it.id){e.preventDefault();e.dataTransfer.dropEffect='move';setOver(it.id)}},
+      onDragLeave:function(e){if(!e.currentTarget.contains(e.relatedTarget))setOver(null)},
+      onDrop:function(e){if(!props.reordering||!drag.current)return;e.preventDefault();props.onReorder(drag.current,it.id);drag.current=null;setOver(null)}},
+      h('button', {type:'button', className:'bga-picture-pick', 'aria-label':(props.multi ? '勾选 ' : '使用壁纸 ')+it.base,
+        'aria-pressed': props.multi ? checked : current, onClick:function () {props.onPick(it)}},
+        h('span', {className:'bga-picture-image'},
+          h('img', {src:it.url+'?sz=preview',alt:'',loading:'lazy',decoding:'async',draggable:false}),
+          props.reordering?h('span',{className:'bga-order-number'},index+1):null,
+          current ? h('span', {className:'bga-picture-badge'}, '✓ 当前选择') : null,
+          props.multi ? h('span', {className:'bga-check', 'aria-hidden':'true'}, checked ? '✓' : '') : null),
+        h('span', {className:'bga-picture-name', title:it.base}, it.base)),
+      props.reordering?h('div',{className:'bga-picture-foot bga-order-actions'},
+        h('button',{type:'button',className:'bga-icon-btn bga-drag-handle',draggable:true,'aria-label':'拖动排序 '+it.base,'aria-describedby':'bga-sort-hint',
+          onDragStart:function(e){drag.current=it.id;e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',JSON.stringify(it.id));e.dataTransfer.setDragImage(e.currentTarget.closest('article'),20,20)},
+          onDragEnd:function(){drag.current=null;setOver(null)},
+          onKeyDown:function(e){if(e.altKey&&(e.key==='ArrowLeft'||e.key==='ArrowRight')){e.preventDefault();move(it,index+(e.key==='ArrowLeft'?-1:1))}}},'⠿'),
+        h('button',{type:'button',className:'bga-icon-btn','aria-label':'向前移动 '+it.base,disabled:index===0,onClick:function(){move(it,index-1)}},'←'),
+        h('button',{type:'button',className:'bga-icon-btn','aria-label':'向后移动 '+it.base,disabled:index===props.items.length-1,onClick:function(){move(it,index+1)}},'→')):
+      h('div', {className:'bga-picture-foot'},
+        h('span', {className:'bga-muted'}, it.hd ? '高清' : it.cat),
+        h('button', {type:'button',className:'bga-icon-btn'+(favorite?' active':''),'aria-label':(favorite?'取消喜欢 ':'喜欢 ')+it.base,'aria-pressed':favorite,onClick:function(){toggleFavorite(it.id)}}, favorite?'♥':'♡'),
+        h('button', {type:'button',className:'bga-icon-btn','aria-label':'将 '+it.base+' 加入图单',title:'加入图单',onClick:function(){props.onAdd([it.id])}}, '+')))
+  }))
 })
 
-// ------------------------------------------------------ 对话页宽度：已迁出 --
-// 「对话页固定宽度」整节（UI + findChatRoot/pinChatWidth/MutationObserver）自 v1.3.0
-// 移交 dsh-cache-control（设置页「会话策略 · 对话页」），本插件不再碰 --dsh-chat-* 变量。
+function PlaylistDialog(props) {
+  var s = useBga(), data = props.data, editing = data.mode === 'edit', adding = data.mode === 'add'
+  var existing = playlistById(data.id), ids = data.ids || []
+  var namePair = React.useState(editing && existing ? existing.name : ''), name = namePair[0], setName = namePair[1]
+  var checkedPair = React.useState(ids.length===1 ? s.playlists.filter(function(p){return p.items.indexOf(ids[0])>=0}).map(function(p){return p.id}) : []), checked=checkedPair[0],setChecked=checkedPair[1]
+  var errorPair=React.useState(''), error=errorPair[0],setError=errorPair[1]
+  var confirmPair=React.useState(false), confirming=confirmPair[0],setConfirming=confirmPair[1]
+  var ref=React.useRef(null)
+  React.useEffect(function(){
+    var prior=document.activeElement, dialog=ref.current
+    if(dialog && dialog.showModal) dialog.showModal()
+    return function(){if(dialog && dialog.open)dialog.close();if(prior && prior.isConnected && prior.focus)prior.focus()}
+  },[])
+  function run(fn) { try {fn();props.onClose()} catch(e){setError(e.message)} }
+  var title=editing?'编辑图单':adding?(ids.length>1?'将 '+ids.length+' 张壁纸加入图单':'收藏到图单'):'新建图单'
+  return h('dialog',{ref:ref,className:'bga-dialog','aria-labelledby':'bga-dialog-title',onCancel:function(e){e.preventDefault();props.onClose()},onClick:function(e){if(e.target===e.currentTarget)props.onClose()}},
+    h('form',{onSubmit:function(e){e.preventDefault();run(function(){
+      if(editing)renamePlaylist(data.id,name)
+      else if(adding)changeMembership(ids,checked,ids.length===1)
+      else {var id=createPlaylist(name,ids);if(props.onCreated)props.onCreated(id)}
+    })}},
+      h('div',{className:'bga-dialog-head'},h('h3',{id:'bga-dialog-title'},title),h('button',{type:'button',className:'bga-icon-btn','aria-label':'关闭图单窗口',onClick:props.onClose},'×')),
+      adding ? h('div',null,
+        h('p',{className:'bga-muted'},ids.length>1?'可同时加入多个图单。':'勾选想收录的图单，取消勾选即可移出。'),
+        h('div',{className:'bga-list-choices'},s.playlists.map(function(p){return h('label',{key:p.id,className:'bga-list-choice'},
+          h('input',{type:'checkbox',checked:checked.indexOf(p.id)>=0,onChange:function(e){setChecked(e.target.checked?checked.concat(p.id):checked.filter(function(id){return id!==p.id}))}}),
+          h('span',null,p.name),h('small',null,p.items.length+' 张'))})),
+        h('div',{className:'bga-create-inline'},
+          h('input',{className:'bga-input',value:name,maxLength:40,'aria-label':'新图单名称',placeholder:'也可以新建一个图单',onChange:function(e){setName(e.target.value);setError('')}}),
+          h('button',{type:'button',className:'bga-btn',disabled:!name.trim(),onClick:function(){run(function(){createPlaylist(name,ids)})}},'创建并加入')))
+        : h('label',{className:'bga-form-label'},'图单名称',h('input',{className:'bga-input',value:name,maxLength:40,autoFocus:true,placeholder:'例如：夜间工作、喜欢的角色',onChange:function(e){setName(e.target.value);setError('')}})),
+      error ? h('p',{className:'bga-error',role:'alert'},error) : null,
+      h('div',{className:'bga-dialog-actions'},
+        editing ? h('button',{type:'button',className:'bga-btn bga-danger',onClick:function(){setConfirming(!confirming)}},'删除图单') : null,
+        h('button',{type:'button',className:'bga-btn',onClick:props.onClose},'取消'),
+        h('button',{type:'submit',className:'bga-btn bga-primary',disabled:adding?(ids.length>1&&!checked.length):!name.trim()},adding?(ids.length>1?'加入所选图单':'保存'):(editing?'保存名称':'创建图单'))),
+      confirming ? h('div',{className:'bga-delete-confirm'},
+        h('p',null,'删除“'+(existing?existing.name:'')+'”？原图片会保留。'+(s.playbackSource==='list:'+data.id?' 该图单的轮播会暂停。':'')),
+        h('button',{type:'button',className:'bga-btn bga-danger',onClick:function(){run(function(){removePlaylist(data.id);if(props.onDeleted)props.onDeleted()})}},'确认删除图单')) : null))
+}
+
+function PlaybackSourceSelect() {
+  var s=useBga(), currentKnown=s.playbackSource==='all'||s.playbackSource.indexOf('list:')===0&&!!playlistById(s.playbackSource.slice(5))||STORE.categories.some(function(c){return 'cat:'+c.name===s.playbackSource})
+  return h('label',{className:'bga-source-control'},h('span',null,'切换范围'),
+    h('select',{'aria-label':'切换范围',value:s.playbackSource,onChange:function(e){setPlaybackSource(e.target.value)}},
+      h('option',{value:'all'},'全部壁纸'),
+      !currentKnown ? h('option',{value:s.playbackSource},sourceLabel(s.playbackSource)+'（暂不可用）') : null,
+      h('optgroup',{label:'我的图单'},s.playlists.map(function(p){return h('option',{key:p.id,value:'list:'+p.id},p.name+' · '+sourceItems('list:'+p.id).length+' 张')})),
+      h('optgroup',{label:'文件夹'},STORE.categories.map(function(c){return h('option',{key:c.name,value:'cat:'+c.name},c.name+' · '+c.count+' 张')}))))
+}
+function PlaybackModeSelect() {
+  var s=useBga()
+  return h('label',{className:'bga-source-control'},h('span',null,'播放顺序'),
+    h('select',{'aria-label':'播放顺序',value:s.playbackMode,onChange:function(e){setPlaybackMode(e.target.value)}},
+      h('option',{value:'random'},'随机播放'),h('option',{value:'ordered'},'顺序播放')))
+}
+
+function AppearancePanel() {
+  var s=useBga(),frame=framingOf(s,s.wallpaper),hasImage=!!s.wallpaper
+  var fxHint={firefly:'轻盈的光点与流星',bubble:'柔和上浮的透明气泡',petal:'缓缓飘落的花瓣',rain:'细密的斜向雨丝',off:'保持安静，不显示装饰'}
+  return h('div',{className:'bga-panel-stack'},
+    Section('这张壁纸的构图',hasImage?'缩放与焦点仅为“'+curLabel(s.wallpaper)+'”保存，换回来会自动恢复。':'先选择一张静态壁纸，再调整构图。',
+      h('fieldset',{className:'bga-framing-controls',disabled:!hasImage},
+        h('div',{className:'bga-control-grid'},Slider('壁纸缩放',frame.zoom,1,2.2,function(v){setImageFraming({zoom:v})},'x')),
+        h('div',{className:'bga-focus-row'},h('div',null,h('b',null,'画面焦点'),h('p',{className:'bga-muted'},'选择裁剪时保留的位置')),
+          h('div',{className:'bga-foci','aria-label':'画面焦点'},FOCI.map(function(fc,i){return h('button',{key:fc.id,type:'button',className:'bga-focus'+(frame.focus===fc.pos?' on':''),'aria-label':['左上','上方','右上','左侧','居中','右侧','左下','下方','右下'][i],'aria-pressed':frame.focus===fc.pos,onClick:function(){setImageFraming({focus:fc.pos})}},h('i',null))}))),
+        h('button',{type:'button',className:'bga-text-btn bga-frame-reset',onClick:resetImageFraming},'恢复这张图的默认构图'))),
+    Section('画面与透明度', '这些设置应用于所有壁纸。',
+      h('div',{className:'bga-control-grid'},
+        Slider('壁纸暗纱',s.veil,0,0.85,function(v){STORE.set({veil:v})}),
+        Slider('界面透明度',s.glass,0,1,function(v){STORE.set({glass:v})}))),
+    Section('配色',null,
+      h('div',{className:'bga-swatches'},PRESETS.map(function(p){return h('button',{key:p.id,type:'button',className:'bga-swatch'+(s.preset===p.id?' on':''),'aria-pressed':s.preset===p.id,onClick:function(){STORE.set({preset:p.id,accent:p.accent,deep:p.deep})}},
+        h('span',{className:'bga-dots'},h('span',{className:'bga-dot',style:{background:p.accent}}),h('span',{className:'bga-dot',style:{background:p.deep}})),p.name)})),
+      h('details',{className:'bga-details'},h('summary',null,'自定义颜色'),h('div',{className:'bga-row'},
+        h('label',{className:'bga-field'},'强调色 ',h('input',{type:'color',value:s.accent,onChange:function(e){STORE.set({accent:e.target.value,preset:'custom'})}})),
+        h('label',{className:'bga-field'},'深色底 ',h('input',{type:'color',value:s.deep,onChange:function(e){STORE.set({deep:e.target.value,preset:'custom'})}}))))),
+    Section('输入框',null,h('div',{className:'bga-control-grid'},
+      Slider('卡面不透明度',s.cardA,0,1,function(v){STORE.set({cardA:v})}),
+      Slider('卡面模糊',s.cardBlur,0,24,function(v){STORE.set({cardBlur:v})},'px')),
+      TinySwitch('显示卡面阴影',s.cardShadow!==false,function(v){STORE.set({cardShadow:v})})),
+    Section('输入框装饰',null,h('div',{className:'bga-fxopts'},EFFECTS.map(function(fx){return h('button',{key:fx.id,type:'button',className:'bga-fxopt'+(s.effect===fx.id?' on':''),'aria-pressed':s.effect===fx.id,onClick:function(){STORE.set({effect:fx.id})}},h('b',null,fx.name),h('span',null,fxHint[fx.id]))}))))
+}
+
+function PlaybackPanel() {
+  var s=useBga(), count=sourceItems(s.playbackSource).length
+  return h('div',{className:'bga-panel-stack'},
+    Section('轮播',null,h('div',{className:'bga-row'},h(PlaybackSourceSelect),h(PlaybackModeSelect)),
+      h('p',{className:'bga-muted'},count?'“换一张”、侧栏宝珠和自动轮播都从这里选图。':'这个范围暂时没有可用壁纸，加入图片后即可切换。'),
+      h('p',{className:'bga-muted'},s.playbackMode==='ordered'?'按图单排列顺序循环；文件夹按图库顺序播放。':'随机播放，同轮内尽量不重复。'),
+      TinySwitch('自动轮播',s.autoOn===true,function(v){STORE.set({autoOn:v})}),
+      h('fieldset',{className:'bga-control-grid',disabled:!s.autoOn},Slider('切换间隔',s.autoMin,1,120,function(v){STORE.set({autoMin:v})},'min',AUTO_STOPS)),
+      h('p',{className:'bga-muted'},'手动换图后，会重新计算轮播间隔。')),
+    Section('渐变',null,TinySwitch('渐变切换',s.fadeOn!==false,function(v){STORE.set({fadeOn:v})}),
+      h('fieldset',{className:'bga-control-grid',disabled:s.fadeOn===false},
+        Slider('开始前等待',s.fadeDelayMs,0,1000,function(v){STORE.set({fadeDelayMs:v})},'ms'),
+        Slider('渐变时长',s.fadeMs,100,5000,function(v){STORE.set({fadeMs:v})},'ms')),
+      h('p',{className:'bga-muted'},'手动连点会随节奏加快：1 秒、500 毫秒、300 毫秒。停顿 1.5 秒后恢复设定时长，正在渐变的画面也会提速。'),
+      h('p',{className:'bga-muted'},'只会缩短，不会延长；快速连点时跳过开始前等待。自动轮播沿用设定时长。')))
+}
+
+// 低频管理操作收进抽屉；下载轮询随组件卸载清理。
+function LibraryTools(props) {
+  var pair=React.useState(null),prog=pair[0],setProg=pair[1],live=React.useRef(true),timer=React.useRef(0)
+  function poll() {
+    fetch('/bga/wallpapers/fetch-status',{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('状态读取失败');return r.json()}).then(function(st){
+      if(!live.current)return
+      setProg(st)
+      if(st.running)timer.current=setTimeout(poll,1000)
+      else if(st.finishedAt)props.refresh()
+    }).catch(function(){if(live.current)setProg({error:'暂时无法读取下载进度，请稍后重试'})})
+  }
+  React.useEffect(function(){live.current=true;poll();return function(){live.current=false;clearTimeout(timer.current)}},[])
+  function download(){
+    setProg({running:true})
+    fetch('/bga/wallpapers/fetch',{method:'POST'}).then(function(r){if(!r.ok)throw new Error('下载请求失败');return r.json()}).then(function(r){if(r.error)throw new Error(r.error);if(live.current)poll()}).catch(function(e){if(live.current)setProg({error:e.message})})
+  }
+  return h('details',{className:'bga-details'},h('summary',null,'管理壁纸文件'),
+    h('p',{className:'bga-muted'},'将图片放入下方文件夹，再刷新图库。子文件夹会自动显示在“文件夹”中。'),
+    h('div',{className:'bga-directory'},STORE.writableDir||STORE.listDir||'正在读取目录'),
+    STORE.writableDir&&STORE.listDir&&STORE.writableDir!==STORE.listDir ? h('p',{className:'bga-muted'},'当前图片来源：'+STORE.listDir) : null,
+    h('div',{className:'bga-row'},h('button',{type:'button',className:'bga-btn',onClick:props.refresh,disabled:props.loading},props.loading?'刷新中…':'刷新图库'),
+      h('button',{type:'button',className:'bga-btn',onClick:download,disabled:!!(prog&&prog.running)},prog&&prog.running?'下载中…':'下载内置壁纸')),
+    prog&&(prog.running||prog.finishedAt||prog.error) ? h('p',{className:prog.error?'bga-error':'bga-muted',role:'status'},prog.error||((prog.done||0)+' / '+(prog.total||0)+' 张 · 已下载 '+(prog.downloaded||0)+' · 跳过 '+(prog.skipped||0)+(prog.failed?' · 失败 '+prog.failed:''))) : null,
+    STORE.skipped.length ? h('p',{className:'bga-muted'},'已略过 '+STORE.skipped.length+' 个不支持的文件。') : null)
+}
 
 function SettingsPage() {
-  var s = useBga()
-  var cur = s.wallpaper || null
-  var dataPair = React.useState({ dir: STORE.listDir, cats: STORE.categories || [], total: STORE.total || 0 })
-  var data = dataPair[0]
-  var setData = dataPair[1]
-  var errPair = React.useState('')
-  var loadError = errPair[0]
-  var setLoadError = errPair[1]
-  var viewPair = React.useState({ page: 'cats', cat: '', hd: 'all' })
-  var view = viewPair[0]
-  var setView = viewPair[1]
-  var readyPair = React.useState(false)   // 清单首次拉取完成前显示加载动画
-  var ready = readyPair[0]
-  var setReady = readyPair[1]
-  var foldPair = React.useState(false)    // 「文件目录与类型说明」抽屉默认收起
-  var dirFoldOpen = foldPair[0]
-  var setDirFoldOpen = foldPair[1]
-
-  function refresh() {
-    setLoadError('')
-    fetchList().then(function () {
-      setData({ dir: STORE.listDir, cats: STORE.categories, total: STORE.total })
-      setReady(true)
-    }).catch(function (e) {
-      setLoadError('底图清单加载失败: ' + String(e))
-      setReady(true)
-    })
+  var s=useBga(),cur=s.wallpaper, favorites=playlistById('favorites').items
+  var frame=framingOf(s,cur)
+  var tabPair=React.useState('library'),tab=tabPair[0],setTab=tabPair[1]
+  var sourcePair=React.useState('all'),source=sourcePair[0],setSource=sourcePair[1]
+  var queryPair=React.useState(''),query=queryPair[0],setQuery=queryPair[1]
+  var qualityPair=React.useState('all'),quality=qualityPair[0],setQuality=qualityPair[1]
+  var multiPair=React.useState(false),multi=multiPair[0],setMulti=multiPair[1]
+  var sortPair=React.useState(false),sorting=sortPair[0],setSorting=sortPair[1]
+  var pickedPair=React.useState([]),picked=pickedPair[0],setPicked=pickedPair[1]
+  var modalPair=React.useState(null),modal=modalPair[0],setModal=modalPair[1]
+  var loadPair=React.useState(true),loading=loadPair[0],setLoading=loadPair[1]
+  var errorPair=React.useState(''),error=errorPair[0],setError=errorPair[1]
+  var life=React.useRef(true),loadSeq=React.useRef(0)
+  var weRefresh=React.useState(0)[1]
+  React.useEffect(function(){
+    var update=function(){weRefresh(function(n){return n+1})}
+    WE_WATCHERS.push(update)
+    return function(){var i=WE_WATCHERS.indexOf(update);if(i>=0)WE_WATCHERS.splice(i,1)}
+  },[])
+  function refresh(){
+    var seq=++loadSeq.current;setLoading(true);setError('')
+    fetchList().then(function(){if(life.current&&seq===loadSeq.current){setLoading(false);STORE.touch()}}).catch(function(){if(life.current&&seq===loadSeq.current){setLoading(false);setError('图库暂时无法加载，请重试。')}})
   }
-  React.useEffect(function () { refresh() }, [])   // 打开页面始终拉最新清单
-
-  // ---- 从 GitHub Release 取回底图（图片不进 git，见 README「底图分发」节）----
-  // 与命令行 node tools/fetch-wallpapers.mjs 走 host 侧同一份实现（fetch-wallpapers.js），
-  // 逐张校验字节数与 sha256；已存在且校验通过的会跳过，所以按钮可以反复点、断网续传。
-  var progPair = React.useState(null)
-  var prog = progPair[0]
-  var setProg = progPair[1]
-  function pollFetch() {
-    fetch('/bga/wallpapers/fetch-status', { cache: 'no-store' })
-      .then(function (r) { return r.json() })
-      .then(function (st) {
-        setProg(st)
-        if (st.running) { setTimeout(pollFetch, 800); return }
-        if (st.finishedAt) refresh()          // 取完（无论成败）刷一次列表，把新图显示出来
-      })
-      .catch(function () { /* 状态查不到就不轮询了 */ })
+  React.useEffect(function(){life.current=true;refresh();return function(){life.current=false;loadSeq.current++}},[])
+  React.useEffect(function(){if(source.indexOf('list:')===0&&!playlistById(source.slice(5))){setSource('all');setPicked([]);setSorting(false)}},[s.playlists,source])
+  function browse(value){setSource(value);setPicked([]);setQuery('');setQuality('all');setSorting(false)}
+  function add(ids){setModal({mode:'add',ids:ids})}
+  var choose=React.useCallback(function(it){
+    if(multi)setPicked(function(prev){return prev.indexOf(it.id)>=0?prev.filter(function(id){return id!==it.id}):prev.concat(it.id)})
+    else {if(STORE.state.weId||weActive()){weDispose();STORE.set({weId:null})}setWallpaper(it)}
+  },[multi])
+  var openAdd=React.useCallback(function(ids){setModal({mode:'add',ids:ids})},[])
+  var reorderCurrent=React.useCallback(function(from,to){if(source.indexOf('list:')===0)reorderPlaylist(source.slice(5),from,to)},[source])
+  var items=React.useMemo(function(){
+    var q=query.trim().toLocaleLowerCase()
+    return sourceItems(source).filter(function(it){return (quality==='all'||(quality==='hd'?it.hd:!it.hd))&&(!q||(it.base+' '+it.cat).toLocaleLowerCase().indexOf(q)>=0)})
+  },[source,query,quality,s.playlists,source==='recent'?s.recent:null,STORE.list])
+  var pool=sourceItems(s.playbackSource), activeList=source.indexOf('list:')===0?playlistById(source.slice(5)):null
+  var missing=activeList?activeList.items.length-sourceItems(source).length:0, liveBg=!!(s.weId||weActive())
+  var curFavorite=cur&&favorites.indexOf(cur.id)>=0
+  var tabs=[['library','图库'],['appearance','外观'],['playback','切换'],['dynamic','动态壁纸']]
+  function tabKeys(e){
+    var i=tabs.findIndex(function(t){return t[0]===tab}),next
+    if(e.key==='ArrowRight')next=(i+1)%tabs.length
+    else if(e.key==='ArrowLeft')next=(i+tabs.length-1)%tabs.length
+    else if(e.key==='Home')next=0
+    else if(e.key==='End')next=tabs.length-1
+    else return
+    e.preventDefault();setTab(tabs[next][0]);e.currentTarget.parentNode.querySelectorAll('[role=tab]')[next].focus()
   }
-  function startFetch() {
-    setProg({ running: true, done: 0, total: 0 })
-    fetch('/bga/wallpapers/fetch', { method: 'POST' })
-      .then(function (r) { return r.json() })
-      .then(function (r) {
-        if (r && r.error) { setProg({ running: false, error: r.error }); return }
-        pollFetch()
-      })
-      .catch(function (e) { setProg({ running: false, error: '请求失败: ' + String(e) }) })
-  }
-  React.useEffect(function () {
-    // 进设置页时若正在下（比如上次没看完），接上进度
-    fetch('/bga/wallpapers/fetch-status', { cache: 'no-store' })
-      .then(function (r) { return r.json() })
-      .then(function (st) { if (st && st.running) { setProg(st); pollFetch() } })
-      .catch(function () {})
-  }, [])
-  var fetchRow = (function () {
-    var label = '下载底图'
-    var note = '从 Release 资产取回（19 张约 333MB，逐张校验 sha256；已存在的会跳过）'
-    if (prog && prog.running) {
-      var pct = prog.total ? Math.round((prog.done / prog.total) * 100) : 0
-      label = '下载中 ' + pct + '%'
-      note = prog.done + '/' + prog.total + ' · 已下 ' + (prog.downloaded || 0) + ' 跳过 ' + (prog.skipped || 0) + ' 失败 ' + (prog.failed || 0) + ' · ' + ((prog.bytes || 0) / 1048576).toFixed(1) + ' MB'
-    } else if (prog && prog.error) {
-      note = '失败：' + prog.error
-    } else if (prog && prog.finishedAt) {
-      note = '完成：下载 ' + (prog.downloaded || 0) + ' 张 · 跳过 ' + (prog.skipped || 0) + ' 张 · 失败 ' + (prog.failed || 0) + ' 张'
-        + (prog.failed ? '（可再点一次补缺）' : '')
-    }
-    return h('div', { className: 'bga-row', style: { margin: '0 0 10px' } },
-      h('button', {
-        className: 'bga-btn',
-        disabled: !!(prog && prog.running),
-        onClick: startFetch,
-        title: '等价于在插件目录执行 node tools/fetch-wallpapers.mjs',
-      }, label),
-      h('span', { className: 'bga-field' }, note))
-  })()
-
-  // 当前正浏览的类型若已不存在/为空目录, 自动退回类型页
-  var activeCat = null
-  if (view.page === 'cat') {
-    for (var ai = 0; ai < data.cats.length; ai++) {
-      if (data.cats[ai].name === view.cat && data.cats[ai].count > 0) { activeCat = data.cats[ai]; break }
-    }
-  }
-  React.useEffect(function () {
-    if (view.page === 'cat' && !activeCat) setView({ page: 'cats', cat: '', hd: 'all' })
-  })
-
-  var totalHd = 0
-  for (var th = 0; th < data.cats.length; th++) totalHd += data.cats[th].hd || 0
-
-  // ---- 类型卡 (一级页) ----
-  var catCards = []
-  for (var ci = 0; ci < data.cats.length; ci++) {
-    ;(function (cat) {
-      var on = !!(cur && cur.cat === cat.name)
-      var thumbs = []
-      var lim = Math.min(cat.items.length, 4)
-      for (var ti = 0; ti < lim; ti++) {
-        thumbs.push(h('span', { key: 't' + ti, className: 'bga-minibox' },
-          h('img', { className: 'bga-mini', src: cat.items[ti].url + '?sz=poster', alt: cat.items[ti].base, loading: 'lazy', decoding: 'async' })))
-      }
-      for (var pad = lim; pad < 4; pad++) {
-        thumbs.push(h('div', { key: 'e' + pad, className: 'bga-emptymini' }, '—'))
-      }
-      var meta = cat.count
-        ? (cat.count + ' 张' + (cat.hd ? ' · ' + cat.hd + ' 张高清' : ''))
-        : '空 · 放入图片后点刷新'
-      catCards.push(h('button', {
-        key: cat.name,
-        className: 'bga-card bga-cat' + (on ? ' on' : ''),
-        disabled: !cat.count,
-        title: (on ? '当前类型 · ' : '') + '打开「' + cat.name + '」图库 (' + cat.count + ' 张)',
-        onClick: function () { setView({ page: 'cat', cat: cat.name, hd: 'all' }) },
-      },
-        h('div', { className: 'bga-cat-thumbs' }, thumbs),
-        h('div', { className: 'bga-cat-meta' },
-          h('b', null, cat.name),
-          h('span', null, meta))))
-    })(data.cats[ci])
-  }
-
-  // (类型内图库网格已提为模块级 ItemGrid 组件, 用 React.memo 隔离, 见下方定义)
-
-  // ---- 类型内筛选: 全部 / 高清 / 普通 (细分是否高清) ----
-  function chipRow(cat) {
-    if (!cat.count) return null
-    var chips = []
-    var opts = [
-      { k: 'all', label: '全部', n: cat.count },
-      { k: 'hd', label: '高清', n: cat.hd },
-      { k: 'plain', label: '普通', n: cat.count - cat.hd },
-    ]
-    for (var ch = 0; ch < opts.length; ch++) {
-      ;(function (o) {
-        if (o.n <= 0) return
-        var isOn = (view.hd || 'all') === o.k
-        chips.push(h('button', {
-          key: o.k,
-          className: 'bga-chip' + (isOn ? ' on' : ''),
-          onClick: function () { setView({ page: 'cat', cat: cat.name, hd: o.k }) },
-        }, o.label + ' (' + o.n + ')'))
-      })(opts[ch])
-    }
-    return chips.length ? h('div', { className: 'bga-chips' }, chips) : null
-  }
-
-  // ---- 主体: 类型页 或 类型内图库 ----
-  var picker
-  if (view.page === 'cat' && activeCat) {
-    picker = h('div', { key: activeCat.name },
-      h('div', { className: 'bga-row', style: { margin: '0 0 10px' } },
-        h('button', { className: 'bga-back', onClick: function () { setView({ page: 'cats', cat: '', hd: 'all' }) } }, '← 全部类型'),
-        h('span', { className: 'bga-h', style: { margin: '0' } }, activeCat.name + ' · ' + activeCat.count + ' 张' + (activeCat.hd ? ' (' + activeCat.hd + ' 高清)' : ''))),
-      chipRow(activeCat),
-      h(ItemGrid, {
-        items: activeCat.items,
-        filter: view.hd || 'all',
-        curId: cur ? cur.id : null,
-        showNo: activeCat.count > 1,
-        mixed: activeCat.count > 1 && activeCat.hd > 0 && activeCat.hd < activeCat.count,
-      }))
-  } else {
-    var body
-    if (!ready) {
-      body = h('div', { className: 'bga-loading' }, h('span', { className: 'bga-spin' }), '正在加载底图清单…')
-    } else if (data.cats.length) {
-      body = h('div', { className: 'bga-catgrid' }, catCards)
-    } else {
-      // 空目录时说清"怎么把图弄回来" —— 图片不进 git（仓库只留清单），新机器用下载按钮或命令行取回。
-      body = h('div', { className: 'bga-none', style: { height: 'auto', flexDirection: 'column', gap: '8px', padding: '18px 0' } },
-        h('span', null, '底图目录是空的 —— 点上面的「下载底图」从 Release 取回（约 333MB），或在插件目录执行 node tools/fetch-wallpapers.mjs'))
-    }
-    picker = h('div', { key: 'cats' }, fetchRow, body)
-  }
-
-  // 当前底图摘要条 (缩略图加载中显示转圈)
-  var curStrip = h('div', { className: 'bga-cur' },
-    h('span', { className: 'bga-curbox' + (cur && cur.url ? '' : ' off') },
-      cur && cur.url
-        ? h('img', { className: 'bga-cur-img', src: cur.url + '?sz=thumb', alt: curLabel(cur), decoding: 'async' })
-        : null),
-    h('div', { className: 'bga-cur-info' },
-      h('b', null, cur ? curLabel(cur) : '未使用底图'),
-      h('small', null, cur
-        ? (cur.hd ? '高清 · ' : '') + '点击下面任一张图即切换'
-        : '当前不使用底图, 点击下面任一张图即可启用')),
-    cur ? h('button', { className: 'bga-btn', onClick: function () { STORE.set({ wallpaper: null }) } }, '清除底图') : null)
-
-  var skipTxt = ''
-  if (STORE.skipped && STORE.skipped.length) {
-    var shown = STORE.skipped.slice(0, 4).join(', ')
-    skipTxt = '已忽略 ' + STORE.skipped.length + ' 个不支持文件' + (shown ? ': ' + shown : '') + (STORE.skipped.length > 4 ? ' …' : '')
-  }
-
-  var swatches = []
-  for (var j = 0; j < PRESETS.length; j++) {
-    ;(function (p) {
-      swatches.push(h('button', {
-        key: p.id,
-        className: 'bga-swatch' + (s.preset === p.id ? ' on' : ''),
-        onClick: function () { STORE.set({ preset: p.id, accent: p.accent, deep: p.deep }) },
-      },
-        h('span', { className: 'bga-dots' },
-          h('span', { className: 'bga-dot', style: { background: p.accent } }),
-          h('span', { className: 'bga-dot', style: { background: p.deep } })),
-        p.name))
-    })(PRESETS[j])
-  }
-
-  var fxOpts = []
-  for (var k = 0; k < EFFECTS.length; k++) {
-    ;(function (fx) {
-      fxOpts.push(h('button', {
-        key: fx.id,
-        className: 'bga-fxopt' + (s.effect === fx.id ? ' on' : ''),
-        onClick: function () { STORE.set({ effect: fx.id }) },
-      }, h('b', null, fx.name), h('span', null, fx.hint)))
-    })(EFFECTS[k])
-  }
-
-  var fociBtns = []
-  for (var f = 0; f < FOCI.length; f++) {
-    ;(function (fc) {
-      fociBtns.push(h('button', {
-        key: fc.id,
-        className: 'bga-focus' + (s.focus === fc.pos ? ' on' : ''),
-        title: '焦点 ' + fc.pos,
-        onClick: function () { STORE.set({ focus: fc.pos }) },
-      }, h('i', null)))
-    })(FOCI[f])
-  }
-
-  var dirPathText = (STORE.writableDir ? '放图目录: ' + STORE.writableDir : '目录: ' + (data.dir || '(读取中)'))
-    + (data.dir && STORE.writableDir && data.dir !== STORE.writableDir ? '（当前显示: ' + data.dir + '）' : '')
-
-  return h('div', { className: 'bga-page' },
-    Section('底图', null,
-      h('div', { className: 'bga-row', style: { marginBottom: '10px' } },
-        h('span', { className: 'bga-field', title: dirPathText }, dirPathText),
-        h('button', { className: 'bga-btn', onClick: refresh }, '刷新'),
-        h('span', { className: 'bga-field' }, '类型 ' + data.cats.length + ' 个 · 共 ' + data.total + ' 张' + (totalHd ? ' (' + totalHd + ' 高清)' : '')),
-        skipTxt ? h('span', { className: 'bga-field' }, skipTxt) : null,
-        loadError ? h('span', { className: 'bga-field' }, loadError) : null),
-      h('div', { className: 'bga-fold', style: { marginBottom: '10px' } },
-        h('button', {
-          type: 'button', className: 'bga-foldbtn',
-          'aria-expanded': dirFoldOpen ? 'true' : 'false',
-          onClick: function () { setDirFoldOpen(!dirFoldOpen) },
-        }, (dirFoldOpen ? '▾ ' : '▸ ') + '文件目录与类型说明'),
-        dirFoldOpen ? h('div', { className: 'bga-foldbody' },
-          h('p', { className: 'bga-sub', style: { margin: 0 } },
-            '底图按类型两级浏览: 一级选类型, 二级选具体底图, 点缩略图即切换。' +
-            '类型 = 放图目录下的子文件夹 (如 线稿风 / 重返未来1999); ' +
-            '文件名尾部带 高清/_高清/·高清/4K/HD 等标记的会自动归为高清并可用筛选细分。'),
-          h('p', { className: 'bga-sub', style: { margin: 0 } },
-            '浏览: 点一张类型卡进入它的图库 (类型 = 放图目录里的子文件夹); 图库内可用「全部/高清/普通」筛选。')) : null),
-      curStrip,
-      picker,
-      h('div', { className: 'bga-row', style: { marginTop: '12px' } },
-        Slider('暗纱', s.veil, 0, 0.85, function (v) { STORE.set({ veil: v }) }),
-        Slider('透光', s.glass, 0, 1, function (v) { STORE.set({ glass: v }) })),
-      h('div', { className: 'bga-sub', style: { margin: '14px 0 8px' } }, '范围调整: 焦点决定裁剪时保住的位置; 缩放绕焦点放大'),
-      h('div', { className: 'bga-row' },
-        h('div', { className: 'bga-foci' }, fociBtns),
-        Slider('缩放', s.zoom, 1, 2.2, function (v) { STORE.set({ zoom: v }) }, 'x'))),
-    Section('配色', '十套预设快速贴合底图色调; 主色驱动边框光效与卡面染色, 深色驱动暗纱与深色表面。',
-      h('div', { className: 'bga-swatches' }, swatches),
-      h('div', { className: 'bga-row', style: { marginTop: '12px' } },
-        h('label', { className: 'bga-field' }, '主色 ',
-          h('input', { type: 'color', value: s.accent, onChange: function (e) { STORE.set({ accent: e.target.value, preset: 'custom' }) } })),
-        h('label', { className: 'bga-field' }, '深色 ',
-          h('input', { type: 'color', value: s.deep, onChange: function (e) { STORE.set({ deep: e.target.value, preset: 'custom' }) } })))),
-    Section('对话框', '琉璃卡面: 半透明 + 可调背景模糊; 特效: 输入框上方的动态装饰 (流萤 / 气泡 / 落樱 / 雨丝)。三者可自由组合。',
-      h('div', { className: 'bga-row', style: { marginBottom: '12px' } },
-        Slider('卡面不透明', s.cardA, 0, 1, function (v) { STORE.set({ cardA: v }) }),
-        Slider('卡面模糊', s.cardBlur, 0, 24, function (v) { STORE.set({ cardBlur: v }) }, 'px')),
-      // 阴影独立成一个小开关（原来它拼在特效里，选「关闭」就一起没了）
-      h('div', { style: { margin: '0 0 10px' } },
-        TinySwitch('卡面阴影（全透明时也能看出输入框边界；与特效开关无关）',
-          s.cardShadow !== false, function (v) { STORE.set({ cardShadow: v }) })),
-      h('div', { className: 'bga-fxopts' }, fxOpts)),
-    WeSection(),
-    h('p', { className: 'bga-note' },
-      '设置自动保存到 DSH 配置目录 (host 侧 settings.json), 重启后恢复上次选择。底图与特效由 bg-atelier 插件提供, 停用插件即完全还原, 不改动任何底层文件。对话页固定宽度改在「会话策略」插件里设置。'))
+  function navItem(key,label,count){return h('button',{key:key,type:'button',className:'bga-nav-item'+(source===key?' on':''),'aria-pressed':source===key,onClick:function(){browse(key)}},h('span',null,label),h('small',null,count))}
+  var library=h('div',{className:'bga-library'},
+    h('aside',{className:'bga-library-nav','aria-label':'图库与图单'},
+      navItem('all','全部壁纸',STORE.list.length),navItem('list:favorites','♥ 我喜欢',sourceItems('list:favorites').length),navItem('recent','最近使用',sourceItems('recent').length),
+      h('div',{className:'bga-nav-heading'},h('span',null,'我的图单'),h('button',{type:'button',className:'bga-icon-btn','aria-label':'新建图单',title:'新建图单',onClick:function(){setModal({mode:'create'})}},'+')),
+      s.playlists.filter(function(p){return p.id!=='favorites'}).map(function(p){return navItem('list:'+p.id,p.name,sourceItems('list:'+p.id).length)}),
+      s.playlists.length===1?h('p',{className:'bga-nav-hint'},'把喜欢的画面，收进自己的图单。'):null,
+      h('details',{className:'bga-folder-list',open:true},h('summary',null,'文件夹'),STORE.categories.map(function(c){return navItem('cat:'+c.name,c.name,c.count)}))),
+    h('div',{className:'bga-library-main'},
+      h('div',{className:'bga-library-heading'},h('div',null,h('h3',null,sourceLabel(source)),h('span',{className:'bga-muted'},items.length+' 张'+(missing?' · '+missing+' 张文件暂不可用':''))),
+        h('div',{className:'bga-row'},source!=='recent'?h('button',{type:'button',className:'bga-btn'+(s.playbackSource===source?' bga-active':''),disabled:s.playbackSource===source||!sourceItems(source).length,onClick:function(){setPlaybackSource(source)}},s.playbackSource===source?'✓ 当前切换范围':'设为切换范围'):null,
+          activeList&&activeList.id!=='favorites'?h('button',{type:'button',className:'bga-icon-btn','aria-label':'编辑图单 '+activeList.name,onClick:function(){setModal({mode:'edit',id:activeList.id})}},'⋯'):null)),
+      activeList?h('div',{className:'bga-sort-bar'},h('button',{type:'button',className:'bga-btn','aria-pressed':sorting,disabled:sourceItems(source).length<2,onClick:function(){setSorting(!sorting);setMulti(false);setPicked([]);setQuery('');setQuality('all')}},sorting?'完成排序':'调整顺序'),
+        h('span',{id:'bga-sort-hint',className:'bga-muted'},sorting?'拖动卡片下方手柄，或用左右箭头调整。':'顺序播放时，按这里的排列切换。')):null,
+      h('div',{className:'bga-library-toolbar'},
+        h('input',{type:'search',className:'bga-input',value:query,disabled:sorting,'aria-label':'搜索静态壁纸',placeholder:'搜索名称或类型',onChange:function(e){setQuery(e.target.value)}}),
+        h('select',{'aria-label':'清晰度筛选',value:quality,disabled:sorting,onChange:function(e){setQuality(e.target.value)}},h('option',{value:'all'},'全部清晰度'),h('option',{value:'hd'},'高清'),h('option',{value:'normal'},'普通')),
+        h('button',{type:'button',className:'bga-btn','aria-pressed':multi,disabled:sorting,onClick:function(){setMulti(!multi);setPicked([])}},multi?'完成':'多选')),
+      multi?h('div',{className:'bga-batch'},h('span',{role:'status'},'已选 '+picked.length+' 张'),
+        h('button',{type:'button',className:'bga-btn',disabled:!items.length,onClick:function(){setPicked(items.map(function(it){return it.id}))}},'全选结果'),
+        h('button',{type:'button',className:'bga-btn',disabled:!picked.length,onClick:function(){add(picked)}},'加入图单'),
+        activeList?h('button',{type:'button',className:'bga-btn',disabled:!picked.length,onClick:function(){removeFromPlaylist(activeList.id,picked);setPicked([])}},'移出此图单'):null):null,
+      error?h('div',{className:'bga-empty',role:'alert'},error,h('button',{type:'button',className:'bga-btn',onClick:refresh},'重试')):
+        loading&&!STORE.list.length?h('div',{className:'bga-empty',role:'status'},'正在加载图库…'):
+        items.length?h(ItemGrid,{items:items,curId:cur&&cur.id,favorites:favorites,multi:multi,selected:picked,onPick:choose,onAdd:openAdd,reordering:sorting&&!!activeList,onReorder:reorderCurrent}):
+          h('div',{className:'bga-empty'},h('b',null,query||quality!=='all'?'没有找到匹配的壁纸':source==='recent'?'还没有使用记录':activeList?'这个图单还是空的':'这里还没有壁纸'),
+            h('p',null,activeList&&!query?'去图库挑选图片，用“＋”收进来。':query?'试试更短的关键词，或调整清晰度筛选。':'选择一张喜欢的壁纸，从这里开始。'),
+            activeList?h('button',{type:'button',className:'bga-btn',onClick:function(){browse('all')}},'去图库选图'):null),
+      h(LibraryTools,{refresh:refresh,loading:loading})))
+  if(!stateLoaded) return h('div',{className:'bga-page bga-studio'},h('div',{className:'bga-empty',role:'status'},
+    h('b',null,STORE.saveStatus==='load-error'?'暂时无法读取设置':'正在打开底图工坊…'),
+    STORE.saveStatus==='load-error'?h('p',null,'连接恢复后即可整理图单，现有设置会保留。'):null,
+    STORE.saveStatus==='load-error'?h('button',{type:'button',className:'bga-btn',onClick:function(){STORE.saveStatus='loading';STORE.touch();STORE.load()}},'重新连接'):null))
+  return h('div',{className:'bga-page bga-studio'},
+    h('header',{className:'bga-studio-heading'},h('div',null,h('h2',null,'底图工坊'),h('p',{className:'bga-muted'},'收藏画面，编成你的图单。')),
+      h('span',{className:'bga-save-state',role:'status'},STORE.saveStatus==='error'?'保存失败':STORE.saveStatus==='saving'?'正在保存…':stateLoaded?'已保存':'正在连接…'),
+      STORE.saveStatus==='error'?h('button',{type:'button',className:'bga-btn',onClick:function(){STORE.save();STORE.touch()}},'重试保存'):null),
+    h('div',{className:'bga-hero'},
+      cur&&cur.url?h('img',{className:'bga-hero-image',src:cur.url,alt:'当前选择：'+curLabel(cur),style:{objectPosition:frame.focus,transform:'scale('+frame.zoom+')',transformOrigin:frame.focus}}):null,
+      h('div',{className:'bga-hero-shade'}),
+      h('div',{className:'bga-hero-info'},h('span',{className:'bga-eyebrow'},liveBg?'静态底图预览':'当前选择'),h('strong',null,cur?bareName(cur.name||cur.file):'从一张喜欢的壁纸开始'),h('span',null,liveBg?'正在使用动态壁纸；在图库选择图片可切回静态':cur?(cur.cat||'')+(cur.hd?' · 高清':''):'浏览图库，或创建你的第一个图单'))),
+    h('div',{className:'bga-player'},
+      h('div',{className:'bga-row'},
+        h('button',{type:'button',className:'bga-btn',disabled:liveBg||!canPreviousWallpaper(),onClick:previousWallpaper,title:'返回当前范围内上一次选择'},'上一张'),
+        h('button',{type:'button',className:'bga-btn bga-primary',disabled:!pool.length||liveBg,onClick:cycleWallpaper},'换一张'),
+        h('button',{type:'button',className:'bga-btn',disabled:(!pool.length||liveBg)&&!s.autoOn,onClick:function(){STORE.set({autoOn:!s.autoOn})}},s.autoOn?'暂停轮播':'开始轮播'),
+        h('button',{type:'button',className:'bga-btn'+(curFavorite?' bga-active':''),disabled:!cur||!cur.id,onClick:function(){toggleFavorite(cur.id)}},curFavorite?'♥ 已喜欢':'♡ 喜欢'),
+        h('button',{type:'button',className:'bga-btn',disabled:!cur||!cur.id,onClick:function(){add([cur.id])}},'＋ 图单')),
+      h('div',{className:'bga-player-source'},h('div',{className:'bga-row'},h(PlaybackSourceSelect),h(PlaybackModeSelect)),h('span',{className:'bga-muted'},liveBg?'静态轮播已暂挂':pool.length?(s.autoOn?'每 '+s.autoMin+' 分钟切换':'轮播已暂停'):'暂无可切换图片'))),
+    h('div',{className:'bga-tabs',role:'tablist','aria-label':'底图工坊设置'},tabs.map(function(t){return h('button',{key:t[0],type:'button',role:'tab',id:'bga-tab-'+t[0],'aria-controls':'bga-panel-'+t[0],'aria-selected':tab===t[0],tabIndex:tab===t[0]?0:-1,onClick:function(){setTab(t[0])},onKeyDown:tabKeys},t[1])})),
+    h('div',{className:'bga-tab-panel',role:'tabpanel',id:'bga-panel-'+tab,'aria-labelledby':'bga-tab-'+tab},tab==='library'?library:tab==='appearance'?h(AppearancePanel):tab==='playback'?h(PlaybackPanel):h(WeSection)),
+    h('footer',{className:'bga-studio-footer'},h('span',null,STORE.list.length+' 张壁纸 · '+s.playlists.length+' 个图单'),cur?h('button',{type:'button',className:'bga-text-btn',onClick:function(){STORE.set({wallpaper:null})}},'清除静态底图'):null),
+    modal?h(PlaylistDialog,{key:modal.mode+':'+(modal.id||'')+':'+(modal.ids||[]).join('|'),data:modal,onClose:function(){setModal(null)},onCreated:function(id){browse('list:'+id)},onDeleted:function(){browse('all')}}):null)
 }
+
 
 // ------------------------------------------------------------ WE 壁纸库 ----
 // Wallpaper Engine 接入。host 侧 /bga/we/* 路由提供库清单与媒体流;
@@ -1762,22 +2317,57 @@ function apply(ctx) {
       }
     }, 'bga-canvas-width')
 
-    var disposeDyn = null
+    // 保留样式节点，且底图与主题样式分开更新。纯换图无需撤销/重发整套主题 token。
+    var dynEl = null, bgEl = null, dynamicInputs = ''
+    function updateStyle(el, css, attr) {
+      if (!el) {
+        el = document.createElement('style')
+        el.setAttribute(attr, '1')
+        document.head.appendChild(el)
+      }
+      if (el.textContent !== css) el.textContent = css
+      return el
+    }
+    function rebuildBackground() {
+      bgEl = updateStyle(bgEl, backgroundCss(STORE.state, renderedBgUrl(), renderedBgFrame()), 'data-bg-atelier-background')
+    }
     function rebuildStyle() {
-      if (disposeDyn) disposeDyn()
-      disposeDyn = styles.insert(dynamicCss(STORE.state))
+      var s=STORE.state,inputs=JSON.stringify([!!s.wallpaper,s.accent,s.deep,s.veil,s.glass,s.cardA,s.cardBlur,s.cardShadow,s.effect])
+      if(!dynEl||inputs!==dynamicInputs){dynamicInputs=inputs;dynEl = updateStyle(dynEl, dynamicCss(s, true), 'data-bg-atelier-dynamic')}
+      rebuildBackground()
     }
     ctx.effect(function () {
+      shownUrl = bgUrlOnScreen(STORE.state)
+      shownFrame = framingForUrl(STORE.state,shownUrl)
+      paintBackground = rebuildBackground
       rebuildStyle()
-      return function () { if (disposeDyn) disposeDyn() }
+      return function () {
+        paintBackground = null
+        shownUrl = null
+        shownFrame = null
+        lastManualFadeAt=null;selectionFade=null
+        decodedWallpaper=null
+        fadeStop()
+        if (dynEl && dynEl.parentNode) dynEl.parentNode.removeChild(dynEl)
+        if (bgEl && bgEl.parentNode) bgEl.parentNode.removeChild(bgEl)
+        dynEl = bgEl = null
+      }
     }, 'bga-dynamic')
 
     var disposeTokens = null
+    var tokenSignature = ''
+    var tokenInputs = ''
     function rebuildTokens() {
       if (theme === undefined) return
-      if (disposeTokens) { disposeTokens(); disposeTokens = null }
+      var s=STORE.state,hasBackground=!!s.wallpaper||weActive(),inputs=JSON.stringify([hasBackground,s.accent,s.deep,s.glass])
+      if(inputs===tokenInputs)return
+      tokenInputs=inputs
       // 没有底图时也要下发: WE 动效层同样需要外框半透明才看得见 (见 WE_LAYER 注释)
-      var tokens = (STORE.state.wallpaper || weActive()) ? buildTokens(STORE.state) : {}
+      var tokens = hasBackground ? buildTokens(s) : {}
+      var signature = JSON.stringify(tokens)
+      if (signature === tokenSignature) return
+      tokenSignature = signature
+      if (disposeTokens) { disposeTokens(); disposeTokens = null }
       disposeTokens = theme.overrideTokens('bg-atelier', tokens)
     }
     ctx.effect(function () {
@@ -1786,13 +2376,38 @@ function apply(ctx) {
     }, 'bga-tokens')
 
     ctx.effect(function () {
-      return STORE.subscribe(function () { rebuildStyle(); rebuildTokens() })
+      var ref = { url: bgUrlOnScreen(STORE.state), state: STORE.state }
+      var off = STORE.subscribe(function () {
+        if(ref.state===STORE.state)return // 保存状态/列表通知不重新计算背景与主题
+        ref.state=STORE.state
+        var url = bgUrlOnScreen(STORE.state)
+        if (url !== ref.url || (STORE.state.fadeOn === false && fadeEl)) {
+          switchFade(ref.url, url)
+          ref.url = url
+        }
+        rebuildStyle(); rebuildTokens(); armAuto()
+        pumpWallpaperRequest()
+      })
+      return function () {
+        off(); fadeStop(); cancelWallpaperRequest()
+        if (autoTimer) { clearTimeout(autoTimer); autoTimer = 0 }
+        autoSig = ''
+      }
     }, 'bga-watch')
 
     // WE 动效层的出现/消失要重建动态样式与 token (为什么: 见 WE_LAYER 上方的注释)
     ctx.effect(function () {
       var previousActive = weActive()
-      var fn = function () { var active = weActive(); if (active === previousActive) return; previousActive = active; rebuildStyle(); rebuildTokens() }
+      var fn = function () {
+        var active = weActive()
+        if (active === previousActive) return
+        previousActive = active
+        fadeStop()
+        lastManualFadeAt=null;selectionFade=null
+        shownUrl = bgUrlOnScreen(STORE.state)
+        shownFrame = framingForUrl(STORE.state,shownUrl)
+        rebuildStyle(); rebuildTokens()
+      }
       WE_WATCHERS.push(fn)
       return function () { var i = WE_WATCHERS.indexOf(fn); if (i >= 0) WE_WATCHERS.splice(i, 1) }
     }, 'bga-we-watch')
@@ -1823,7 +2438,8 @@ function apply(ctx) {
     console.log('[dsh-bg-atelier] client up')
 
     // 恢复上次应用过的 WE 动效底图: 必须等 weId 从 settings.json 拉回来, 所以接在 load 后面。
-    STORE.load().then(function () { weRestore() })
+    // armAuto 也在这里补一次: subscribe 里那次跑在"设置还没拉回来"的默认值上(autoOn 默认关)。
+    STORE.load().then(function () { weRestore(); armAuto() })
   }
 
   exports.apply = apply
@@ -1832,9 +2448,28 @@ function apply(ctx) {
   // "数量随画布宽度"、"卡面阴影独立开关"与 DockFx 真渲染。
   exports.internals = {
     STORE: STORE,
+    SettingsPage: SettingsPage, PlaylistDialog: PlaylistDialog,
+    normalizePlaylists: normalizePlaylists, uniqueImageIds: uniqueImageIds, normalizeSource: normalizeSource,
+    createPlaylist: createPlaylist, renamePlaylist: renamePlaylist, removePlaylist: removePlaylist,
+    changeMembership: changeMembership, removeFromPlaylist: removeFromPlaylist, toggleFavorite: toggleFavorite,
+    sourceItems: sourceItems, setPlaybackSource: setPlaybackSource, cycleWallpaper: cycleWallpaper,
+    reorderPlaylist: reorderPlaylist, setPlaybackMode: setPlaybackMode, previousWallpaper: previousWallpaper, canPreviousWallpaper: canPreviousWallpaper,
+    framingOf: framingOf, normalizeImageFraming: normalizeImageFraming, setImageFraming: setImageFraming, resetImageFraming: resetImageFraming,
     weShow: weShow, weDispose: weDispose, weStartNative: weStartNative, weApplySchemeColor: weApplySchemeColor, WeSection: WeSection, WeProperties: WeProperties, weFilterLibrary: weFilterLibrary, weMediaUrl: weMediaUrl,
     staticCss: staticCss,
     dynamicCss: function () { return dynamicCss(STORE.state) },
+    bgLayerCss: bgLayerCss,
+    fadeRun: fadeRun, fadeStop: fadeStop, fadeVisible: fadeVisible, bgUrlOnScreen: bgUrlOnScreen,
+    fadeDurMs: fadeDurMs, fadeWaitMs: fadeWaitMs, switchFade: switchFade,
+    adaptiveFadeMs: adaptiveFadeMs, manualFadeTiming: manualFadeTiming,
+    fadeMotionStatus: function(){return fadeMotion?{duration:fadeMotion.duration,started:fadeMotion.started}:null},
+    renderedBgUrl: renderedBgUrl,
+    backgroundCss: function () { return backgroundCss(STORE.state, renderedBgUrl(), renderedBgFrame()) },
+    setWallpaper: setWallpaper,
+    wallpaperRequestPending: function(){return !!(decodeJob||queuedSwap)},
+    autoDelayMs: autoDelayMs, armAuto: armAuto, autoTick: autoTick,
+    AUTO_STOPS: AUTO_STOPS, nearestStop: nearestStop, Slider: Slider,
+    autoPending: function () { return autoTimer !== 0 },
     DockFx: DockFx,
     canvasWidth: function () { return CANVAS_W },
     setCanvasWidth: function (w) { CANVAS_W = Math.max(120, Math.round(Number(w) || 985)); regenerateParticles() },

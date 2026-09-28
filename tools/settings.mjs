@@ -27,10 +27,14 @@ const dir = () => path.join(dshHome(), PLUGIN)
 const settingsFile = () => path.join(dir(), 'settings.json')
 
 // 与插件源码同口径的默认值 / 枚举 / 区间（改插件时这里要跟着改，注意别漂）
-const DEFAULTS = { wallpaper: null, effect: 'firefly', accent: '#e88ca0', deep: '#241318', veil: 0, glass: 0.8, cardA: 0, cardBlur: 10, focus: '50% 50%', zoom: 1, preset: 'sakura', cardShadow: true }
+const DEFAULTS = { wallpaper: null, effect: 'firefly', accent: '#e88ca0', deep: '#241318', veil: 0, glass: 0.8, cardA: 0, cardBlur: 10, focus: '50% 50%', zoom: 1, preset: 'sakura', cardShadow: true, autoOn: false, autoMin: 30, fadeOn: true, fadeDelayMs: 0, fadeMs: 900, playlists: [], playbackSource: 'all', playbackMode: 'random', imageFraming: {}, recent: [], weId: null, weMode: 'live', weQuality: 'balanced' }
 const EFFECT_IDS = ['firefly', 'bubble', 'petal', 'rain', 'off']
 const PRESETS = ['sakura', 'teal', 'amber', 'violet', 'mint', 'crimson', 'mist', 'lavender', 'peach', 'mono', 'custom']
-const RANGE = { veil: [0, 0.85], glass: [0, 1], cardA: [0, 1], cardBlur: [0, 24], zoom: [1, 2.2] }
+const RANGE = { veil: [0, 0.85], glass: [0, 1], cardA: [0, 1], cardBlur: [0, 24], zoom: [1, 2.2], autoMin: [1, 120], fadeDelayMs: [0, 1000], fadeMs: [100, 5000] }
+// 间隔只有这 14 档（与 client.js 的 AUTO_STOPS 同口径）：导入 47 也吸附到 45，
+// 否则设置文件写着 47、UI 显示 45，两边对不上。
+const AUTO_STOPS = [1, 2, 3, 4, 5, 7, 10, 15, 20, 30, 45, 60, 90, 120]
+const nearestStop = (v) => AUTO_STOPS.reduce((b, s) => (Math.abs(s - v) < Math.abs(b - v) ? s : b), AUTO_STOPS[0])
 const isHex = (v) => typeof v === 'string' && /^#[0-9a-fA-F]{6}$/.test(v)
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v))
 
@@ -59,14 +63,49 @@ export function validate(raw) {
   out.deep = isHex(src.deep) ? src.deep : DEFAULTS.deep
   for (const k of Object.keys(RANGE)) {
     const n = Number(src[k])
-    if (!Number.isFinite(n)) { notes.push(k + ' 不是数字 ⇒ 用默认 ' + DEFAULTS[k]); continue }
+    // 键**不存在**（老版本写的文件缺新字段）不算错，别喊"不是数字"——升级后第一次导入
+    // 会拿 v1.10.0 的文件跑，那两条假警报读起来像用户文件坏了。
+    if (!Number.isFinite(n)) { if (k in src) notes.push(k + ' 不是数字 ⇒ 用默认 ' + DEFAULTS[k]); continue }
     const c = clamp(n, RANGE[k][0], RANGE[k][1])
     if (c !== n) notes.push(k + ' ' + n + ' 越界 ⇒ 钳到 ' + c)
     out[k] = c
   }
+  { // 档位吸附：坏值已在上面兜成默认，这里只剩"表外的数"这一种
+    const snapped = nearestStop(out.autoMin)
+    if (snapped !== out.autoMin) notes.push('autoMin ' + out.autoMin + ' 不是档位 ⇒ 吸附到 ' + snapped)
+    out.autoMin = snapped
+  }
   out.focus = (typeof src.focus === 'string' && /^-?\d+(\.\d+)?% -?\d+(\.\d+)?%$/.test(src.focus.trim())) ? src.focus.trim() : DEFAULTS.focus
   out.preset = PRESETS.includes(src.preset) ? src.preset : DEFAULTS.preset
   out.cardShadow = src.cardShadow !== false          // 默认开
+  out.autoOn = src.autoOn === true                   // v1.10.0 默认关（不请自来的换图很烦）
+  out.fadeOn = src.fadeOn !== false                  // v1.10.0 默认开
+  const ids = value => Array.isArray(value) ? [...new Set(value.filter(id => typeof id === 'string' && id.length > 0 && id.length <= 512))].slice(0,2000) : []
+  const seen = new Set()
+  out.playlists = (Array.isArray(src.playlists) ? src.playlists : []).slice(0,64).flatMap(p => {
+    if (!p || typeof p.id !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(p.id) || seen.has(p.id)) return []
+    const name = typeof p.name === 'string' ? p.name.trim().slice(0,40) : ''
+    if (!name && p.id !== 'favorites') return []
+    seen.add(p.id)
+    return [{id:p.id, name:p.id === 'favorites' ? '我喜欢' : name, items:ids(p.items)}]
+  })
+  if (!seen.has('favorites')) out.playlists.unshift({id:'favorites',name:'我喜欢',items:[]})
+  out.recent = ids(src.recent).slice(0,36)
+  out.playbackSource = typeof src.playbackSource === 'string' && src.playbackSource.length <= 520 && /^(all|cat:.+|list:[a-zA-Z0-9_-]{1,80})$/.test(src.playbackSource) ? src.playbackSource : 'all'
+  out.playbackMode = src.playbackMode === 'ordered' ? 'ordered' : 'random'
+  out.imageFraming = Object.create(null)
+  if (src.imageFraming && typeof src.imageFraming === 'object' && !Array.isArray(src.imageFraming)) {
+    for (const id of Object.keys(src.imageFraming).slice(0,2000)) {
+      const v = src.imageFraming[id]
+      if (!id || id.length > 512 || !v || typeof v !== 'object' || Array.isArray(v)) continue
+      const zoom = Number(v.zoom), match = typeof v.focus === 'string' && v.focus.trim().match(/^(\d+(?:\.\d+)?)% (\d+(?:\.\d+)?)%$/)
+      out.imageFraming[id] = {zoom:Number.isFinite(zoom)?clamp(zoom,1,2.2):1,
+        focus:match?Math.min(100,Number(match[1]))+'% '+Math.min(100,Number(match[2]))+'%':'50% 50%'}
+    }
+  }
+  out.weId = typeof src.weId === 'string' ? src.weId : null
+  out.weMode = src.weMode === 'still' ? 'still' : 'live'
+  out.weQuality = ['smooth','balanced','saver'].includes(src.weQuality) ? src.weQuality : 'balanced'
   return { settings: out, notes }
 }
 
@@ -107,7 +146,7 @@ if (cmd === 'show') {
   const { settings } = validate(cur)
   const i = args.indexOf('--out')
   const out = i >= 0 ? args[i + 1] : path.join(process.cwd(), 'dsh-bg-atelier-settings-' + stamp().slice(0, 10) + '.json')
-  const payload = { format: FORMAT, plugin: PLUGIN, pluginVersion: '1.5.4', exportedAt: new Date().toISOString(), host: os.hostname(), settings }
+  const payload = { format: FORMAT, plugin: PLUGIN, pluginVersion: '1.15.0', exportedAt: new Date().toISOString(), host: os.hostname(), settings }
   fs.writeFileSync(out, JSON.stringify(payload, null, 2), 'utf8')
   console.log('已导出 ' + out)
   console.log('  ' + Object.keys(settings).length + ' 个字段；底图 = ' + (settings.wallpaper ? settings.wallpaper.name : '（未选）'))
@@ -124,7 +163,8 @@ if (cmd === 'show') {
   const { settings, notes } = validate(payload.settings)
   const before = readSettings()
   console.log('将写入：' + settingsFile())
-  console.log('  特效 ' + settings.effect + ' · 底图 ' + (settings.wallpaper ? settings.wallpaper.name : '（未选）') + ' · 卡面阴影 ' + settings.cardShadow)
+  console.log('  特效 ' + settings.effect + ' · 底图 ' + (settings.wallpaper ? settings.wallpaper.name : '（未选）') + ' · 卡面阴影 ' + settings.cardShadow
+    + ' · 自动切换 ' + (settings.autoOn ? settings.autoMin + ' 分钟' : '关') + ' · 渐变 ' + (settings.fadeOn ? '开' : '关'))
   for (const n of notes) console.log('  注意：' + n)
   const missing = wallpaperExistsOnDisk(settings.wallpaper)
   if (missing === false) console.log('  ⚠ 这张底图的图片文件在本机不存在：克隆时若用了 sparse，执行 `git sparse-checkout add wallpapers` 取回图片。')

@@ -30,12 +30,22 @@ const SUITES = [
   'tools/test-we-native.mjs',
   'tools/test-we-properties.mjs',
   'tools/verify-dockfx-bounds.mjs',
+  // 自动切换（间隔钳制 / 开关 / signature 不重起 / tick 起表）+ 渐变过渡（建拆 / 两帧 / 单层）。
+  // 纯算术 + 调用计数 + 记录型假 document，不联网不读本机安装目录。
+  'tools/verify-auto-fade.mjs',
+  // 迁移脚本 tools/settings.mjs 的校验口径：间隔档位吸附（那张 14 档表是 client.js AUTO_STOPS 的副本，
+  // 两处各写一遍就得有人盯着）+ v1.11.0 两个新字段的默认值/钳制 + 老设置文件兼容。
+  'tools/verify-settings.mjs',
+  'tools/test-playlists.mjs',
   // 底图去重（贝利尔两对：同内容两个名字 → 硬链接）。离线自足：清单校验那几项在 CI 照跑，
   // 只有"读真图"的 ①②③ 在没有 wallpapers/ 时打 SKIP（图片不进 git）。
   'tools/verify-wallpaper-dedup.mjs',
 ]
 
 const EXCLUDED = [
+  ['tools/verify-switch-load-browser.mjs', '需要 Playwright 与 Chromium；隔离页面的连点解码压力与选择计数回归'],
+  ['tools/verify-playlists-browser.mjs', '需要 React DOM、Playwright 与 Chromium；图单与设置页真实 UI 回归，使用隔离数据'],
+  ['tools/verify-fade-browser.mjs', '需要 Playwright 与 Chromium；独立浏览器回归，不连接真实 DSH、不写用户设置'],
   ['tools/fetch-wallpapers.mjs --check', '要本机已备好全部底图（67 张 / 约 1.52GB，图片不进 git ⇒ CI 上必然失败）；这个脚本本身还会**真实下载**，绝不能进 CI'],
   ['tools/test-served-bytes.mjs', '要 wallpapers/ 里的真实图片才能起供图路由断言（离线跑本机复现退出码 1：没有 wallpapers/）'],
   ['tools/make-release.mjs --dry-run', '唯一不上传的分支也要**联网**查 Release 资产表 ⇒ CI（尤其 GitHub Actions 自带 GITHUB_TOKEN 时）不该顺手打外网 API；发布机上手动跑'],

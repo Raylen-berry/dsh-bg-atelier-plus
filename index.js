@@ -218,7 +218,8 @@ function readBody(req) {
     let size = 0
     req.on('data', (c) => {
       size += c.length
-      if (size > 8192) {
+      // 图单可能引用数百张图；仍限制请求体大小，避免旧 8KB 上限截断正常设置。
+      if (size > 2 * 1024 * 1024) {
         reject(new Error('body too large'))
         req.destroy()
         return
