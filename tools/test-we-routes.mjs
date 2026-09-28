@@ -52,7 +52,13 @@ try {
   console.log('PASS library/media HTTP: cache / refresh / local IDs / video ranges / web / denied files');
   const post = { method: 'POST' };
   assert.equal((await get(`still?id=${scene.id}`, post)).status, 202);
-  await get(`still?id=${scene.id}`, post); assert.equal(jobs, 1);
+  // 202 只保证**受理**：真正调到 composeWorker 还隔着 compose 里那几个 await，
+  // 而"响应到手"与"任务已经起跑"之间没有先后保证 —— 拿它当同步断言是竞态。
+  // 实测：Node 20.20.2 / 24.21.0 上响应先到（jobs 还是 0），Node 22 上恰好反过来 ⇒
+  // CI 的 test(20)/test(24) 两个 job 就红在这一行（不是产品漏了去重，去重在 start() 里是同步的）。
+  for (let i = 0; i < 50 && jobs === 0; i++) await new Promise(r => setTimeout(r, 10));
+  assert.equal(jobs, 1, '第一次 POST 之后要起一个任务');
+  await get(`still?id=${scene.id}`, post); assert.equal(jobs, 1, '同一个 id 的第二个 POST 不许再起一个任务');
   assert.equal((await get(`still/${scene.id}.webp`, { method: 'HEAD' })).status, 404);
   // Other requests continue while composition waits.
   assert.equal((await get('status')).status, 200);
