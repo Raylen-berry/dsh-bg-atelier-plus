@@ -30,6 +30,8 @@ const SUITES = [
   'tools/test-we-native.mjs',
   'tools/test-we-properties.mjs',
   'tools/verify-dockfx-bounds.mjs',
+  // 特效画布几何（画布 = 输入框卡面矩形, 高度跟着卡面长高）+ 标签气泡（用户附图那套）。
+  'tools/verify-fx-geometry.mjs',
   // 自动切换（间隔钳制 / 开关 / signature 不重起 / tick 起表）+ 渐变过渡（建拆 / 两帧 / 单层）。
   // 纯算术 + 调用计数 + 记录型假 document，不联网不读本机安装目录。
   'tools/verify-auto-fade.mjs',

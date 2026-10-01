@@ -11,7 +11,10 @@
 // ============================================================================
 
 window.__ModuleLoader__.load({
-  id: 'dsh-bg-atelier',
+  // v1.16.0: id 必须与 package.json 的包名一致 —— 客户端 bundle 是按
+  // "包名/client.js" 组 URL 加载的, 宿主用包名查这个 id, 对不上就是
+  // "import failed: client-modules: could not load ..." (页面直接报 Failed to load plugins)。
+  id: 'dsh-bg-atelier-plus',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -86,6 +89,25 @@ function normalizeEffect(v) {
   return EFFECT_IDS[v] === 1 ? v : 'firefly'
 }
 
+/** v1.16.0 外观适配三项的归一化。缺字段 = 老设置文件/新装:
+ *  surface 给 0.30(原 glass .8 时的等效面透明度), preview / bubble 保持开与中等强度。 */
+function stylesNumber(v, fallback, lo, hi) {
+  var n = Number(v)
+  if (!isFinite(n)) return fallback
+  return Math.max(lo, Math.min(hi, n))
+}
+/** 表面不透明度的上限。用户 2026-10-01 定：**30% 封顶** —— 再高底图就被洗白了，
+ *  所以 0.30 既是默认也是上限（原来 0.8 的滑杆太宽，都在没用的区间里）。 */
+var SURFACE_MAX = 0.30
+function normalizeStyles(value) {
+  var v = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  return {
+    surface: stylesNumber(v.surface, SURFACE_MAX, 0, SURFACE_MAX),
+    preview: v.preview !== false,
+    bubble: stylesNumber(v.bubble, 0.5, 0, 1),
+  }
+}
+
 var FOCI = [
   { id: 'tl', pos: '0% 0%' },     { id: 'tc', pos: '50% 0%' },   { id: 'tr', pos: '100% 0%' },
   { id: 'cl', pos: '0% 50%' },    { id: 'cc', pos: '50% 50%' },  { id: 'cr', pos: '100% 50%' },
@@ -125,6 +147,12 @@ var STORE = {
     weId: null,
     weMode: 'live',       // live uses the desktop bridge; still remains available.
     weQuality: 'balanced',
+    // v1.16.0 (官方版分支) 三处适配开关, 见 normalizeStyles() / themeSurfaceCss() / bubbleCss():
+    //   surface  —— 大面积表面(外框/侧栏/会话区)的不透明度。官方版浅色主题下这些面
+    //               原本是一层近白薄纱(用户说的"盖了层白布"), 现在改成带底图色调的浅色 + 可调透明。
+    //   preview  —— 高清底图分两步上屏: 先铺 640 预览(秒出), 再换中间档/原图。
+    //   bubble   —— 消息气泡加一点淡阴影(和输入框卡面同源, 可调强度)。
+    styles: { surface: 0.30, preview: true, bubble: 0.5 },
   },
   list: [],
   listDir: '',
@@ -137,7 +165,7 @@ var STORE = {
     patch = migrateWallpaperNames(patch)
     // 清空或其它入口直接指定底图时，取消仍在解码的旧请求，防止稍后又盖回来。
     if (Object.prototype.hasOwnProperty.call(patch, 'wallpaper') || patch.weId) cancelWallpaperRequest()
-    if (patch.wallpaper === null) decodedWallpaper=null
+    if (patch.wallpaper === null) { decodedWallpaper=null; forgetLarges() }
     var next = {}
     for (var k in this.state) next[k] = this.state[k]
     for (var p in patch) next[p] = patch[p]
@@ -146,6 +174,7 @@ var STORE = {
     if (Object.prototype.hasOwnProperty.call(patch, 'playbackSource')) next.playbackSource = normalizeSource(patch.playbackSource)
     if (Object.prototype.hasOwnProperty.call(patch, 'playbackMode')) next.playbackMode = patch.playbackMode === 'ordered' ? 'ordered' : 'random'
     if (Object.prototype.hasOwnProperty.call(patch, 'imageFraming')) next.imageFraming = normalizeImageFraming(patch.imageFraming)
+    if (Object.prototype.hasOwnProperty.call(patch, 'styles')) next.styles = normalizeStyles(patch.styles)
     this.state = next
     STORE.save()
     for (var i = 0; i < this.listeners.length; i++) this.listeners[i]()
@@ -234,6 +263,9 @@ function hydrateItem(it, catName) {
     base: it.base || bareName(it.name),
     url: it.url,
     hd: !!it.hd,
+    // v1.16.4: 标签来自 host（目录声明 + 文件名 `!主体` 覆盖 + 高清时补「高清」）。
+    // 一张图可能同时挂「重返未来1999」和「高清」—— 搜 6·1 两版都出来就靠它。
+    tags: Array.isArray(it.tags) && it.tags.length ? it.tags.slice(0, 8) : [catName || '未分类'],
     no: it.no || 0,
     size: it.size || 0,
   }
@@ -247,7 +279,11 @@ function wallpaperOf(item) {
     name: item.base,   // 显示名 (去扩展名/去高清标记), 不随编号变化
     url: item.url,
     hd: !!item.hd,
+    tags: Array.isArray(item.tags) ? item.tags.slice(0, 8) : (item.cat ? [item.cat] : []),
     no: item.no || 0,
+    // v1.16.0: size 必须一起带上 —— previewUrlOf/largeUrlOf 靠它判断"是不是大图",
+    // 少了它 (原来就是漏的) 大图也会被当成小图, 直接拉几十 MB 的原图。
+    size: item.size || 0,
   }
 }
 
@@ -260,7 +296,8 @@ var swapSeq = 0
 var pendingStep = null
 var queuedSwap = null
 var decodeJob = null
-var decodedWallpaper = null
+var upgradeJob = null          // 预览上屏后的"升清"任务 (v1.16.0 官方版分支)
+var decodedWallpaper = null    // 已经解好的原图/预览
 
 // 只迁移明确更名的图片引用，不改图单名称或多人组合图名。
 var WALLPAPER_RENAMES = []
@@ -302,6 +339,7 @@ function cancelWallpaperRequest() {
   pendingStep = null
   queuedSwap = null
   if(decodeJob){var job=decodeJob;decodeJob=null;job.cancel()}
+  if(upgradeJob){var up=upgradeJob;upgradeJob=null;up.cancel()}
   if(!STORE.state.wallpaper)decodedWallpaper=null
 }
 
@@ -506,7 +544,68 @@ function pumpWallpaperRequest() {
   if(request.seq!==swapSeq)return
   var w=request.wallpaper
   if(!w.url||typeof Image!=='function'){commitWallpaper(request,null);return}
-  if(decodedWallpaper&&decodedWallpaper.url===w.url){commitWallpaper(request,decodedWallpaper.img);return}
+  var cached=wallpaperImageFor(w)
+  if(cached){commitWallpaper(request,cached);return}
+  var previewUrl=previewUrlOf(w), largeUrl=largeUrlOf(w)
+  // 「正在看的就是这张」上面已经用 wallpaperImageFor 命中并 return 了, 所以这里不再比较
+  // 当前 url —— 早先那版多写了一次 `state.wallpaper.url===w.url`, 结果换图时预览永远被判成
+  // 关掉 (新旧 url 必然不同), 两段式加载一次都没生效。
+  var previewOn=previewUrl!==null&&STORE.state.styles&&STORE.state.styles.preview!==false
+  // 第一段: 预览(或"预览关掉时"直接用目标图) —— 这一段的解码结果照旧交给 commitWallpaper。
+  startDecode(request,previewOn?previewUrl:largeUrl,true,function(){
+    // 第二段: 升清。原来几十 MB 的原图在这里还要**再解一次**才能上屏, 换高清时那一下
+    // 卡顿就出在这儿; 现在升清只在图片加载完成后提交 (浏览器已解好), 主线程不再重解。
+    if(previewOn&&!wallpaperBackgrounded())upgradeWallpaper(request,largeUrl)
+  })
+}
+
+/** 先铺预览、稍后换清晰版的目标尺寸 (长边)。0 = 不请求中间档, 直接用原图。 */
+var PREVIEW_UPGRADE_DIM=3840
+/** item/wallpaper 形状通用的尺寸读取 (wallpaper 对象上 size 是可选字段)。 */
+function sizeOfWallpaper(w){
+  if(!w)return 0
+  var n=Number(w.size)
+  return isFinite(n)&&n>0?n:0
+}
+/** 这张图是不是"大图" —— 决定要不要走"先预览再升清"。
+ *  **不能只看 hd 标记**: 标记是按文件名尾部关键字认的, 「高清」目录里那 157 张文件名
+ *  不带 _高清/·高清 后缀, hd 全是 false, 但它们单张 15–80MB, 正是最卡的一批。
+ *  所以再按文件大小兜一条: >1.5MB 也算大图。 */
+function isHeavyWallpaper(w){
+  if(!w||!w.url)return false
+  return w.hd===true||sizeOfWallpaper(w)>1.5*1024*1024
+}
+function previewUrlOf(w){
+  if(!isHeavyWallpaper(w))return null
+  return w.url+'?sz=preview'
+}
+function largeUrlOf(w){
+  if(!w||!w.url)return null
+  // 「升清」这档只在"真需要"时才走: 大图要中间档 (host 侧对长边 ≤3840 的原图会直接送
+  // 原文件字节), 小图直接原图上屏 —— 没有可省的带宽/解码, 多一跳反而更慢。
+  if(PREVIEW_UPGRADE_DIM>0&&isHeavyWallpaper(w))return w.url+'?sz=large'
+  return w.url
+}
+function wallpaperImageFor(w){
+  if(!w)return null
+  if(decodedWallpaper&&decodedWallpaper.url===w.url)return decodedWallpaper.img
+  var large=largeUrlOf(w)
+  for(var i=0;i<decodedLarges.length;i++)if(large&&decodedLarges[i].url===large)return decodedLarges[i].img
+  return null
+}
+/** 清晰版解码结果只留最近两张: 一张 3840 档解完约 8–33MB, 无上限会随换图一路攒内存。
+ *  留两张是为了"换回去"不用重解, 又不会变成常驻大户。 */
+var decodedLarges=[]
+function rememberLarge(url,img){
+  for(var i=0;i<decodedLarges.length;i++)if(decodedLarges[i].url===url)decodedLarges.splice(i,1)
+  decodedLarges.unshift({url:url,img:img})
+  if(decodedLarges.length>2)decodedLarges.length=2
+}
+function forgetLarges(){decodedLarges=[]}
+
+/** 解码一张图, 成功(或"解码不可用但 onload 到了")才把结果交给 commit。
+ *  onDone 只在**本次请求仍是最新**且成功后调用 —— 迟到/被顶掉的请求一律静默丢弃。 */
+function startDecode(request,url,commit,onDone){
   var img=new Image(),done=false,timer=0
   var job={request:request,img:img,cancel:function(){finish(false,true)}}
   decodeJob=job
@@ -517,18 +616,56 @@ function pumpWallpaperRequest() {
     img.onload=img.onerror=null
     if(decodeJob===job)decodeJob=null
     var latest=job.request.seq===swapSeq
-    if(ok&&latest&&!aborted)commitWallpaper(job.request,img)
-    else {
+    if(ok&&latest&&!aborted){
+      if(commit)commitWallpaper(job.request,img)
+      if(onDone)onDone()
+    } else {
       // 显式清空/卸载/换范围时连 src 一并解除，释放加载引用；迟到回调被 done 拦住。
       try{img.src=''}catch(e){}
-      if(latest&&!aborted){pendingStep=null;console.warn('[bg-atelier] 图片未能解码，保留当前底图')}
+      if(latest&&!aborted&&commit){pendingStep=null;console.warn('[bg-atelier-plus] 图片未能解码，保留当前底图')}
     }
     if(!aborted)pumpWallpaperRequest()
   }
   img.onload=function(){if(typeof img.decode!=='function')finish(true)}
   img.onerror=function(){finish(false)}
   timer=setTimeout(function(){finish(false)},15000)
-  try{img.src=w.url;if(typeof img.decode==='function')img.decode().then(function(){finish(true)},function(){finish(false)})}catch(e){finish(false)}
+  try{img.src=url;if(typeof img.decode==='function')img.decode().then(function(){finish(true)},function(){finish(false)})}catch(e){finish(false)}
+}
+
+/** 预览已上屏后, 在后台把清晰版加载/解码好, 只更新底图 URL 与解码缓存 (不重新记录历史、不写盘)。
+ *  失败就保留预览 —— 预览只是"更软", 比留深色底好; 不弹错、不打断用户。 */
+function upgradeWallpaper(request,url){
+  if(!url)return
+  var img=new Image(),done=false,timer=0
+  var job={request:request,img:img,cancel:function(){finish(false)}}
+  upgradeJob=job
+  function finish(ok){
+    if(done)return
+    done=true
+    if(timer){clearTimeout(timer);timer=0}
+    img.onload=img.onerror=null
+    if(upgradeJob===job)upgradeJob=null
+    // 作废条件: 加载/解码失败、已进后台、或者"当前选中的已经不是这张图"。
+    // **不比 swapSeq**: 预览一提交, 插件自己那条 commit→subscribe→cancelWallpaperRequest
+    // 链路就会把 swapSeq 推一格 (实测 reqseq=4 / now=5), 于是清晰版每次都被判成"过期"丢掉,
+    // 结果是预览铺上去了、清晰版永远不换 —— 用户看到的还是那层发软的图。
+    // 换图时真正要防的是"这张清晰版盖到别的图上", 那句话由 wallpaper.url 的比较来说。
+    var current=STORE.state.wallpaper
+    if(!ok||wallpaperBackgrounded()||!current||current.url!==request.wallpaper.url){
+      try{img.src=''}catch(e){}
+      return
+    }
+    // **不改 STORE.state.wallpaper.url**: 那个 url 是"选中哪张图"的身份, 历史/图单/比较都用它。
+    // 只把"屏幕上正在画的那一版"换成清晰版 (renderedBgUrl/rebuildBackground 都读它)。
+    shownUrl=url
+    shownFrame=framingForUrl(STORE.state,url)
+    rememberLarge(url,img)
+    if(paintBackground)paintBackground()
+  }
+  img.onload=function(){finish(true)}
+  img.onerror=function(){finish(false)}
+  timer=setTimeout(function(){finish(false)},15000)
+  try{img.src=url;if(typeof img.decode==='function')img.decode().then(function(){finish(true)},function(){finish(false)})}catch(e){finish(false)}
 }
 
 function fetchList() {
@@ -685,7 +822,7 @@ function cycleWallpaper(options) {
   }
   if (STORE.list.length) { step(STORE.list); return }
   fetchList().then(step).catch(function (e) {
-    console.error('[bg-atelier] cycle failed: ' + String(e))
+    console.error('[bg-atelier-plus] cycle failed: ' + String(e))
   })
 }
 
@@ -711,6 +848,7 @@ function suspendWallpapers(suspended) {
   wallpaperSuspended = suspended
   wallpaperEpoch++
   cancelWallpaperRequest()
+  if (suspended) forgetLarges()   // 进后台就把清晰版缓存放掉: 它只是"少解一次"的加速, 不是必需品
   fadeStop()
   lastManualFadeAt = null
   selectionFade = null
@@ -786,7 +924,7 @@ function autoTick(generation) {
   autoTimer = 0
   try {
     if (!decodeJob && !queuedSwap && !fadeEl) cycleWallpaper({automatic:true})
-  } catch (e) { console.error('[bg-atelier] auto cycle failed: ' + String(e)) }
+  } catch (e) { console.error('[bg-atelier-plus] auto cycle failed: ' + String(e)) }
   armAuto(true)   // 重新起表: 换图失败/池子为空也不该让自动切换悄悄停掉
 }
 
@@ -814,15 +952,77 @@ function mix(c1, c2, t) {
 var WHITE = { r: 255, g: 255, b: 255 }
 var BLACK = { r: 0, g: 0, b: 0 }
 
+/** 浅色主题的"面"色 = 底图深色往白里提亮到 surfaceTone(s). 提亮比例不算死:
+ *  深色底(deep 本来就暗)需要提得更白才够对比, 浅色底只提一点即可 —— 两端都钳在
+ *  0.45..0.85, 免得出现"近黑的面"或"又变回白布"。 */
+function themeSurfaceTone(sh) {
+  return Math.max(0.45, Math.min(0.85, sh && typeof sh.tone === 'number' ? sh.tone : 0.6))
+}
+/** 设置面板"可读底座"的颜色 (近乎不透明)。**必须算成字面量**再写进插件自己的样式表 ——
+ *  早先版本用 `var(--bga-surface-solid)` 走 theme token, 而给 overrideTokens 塞未注册的
+ *  token 名会让当前宿主把**整层 override 判废**, 后果是界面 token 全回到默认、底图被盖住
+ *  (用户 2026-10-01 报的"壁纸直接不显示")。这里不碰 theme 服务, 自然没这个风险。 */
+function settingsSolidColor(s) {
+  var deep = hexRgb(s.deep)
+  var accent = hexRgb(s.accent)
+  var dark = typeof document !== 'undefined' && document.body &&
+    document.body.hasAttribute && document.body.hasAttribute('data-ds-dark-theme')
+  var base = dark ? mix(deep, accent, 0.06) : mix(deep, WHITE, themeSurfaceTone(s.styles))
+  return rgba(base, 0.97)
+}
+/** 大面积表面(外框/侧栏/会话区)的不透明度。默认 0.30; styles 缺字段时按老 glass 折算
+ *  (glass .8 → .30), 这样没写过 styles 的老设置文件不会突然换个观感。 */
+function themeSurfaceAlpha(s) {
+  var st = s && s.styles
+  if (!st || typeof st !== 'object') {
+    var glass = Number(s && s.glass)
+    if (!isFinite(glass)) glass = 0.8
+    return 0.6 - Math.max(0, Math.min(1, glass)) * 0.375    // .8 → .30, 1 → .225
+  }
+  return stylesNumber(st.surface, 0.30, 0, 0.8)
+}
+
+/** 消息气泡阴影 (v1.16.0 新增; v1.16.1 改成"外圈描边", v1.16.2 修回真正的气泡阴影)。
+ *
+ *  踩过的两个坑, 都写在这儿免得下次再犯:
+ *   ① 本机开着 dsh-cache-control 的「清空气泡」⇒ 气泡 `background:transparent`, 直接在气泡上画
+ *      box-shadow **看不见**(透明盒子没有轮廓)。所以阴影必须画在一个**有背景**的副本上；
+ *   ② 用 `filter:drop-shadow` 会变成"文字阴影"(用户 2026-10-01 明确否掉: 要的是气泡阴影)。
+ *
+ *  做法: 气泡::before 当描边环 —— 它 `inset:0` + `border-radius` 继承 + 负 z-index 垫在内容底下,
+ *  再用 box-shadow 往外扩出阴影。清空气泡时看起来就是"气泡形状的阴影圈", 不清空气泡时是普通卡片阴影。
+ *  强度 0 = 整条规则不下发。 */
+function bubbleCss(s) {
+  var st = (s && s.styles) || {}
+  var a = stylesNumber(st.bubble, 0.5, 0, 1)
+  if (!a || !s || !s.wallpaper) return ''
+  var deep = hexRgb(s.deep)
+  var light = 'rgba(' + deep.r + ',' + deep.g + ',' + deep.b + ',' + (0.05 + 0.16 * a).toFixed(3) + ')'
+  var dark = 'rgba(0,0,0,' + (0.10 + 0.30 * a).toFixed(3) + ')'
+  var hx = (0.4 + 1.6 * a).toFixed(2)   // 横向外扩
+  var vy = (0.8 + 2.4 * a).toFixed(2)   // 向下偏移
+  var bl = (1.6 + 8 * a).toFixed(2)     // 接触阴影模糊
+  var bl2 = (4 + 18 * a).toFixed(2)     // 环境阴影模糊
+  var ring =
+    'body [class*="_bubble"]{position:relative;box-shadow:0 1px 2px ' + light + ',0 6px 18px ' + dark + '}\n' +
+    'body [class*="_bubble"]::before{content:"";position:absolute;z-index:-1;inset:0;' +
+    'border-radius:inherit;box-shadow:inset 0 0 0 1px ' + light + ',0 ' + vy + 'px ' + bl + 'px ' + dark + ',0 ' + vy + 'px ' + bl2 + 'px ' + dark + ';' +
+    'left:-' + hx + 'px;right:-' + hx + 'px;top:-' + hx + 'px;bottom:-' + hx + 'px}\n' +
+    'body[data-ds-dark-theme] [class*="_bubble"]{box-shadow:0 1px 2px rgba(0,0,0,.25),0 8px 22px ' + dark + '}\n'
+  return ring
+}
+
 // ------------------------------------------------------------ 主题 token 层 --
 
 function buildTokens(s) {
   var accent = hexRgb(s.accent)
   var deep = hexRgb(s.deep)
-  var ltint = mix(deep, WHITE, 0.96)          // 浅色表面近纯白, 只留一丝色调, 避免灰雾
-  var baseA = 0.6 - s.glass * 0.55            // glass .8 → 0.16; glass 1 → 0.05
-  var layerA = baseA + 0.06
-  var layer2A = baseA + 0.12
+  // v1.16.0: 浅色主题的面色改成"底图深色提亮"(原来是往纯白 96% 靠 → 整屏一层白布),
+  // 面透明度改由 styles.surface 单独控制。深色主题那套值一个字没动。
+  var ltint = mix(deep, WHITE, themeSurfaceTone(s.styles))
+  var baseA = themeSurfaceAlpha(s)
+  var layerA = Math.min(0.85, baseA + 0.06)
+  var layer2A = Math.min(0.9, baseA + 0.12)
   var sideA = Math.min(0.95, baseA + 0.05)
   var tokens = {}
   tokens['--dsw-alias-bg-base'] = { light: rgba(ltint, baseA), dark: rgba(deep, baseA) }
@@ -902,7 +1102,6 @@ function dynamicCss(s, withoutBackground) {
   css += effectCss(s, accent, deep)
   return css
 }
-
 function backgroundCss(s, url, frame) {
   if (!url || weActive()) return ''
   var deep = hexRgb(s.deep)
@@ -1196,13 +1395,15 @@ function flyRules(n) {
   for (var i = 0; i < n; i++) {
     var leftN = 1 + prand(i + 1) * 97
     var left = leftN.toFixed(1)
-    var bottom = 4 + Math.round(prand(i + 31) * 42)
+    // v1.16.5: 纵向位置改成**画布高度的百分比**（原来写死 4~46px）：卡面长高后粒子跟着铺满，
+    // 不然全挤在底部一小条、上面仍是空的。90px 画布下的落点与旧版一致。
+    var bottom = (4 + prand(i + 31) * 42).toFixed(1) + '%'
     var size = 3 + Math.round(prand(i + 61) * 4) * 0.5
     var dur = 8 + Math.round(prand(i + 91) * 10)
     var delay = (prand(i + 121) * 12).toFixed(1)
     var tail = i % 4 === 3 ? ' reverse' : ''
     var pool = leftN >= 50 ? WANDERS_L : WANDERS_R
-    out.push('.bga-fly.f' + (i + 1) + '{left:' + left + '%;bottom:' + bottom + 'px;width:' + size + 'px;height:' + size +
+    out.push('.bga-fly.f' + (i + 1) + '{left:' + left + '%;bottom:' + bottom + ';width:' + size + 'px;height:' + size +
       'px;animation:' + pool[i % pool.length] + ' ' + dur + 's linear infinite ' + delay + 's' + tail + '}')
   }
   return out
@@ -1212,11 +1413,11 @@ function starRules(n) {
   var out = []
   for (var i = 0; i < n; i++) {
     var left = (3 + prand(i + 201) * 94).toFixed(1)
-    var bottom = 40 + Math.round(prand(i + 231) * 34)
+    var bottom = (45 + prand(i + 231) * 38).toFixed(1) + '%'
     var size = 2.5 + Math.round(prand(i + 261) * 2) * 0.5
     var dur = (2.2 + prand(i + 291) * 2.4).toFixed(1)
     var delay = (prand(i + 321) * 4).toFixed(1)
-    out.push('.bga-star.s' + (i + 1) + '{left:' + left + '%;bottom:' + bottom + 'px;width:' + size + 'px;height:' + size +
+    out.push('.bga-star.s' + (i + 1) + '{left:' + left + '%;bottom:' + bottom + ';width:' + size + 'px;height:' + size +
       'px;animation:bga-twinkle ' + dur + 's ease-in-out infinite ' + delay + 's}')
   }
   return out
@@ -1226,13 +1427,13 @@ function bubRules(n) {
   var out = []
   for (var i = 0; i < n; i++) {
     var left = (2 + prand(i + 401) * 95).toFixed(1)
-    var bottom = 4 + Math.round(prand(i + 431) * 18)
+    var bottom = (4.4 + prand(i + 431) * 20).toFixed(1) + '%'
     var size = 7 + Math.round(prand(i + 461) * 15)          // 7~22px
     var dur = 5.2 + prand(i + 491) * 5                      // 升得更快, 一屏里同时在飞的多
     // **负延迟**（v1.5.3）：切换瞬间气泡已在行程中途, 不会带着边框实心停在底部"等发车";
     // 配合下面 .bga-bub 的 opacity:0 双保险。
     var delay = -(prand(i + 521) * dur).toFixed(1)
-    out.push('.bga-bub.b' + (i + 1) + '{left:' + left + '%;bottom:' + bottom + 'px;width:' + size + 'px;height:' + size +
+    out.push('.bga-bub.b' + (i + 1) + '{left:' + left + '%;bottom:' + bottom + ';width:' + size + 'px;height:' + size +
       'px;animation-duration:' + dur.toFixed(1) + 's;animation-delay:' + delay + 's}')
   }
   return out
@@ -1241,18 +1442,27 @@ function bubRules(n) {
 // ================= 画布宽度 → 粒子数量（数量随屏宽，密度不随屏宽） =================
 // 每个特效定义一个**间距**（多少 px 一颗），数量 = round(画布宽 / 间距)，再夹进上下限。
 // 间距按"本机画布 985px 下复核过的数量"折算：流萤 54.7px/颗、星与气泡与落樱 70.4、雨丝 22.4。
-// 上下限只防极端：小到 300px 画布也不至于只剩两三颗，大到 4K 也不至于上百颗压帧。
+//
+// v1.16.1（用户 2026-10-01「可能要合理微调成密度」）：
+//   · 画布现在跟**输入框卡面**同宽（见 syncCanvasWidth），而卡面宽度 = 会话列 × 72%；
+//     会话页宽度可调 ⇒ 卡面 600–4000px 都可能出现，密度必须自己撑住。
+//   · 原来那个 `max` 是"最多几颗"的硬顶（40/30/26/30/90），是按 985px 画的，屏一宽密度就掉。
+//     现在改成**自适应步长**：超过基准宽度后每多 step×0.75 才多一颗，长边略微摊薄（防 4K 压帧），
+//     但不再有硬顶；min 只防"画布太小只剩两三颗"。
 var CANVAS_W = 985
 var DENSITY = {
-  fly:   { per: 54.7, min: 6,  max: 40 },
-  star:  { per: 70.4, min: 4,  max: 30 },
-  bub:   { per: 70.4, min: 5,  max: 26 },
-  petal: { per: 70.4, min: 4,  max: 30 },
-  rain:  { per: 22.4, min: 10, max: 90 },
+  fly:   { per: 54.7, min: 6,  step: 41 },
+  star:  { per: 70.4, min: 4,  step: 53 },
+  bub:   { per: 70.4, min: 5,  step: 53 },
+  petal: { per: 70.4, min: 4,  step: 53 },
+  rain:  { per: 22.4, min: 10, step: 17 },
 }
 function countFor(kind) {
   var d = DENSITY[kind]
-  return Math.min(d.max, Math.max(d.min, Math.round(CANVAS_W / d.per)))
+  var base = CANVAS_W >= 985
+    ? 985 / d.per + (CANVAS_W - 985) / (d.step * 0.75)   // 宽了: 每 step×0.75 加一颗
+    : Math.max(1, CANVAS_W / d.step)                     // 窄了: 按 step 摊
+  return Math.max(d.min, Math.round(base))
 }
 
 // 规则数组是**可重建**的：画布宽度一变就按新数量重算（数量同时决定 CSS 规则条数与 DockFx 的节点数）。
@@ -1319,13 +1529,26 @@ function staticCss() {
   '@keyframes bga-meteor{0%{opacity:0;transform:translateX(0) rotate(-4deg)}6%{opacity:0.9}18%{opacity:0;transform:translateX(58vw) rotate(-4deg)}100%{opacity:0;transform:translateX(58vw) rotate(-4deg)}}',
   '@keyframes bga-meteor2{0%{opacity:0;transform:translateX(0) rotate(3deg)}5%{opacity:0.85}16%{opacity:0;transform:translateX(-52vw) rotate(3deg)}100%{opacity:0;transform:translateX(-52vw) rotate(3deg)}}',
   '@keyframes bga-rot{to{transform:rotate(360deg)}}',
-  // ---- 流萤 dock ----
-  '.bga-dockfx{height:0;position:relative;z-index:5;width:100%;max-width:var(--dsh-composer-card-max-width,100%);pointer-events:none}',
+  // ---- 特效画布 (v1.16.3: 吸附到输入框卡面, 一条几何规则) ----
+  // 走过的弯路, 记在这儿免得再犯:
+  //   · 最初画布在宿主那个"居中收缩"的 flex 行里, 量出来只有 194px（整行 434px），
+  //     粒子按 194px 算密度只剩 6 只, 超出的还被 clip 切掉;
+  //   · 然后改成 position:fixed + JS 按「会话列/卡面」绝对坐标写 --bga-fx-*。**这条路是错的**:
+  //     卡面会随输入内容长高、窄屏/侧栏折叠都会换几何, 一旦量滞后画布就停在旧位置 ——
+  //     用户反复报"特效不在对话框内"。拿绝对像素对是治标;
+  //   · 中间还试过百分比 inset(`--bga-fx-x`): 定位容器的宽度口径与目测不一致(实测 10.5%
+  //     缩出来是 118px, 而卡面真正差 186px), 算不准。
+  // 现在只留一条几何规则: 画布的定位容器（本机 = `Dc7zOa_composerSeat`, 与卡面**上沿对齐**）
+  // 比卡面宽, 所以用**左右内缩量**把它缩到卡面宽度。
+  // 三个量都是"卡面相对容器"的偏移: 内缩量 l/r + 上偏 oy + 高度 h。v1.16.5 起高度**跟着卡面走**
+  // （以前写死 90px）: 用户往输入框里塞图, 卡面会长到 300px+, 而画布还停在顶部 90px ——
+  // 底部一大截没有特效（"空白区域断层"）。现在画布 = 卡面矩形本身, 粒子高度也按卡面高度铺。
+  '.bga-dockfx{position:absolute;top:var(--bga-fx-oy,0px);left:var(--bga-fx-inset-l,10%);right:var(--bga-fx-inset-r,10%);height:var(--bga-fx-h,90px);z-index:0;pointer-events:none;overflow:clip}',
   // 画布 overflow:clip 治「横向滚动条频闪」：粒子/流星都是 left% + translate 漂移,
   // overflow:visible 时飘出右缘会把外层 [data-conversation-scroll]（overflow:auto）的
   // scrollWidth 顶大 ⇒ 会话区底部横滚条反复出现。clip 不生成滚动容器、不顶祖先;
   // 配合 flyRules 的「按位置选漂移方向」, 粒子行程全在画布内, clip 只当兜底。
-  '.bga-dockfx-in{position:absolute;left:0;right:0;bottom:4px;height:90px;overflow:clip}',
+  '.bga-dockfx-in{position:absolute;left:0;right:0;bottom:0;top:0;overflow:clip}',
   '.bga-fly{position:absolute;width:5px;height:5px;border-radius:50%;corner-shape:round;background:var(--bga-accent);box-shadow:0 0 12px 3px var(--bga-accent-soft);opacity:0}',
   ...FLY_RULES,
   '.bga-star{position:absolute;width:3px;height:3px;border-radius:50%;corner-shape:round;background:var(--bga-accent);box-shadow:0 0 7px 1.5px var(--bga-accent-soft);opacity:0;animation:bga-twinkle 2.8s ease-in-out infinite}',
@@ -1335,21 +1558,23 @@ function staticCss() {
   '.bga-meteor.m2{left:auto;right:0;bottom:66px;width:94px;height:2.5px;animation:bga-meteor2 13s linear infinite 7.5s}',
   // ---- 特效: 气泡 (与流萤共用 .bga-dockfx 这块画布) ----
   // 气泡: 个头 7~22px、边缘带高光+外辉, 底部铺一层"水面"辉光带, 让整串气泡有出处。
-  '@keyframes bga-rise{0%{transform:translateY(0) scale(.5);opacity:0}12%{opacity:.95}68%{opacity:.72}100%{transform:translateY(-92px) scale(1.35);opacity:0}}',
+  // 升程/水面高度都随画布高度 (v1.16.5, 见 syncParticleScale): 卡面高 300px 时气泡还只升 92px
+  // 就成了"底部一小团", 上不去。
+  '@keyframes bga-rise{0%{transform:translateY(0) scale(.5);opacity:0}12%{opacity:.95}68%{opacity:.72}100%{transform:translateY(calc(-1 * var(--bga-fx-rise,92px))) scale(1.35);opacity:0}}',
   '.bga-bub{position:absolute;border-radius:50%;corner-shape:round;border:2px solid var(--bga-accent-soft);background:radial-gradient(circle at 32% 26%,rgba(255,255,255,.95),var(--bga-accent-faint) 60%,var(--bga-accent-soft) 100%);box-shadow:0 0 10px var(--bga-accent-faint),inset 0 -2px 6px var(--bga-accent-faint);opacity:0;animation:bga-rise 7s ease-in infinite}',
   ...BUB_RULES,
   '@keyframes bga-bubsurf{0%,100%{opacity:.3;transform:scaleX(1)}50%{opacity:.62;transform:scaleX(1.05)}}',
-  '.bga-bubsurf{position:absolute;left:-2%;right:-2%;bottom:0;height:22px;border-radius:50%;corner-shape:round;filter:blur(13px);background:var(--bga-accent-soft);opacity:.4;animation:bga-bubsurf 6.5s ease-in-out infinite}',
+  '.bga-bubsurf{position:absolute;left:-2%;right:-2%;bottom:0;height:clamp(22px,22%,34px);border-radius:50%;corner-shape:round;filter:blur(13px);background:var(--bga-accent-soft);opacity:.4;animation:bga-bubsurf 6.5s ease-in-out infinite}',
   // ---- 落樱 / 雨丝 (都在同一块 .bga-dockfx-in 画布上; 画布 overflow:clip,
   //      每条的行程都按"不碰到画布边缘"设计, clip 只当兜底)。
   // 落樱: 花瓣用 border-radius:50% 0 50% 0 出叶形 (corner-shape:round 保住这个形状,
   //    否则会被主题的全局 corner-shape 改成方圆角)。落到底部前淡出, 不会"拍"在卡面上。
-  '@keyframes bga-fall{0%{transform:translate(0,-10px) rotate(0);opacity:0}12%{opacity:.85}88%{opacity:.7}100%{transform:translate(var(--bga-dx,0px),104px) rotate(300deg);opacity:0}}',
+  '@keyframes bga-fall{0%{transform:translate(0,-10px) rotate(0);opacity:0}12%{opacity:.85}88%{opacity:.7}100%{transform:translate(var(--bga-dx,0px),var(--bga-fx-fall,104px)) rotate(300deg);opacity:0}}',
   '.bga-ptl i{position:absolute;top:-12px;background:linear-gradient(150deg,var(--bga-accent),var(--bga-accent-soft));border-radius:50% 0 50% 0;corner-shape:round;opacity:0;animation:bga-fall var(--bga-dur,11s) linear infinite var(--bga-delay,0s)}',
   ...PETAL_RULES,
   // 雨丝: 细斜雨丝下落 + 底部一层"被雨打湿"的水光。雨丝左移 22px, left 起点 4% 起,
   //    两端都不触画布边。条数见 RAIN_RULES。
-  '@keyframes bga-drop{0%{transform:translate(0,-16px) rotate(12deg);opacity:0}10%{opacity:.75}100%{transform:translate(-22px,110px) rotate(12deg);opacity:0}}',
+  '@keyframes bga-drop{0%{transform:translate(0,-16px) rotate(12deg);opacity:0}10%{opacity:.75}100%{transform:translate(-22px,var(--bga-fx-drop,110px)) rotate(12deg);opacity:0}}',
   '@keyframes bga-wet{0%,100%{opacity:.09}50%{opacity:.2}}',
   '.bga-rn i{position:absolute;top:-14px;width:1px;background:linear-gradient(180deg,transparent,var(--bga-accent));opacity:0;animation:bga-drop var(--bga-dur,2s) linear infinite var(--bga-delay,0s)}',
   ...RAIN_RULES,
@@ -1436,8 +1661,12 @@ function staticCss() {
   '.bga-chip.on{color:var(--dsw-alias-label-primary);border-color:var(--bga-accent,var(--dsw-alias-brand-primary));box-shadow:0 0 0 1px var(--bga-accent,var(--dsw-alias-brand-primary)) inset}',
   '.bga-thumbwrap{position:relative;display:block}',
   '.bga-no{position:absolute;left:4px;top:4px;font-size:9px;line-height:1.2;padding:2px 5px;border-radius:5px;background:rgba(0,0,0,.6);color:#fff;pointer-events:none}',
+  // 标签气泡 (v1.16.5): 用户附图那套 —— 圆角胶囊 + 淡色底 + 同色系描边。
+  // 颜色由 tagPill() 按标签名调色板算成**字面量**下发 (不碰 theme token, 见 settingsSolidColor 注释)。
+  '.bga-tagpill{font-style:normal;display:inline-flex;align-items:center;min-height:20px;font-size:10.5px;line-height:1.5;border-radius:999px;padding:1px 9px;white-space:nowrap;flex:none;border:1px solid transparent}',
   '.bga-name em{font-style:normal;font-size:10px;color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l2);border-radius:5px;padding:0 4px;flex:none}',
-  // ---- v1.2: 加载动画 (转圈) + 类型卡缩略图盒子 ----  '.bga-loading{display:flex;align-items:center;justify-content:center;gap:8px;padding:26px 0;color:var(--dsw-alias-label-secondary);font-size:12px}',
+  // ---- v1.2: 加载动画 (转圈) + 类型卡缩略图盒子 ----
+  '.bga-loading{display:flex;align-items:center;justify-content:center;gap:8px;padding:26px 0;color:var(--dsw-alias-label-secondary);font-size:12px}',
   '.bga-spin{width:15px;height:15px;border-radius:50%;corner-shape:round;border:2px solid rgba(160,170,190,.3);border-top-color:var(--bga-accent,#7aa7e8);animation:bga-rot .7s linear infinite}',
   '.bga-thumbwrap::before,.bga-curbox::before,.bga-minibox::before{content:"";position:absolute;left:50%;top:50%;z-index:0;border-radius:50%;corner-shape:round;border:2px solid rgba(160,170,190,.28);border-top-color:var(--bga-accent,#7aa7e8);animation:bga-rot .7s linear infinite}',
   '.bga-thumbwrap::before{width:20px;height:20px;margin:-10px 0 0 -10px}',
@@ -1470,7 +1699,7 @@ body[data-ds-dark-theme] .bga-studio{--bga-panel:rgba(16,23,37,.94);--bga-panel-
 .bga-tab-panel{min-width:0}.bga-library{display:grid;grid-template-columns:168px minmax(0,1fr);gap:20px}.bga-library-nav{padding:12px 8px;background:var(--bga-panel);border:1px solid var(--bga-line);border-radius:14px;align-self:start;min-width:0}.bga-nav-item{display:flex;align-items:center;gap:8px;width:100%;min-height:38px;padding:8px 10px;border:0;border-radius:8px;color:var(--bga-muted);background:transparent;cursor:pointer;text-align:left;font-size:13px!important}.bga-nav-item>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;flex:1}.bga-nav-item small{font-size:11px;opacity:.8}.bga-nav-item.on{color:var(--bga-text);background:var(--bga-panel-soft);box-shadow:inset 2px 0 var(--bga-accent,#7190cb)}.bga-nav-item:hover{color:var(--bga-text);background:var(--bga-panel-soft)}.bga-nav-heading{display:flex;align-items:center;justify-content:space-between;margin:15px 8px 5px;font-size:11px;letter-spacing:.06em;color:var(--bga-muted)}.bga-nav-hint{font-size:12px;color:var(--bga-muted);margin:6px 10px 14px}.bga-folder-list{margin-top:16px;border-top:1px solid var(--bga-line);padding-top:12px}.bga-folder-list summary{font-size:12px;padding:4px 9px 9px;color:var(--bga-muted);cursor:pointer}
 .bga-sort-bar{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px}.bga-picture.drop-target{border-color:var(--bga-accent);box-shadow:inset 0 0 0 3px var(--bga-accent)}.bga-order-number{position:absolute;top:7px;left:7px;padding:2px 7px;border-radius:6px;background:#11233bdd;color:white;font-size:12px}.bga-order-actions{justify-content:flex-end}.bga-order-actions .bga-drag-handle{margin-right:auto;cursor:grab}.bga-drag-handle:active{cursor:grabbing}.bga-framing-controls{border:0;padding:0;margin:0;min-width:0}.bga-frame-reset{margin-top:16px}.bga-framing-controls:disabled{opacity:.5}.bga-player-source>.bga-row{gap:12px;max-width:100%}.bga-player-source .bga-source-control{min-width:0}.bga-sort-bar+.bga-library-toolbar input:disabled,.bga-sort-bar+.bga-library-toolbar select:disabled{opacity:.45}
 .bga-library-main{min-width:0}.bga-library-heading{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:14px}.bga-library-heading h3{font-size:17px;line-height:1.4;margin:0 0 3px;overflow-wrap:anywhere}.bga-library-heading>.bga-row{gap:4px}.bga-library-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:14px;min-width:0}.bga-library-toolbar .bga-input{flex:1;width:100px}.bga-library-toolbar select{width:118px;flex:none}.bga-library-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:13px;max-height:560px;overflow:auto;align-content:start;padding:2px 3px 5px;scrollbar-width:thin;scrollbar-color:var(--bga-accent) transparent}
-.bga-picture{border:1px solid var(--bga-line);background:var(--bga-panel);border-radius:12px;overflow:hidden;min-width:0;transition:border-color .15s}.bga-picture:hover{border-color:var(--bga-accent)}.bga-picture.current,.bga-picture.picked{border-color:var(--bga-accent);box-shadow:0 0 0 1px var(--bga-accent)}.bga-picture-pick{display:block;padding:0;width:100%;border:0;color:inherit;background:transparent;cursor:pointer;text-align:left}.bga-picture-image{position:relative;display:block;aspect-ratio:16/10;overflow:hidden;background:var(--bga-panel-soft)}.bga-picture-image img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .2s}.bga-picture-pick:hover img{transform:scale(1.03)}.bga-picture-name{display:block;font-size:13px;font-weight:600;padding:9px 10px 1px;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}.bga-picture-badge{position:absolute;left:7px;bottom:7px;padding:3px 7px;border:1px solid #ffffff35;border-radius:6px;color:#fff;background:#11233bdd;font-size:10px;line-height:1.4}.bga-check{position:absolute;right:8px;top:8px;background:#152238b3;border:1px solid #e1e9f1;border-radius:5px;width:23px;height:23px;text-align:center;color:#fff}.bga-picture.picked .bga-check{background:#426cb4}.bga-picture-foot{display:flex;align-items:center;padding:0 6px 5px 10px;gap:2px}.bga-picture-foot>.bga-muted{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:11px}.bga-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex:none;border:0;border-radius:7px;background:transparent;color:inherit;font-size:20px!important;cursor:pointer}.bga-icon-btn:hover{background:rgba(120,145,185,.15)}.bga-icon-btn.active{color:var(--bga-accent,#7190cb)}
+.bga-picture{border:1px solid var(--bga-line);background:var(--bga-panel);border-radius:12px;overflow:hidden;min-width:0;transition:border-color .15s}.bga-picture:hover{border-color:var(--bga-accent)}.bga-picture.current,.bga-picture.picked{border-color:var(--bga-accent);box-shadow:0 0 0 1px var(--bga-accent)}.bga-picture-pick{display:block;padding:0;width:100%;border:0;color:inherit;background:transparent;cursor:pointer;text-align:left}.bga-picture-image{position:relative;display:block;aspect-ratio:16/10;overflow:hidden;background:var(--bga-panel-soft)}.bga-picture-image img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .2s}.bga-picture-pick:hover img{transform:scale(1.03)}.bga-picture-name{display:block;font-size:13px;font-weight:600;padding:9px 10px 2px;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}.bga-tags{flex:1 1 auto;min-width:0;display:flex;gap:4px;overflow-x:auto;scrollbar-width:none}.bga-tags::-webkit-scrollbar{display:none}.bga-tagbar{margin:0 0 12px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}.bga-tagchip{border:0;padding:0;cursor:pointer;background:none}.bga-tagchip .bga-tagpill{opacity:.72;transition:opacity .15s}.bga-tagchip:hover .bga-tagpill{opacity:1}.bga-tagchip.on .bga-tagpill{opacity:1;box-shadow:0 0 0 1px currentColor inset}.bga-picture-badge{position:absolute;left:7px;bottom:7px;padding:3px 7px;border:1px solid #ffffff35;border-radius:6px;color:#fff;background:#11233bdd;font-size:10px;line-height:1.4}.bga-check{position:absolute;right:8px;top:8px;background:#152238b3;border:1px solid #e1e9f1;border-radius:5px;width:23px;height:23px;text-align:center;color:#fff}.bga-picture.picked .bga-check{background:#426cb4}.bga-picture-foot{display:flex;align-items:center;padding:0 6px 5px 10px;gap:4px}.bga-picture-foot .bga-icon-btn{flex:none}.bga-picture-foot>.bga-muted{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:11px}.bga-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex:none;border:0;border-radius:7px;background:transparent;color:inherit;font-size:20px!important;cursor:pointer}.bga-icon-btn:hover{background:rgba(120,145,185,.15)}.bga-icon-btn.active{color:var(--bga-accent,#7190cb)}
 .bga-batch{display:flex;align-items:center;gap:7px;flex-wrap:wrap;background:var(--bga-panel);border:1px solid var(--bga-line);border-radius:10px;padding:9px;margin-bottom:12px;font-size:12px}.bga-batch>span{margin-right:auto}.bga-empty{text-align:center;padding:48px 20px;border:1px dashed var(--bga-line);border-radius:14px;background:var(--bga-panel);color:var(--bga-muted);font-size:13px}.bga-empty b{color:var(--bga-text);font-size:15px}.bga-empty p{margin:8px 0 16px}
 .bga-details{margin-top:18px;border-top:1px solid var(--bga-line);padding-top:12px;font-size:12px}.bga-details>summary{color:var(--bga-muted);cursor:pointer;min-height:30px}.bga-details[open]>summary{margin-bottom:12px}.bga-directory{padding:10px;background:var(--bga-panel-soft);border-radius:8px;overflow-wrap:anywhere;margin-bottom:12px;font-size:12px}.bga-studio-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;color:var(--bga-muted);font-size:11px;padding:2px 0 12px}.bga-text-btn{border:0;background:transparent;color:inherit;cursor:pointer;font-size:12px!important;text-decoration:underline;text-underline-offset:4px}
 .bga-panel-stack{display:grid;gap:16px}.bga-panel-stack>section,.bga-tab-panel>section{background:var(--bga-panel);border:1px solid var(--bga-line);border-radius:14px;padding:22px}.bga-studio .bga-h{font-size:16px;color:var(--bga-text);margin:0 0 10px}.bga-studio .bga-sub{color:var(--bga-muted);font-size:12px;margin:0 0 18px}.bga-control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 30px;margin:16px 0;border:0;padding:0;min-width:0}.bga-control-grid .bga-field{display:grid;grid-template-columns:minmax(0,1fr) 65px;gap:10px;color:var(--bga-muted);font-size:13px}.bga-control-grid .bga-field input[type=range]{grid-row:2;grid-column:1/-1;width:100%;margin:0;height:18px}.bga-control-grid .bga-val{grid-row:1;grid-column:2;font-size:12px}.bga-control-grid:disabled{opacity:.45}.bga-studio .bga-tiny{font-size:13px;color:var(--bga-text);gap:9px;margin:8px 0}.bga-studio .bga-tiny input{width:16px;height:16px}.bga-focus-row{display:flex;gap:20px;justify-content:space-between;align-items:center;border-top:1px solid var(--bga-line);padding-top:16px}.bga-focus-row b{font-size:13px;font-weight:500}.bga-focus-row p{margin:4px 0 0}.bga-studio .bga-fxopts{grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:10px}.bga-studio .bga-fxopt{padding:15px 12px;background:var(--bga-panel-soft);color:var(--bga-text)}.bga-studio .bga-fxopt span{color:var(--bga-muted);font-size:12px}.bga-studio .bga-swatch{flex:1;min-width:62px;background:var(--bga-panel-soft);color:var(--bga-text);padding:12px 8px}.bga-studio .bga-swatches{gap:8px}
@@ -1495,19 +1724,101 @@ var canvasTimer = 0
 /** 量画布实宽 → 按新宽度重算数量 → 重建样式表 + 通知重渲染。
  *  只在"变化超过 24px"时才动：拖窗口边缘会连续触发 resize，不设闸会把整张样式表
  *  一帧重建一次。 */
+/** 画布的左右内缩量 + 上偏 + 高度 = 输入框卡面相对**画布定位祖先**的矩形。
+ *  为什么绕这一圈: 画布的定位祖先（`.bga-dockfx` 往上第一个 position 非 static 的祖先，
+ *  本机 = `Dc7zOa_composerSeat`，1131px）比输入框卡面（912px）宽，且卡面在里面是**居中**的，
+ *  所以要用"卡面相对它的偏移"把画布缩进去。写相对量而不是页面绝对坐标: 容器挪动/卡面变宽/
+ *  侧栏折叠都会跟着走，不会像 v1.16.1 那样"停在旧位置"。
+ *  高度也必须量（v1.16.5）: 卡面随输入内容（尤其附图）长高，写死 90px 会让下半截没有特效。
+ *  读不到就保持上一次的值（CSS 里那条兜底规则）。 */
+function syncCanvasInset() {
+  if (typeof document === 'undefined' || !document.querySelector) return
+  var el = document.querySelector('.bga-dockfx')
+  var card = document.querySelector('[data-composer-card]')
+  if (!el || !card || !el.getBoundingClientRect || !card.getBoundingClientRect) return
+  // 画布往上第一个有盒子的、position 非 static 的祖先 = 它真正的定位祖先
+  var host = el.parentElement
+  while (host && host !== document.body) {
+    var r = host.getBoundingClientRect ? host.getBoundingClientRect() : null
+    if (r && r.width > 0 && getComputedStyle(host).position !== 'static') break
+    host = host.parentElement
+  }
+  if (!host || host === document.body || !host.getBoundingClientRect) return
+  var box = host.getBoundingClientRect()
+  var cr = card.getBoundingClientRect()
+  if (!box.width || !cr.height) return
+  var left = Math.round(cr.left - box.left)
+  var right = Math.round(box.right - cr.right)
+  if (left < 0) left = 0
+  if (right < 0) right = 0
+  if (left + right >= box.width - 40) return          // 明显量错就保持上一次 / CSS 默认
+  var oy = Math.round(cr.top - box.top)
+  if (oy < 0) oy = 0
+  var h = Math.round(cr.height)
+  // 卡面一长高，几何三个量都变。**内联写在 .bga-dockfx 上**而不是写 <html>: 画布是单例,
+  // 内联的优先级比 CSS 规则高且不用等下一帧, 也不会把主题层卷进来。
+  if (el.style) {
+    el.style.setProperty('--bga-fx-inset-l', left + 'px')
+    el.style.setProperty('--bga-fx-inset-r', right + 'px')
+    el.style.setProperty('--bga-fx-oy', oy + 'px')
+    el.style.setProperty('--bga-fx-h', h + 'px')
+  }
+}
+
+/** 画布高度 → 粒子纵向几何。基准 = 写死 90px 那版的观感（用户已验收过）:
+ *  bottom 4~46px、行程 92px。卡面长高时这些量**等比例放大**, 否则粒子全挤在底部一小条,
+ *  上面还是一大片空的（等于把"断层"从画布外挪到画布内）。上限 200px: 再高收益只有噪声,
+ *  却要按面积付渲染成本。 */
+var FX_BASE_H = 90
+var fxScaledH = 0
+function canvasScale(h) {
+  if (!isFinite(h) || h <= 0) return 1
+  return Math.min(200, h) / FX_BASE_H
+}
+function syncParticleScale() {
+  if (typeof document === 'undefined' || !document.querySelector) return
+  var el = document.querySelector('.bga-dockfx')
+  var h = el && el.getBoundingClientRect ? el.getBoundingClientRect().height : 0
+  if (!h) return
+  // 拖动窗口边缘 / 输入框长高会连发——比例只在高度真的变了才重写（写变量本身很便宜，
+  // 但 ResizeObserver 一秒能发几十次，这里留个 4px 闸门）。
+  if (Math.abs(h - fxScaledH) < 4) return
+  fxScaledH = h
+  var k = canvasScale(h)
+  var setVar = function (name, value) {
+    if (document.documentElement && document.documentElement.style && document.documentElement.style.setProperty) {
+      document.documentElement.style.setProperty(name, value)
+    }
+  }
+  setVar('--bga-fx-rise', Math.round(92 * k) + 'px')        // 气泡升程
+  setVar('--bga-fx-fall', Math.round(104 * k) + 'px')       // 落樱行程
+  setVar('--bga-fx-drop', Math.round(110 * k) + 'px')       // 雨丝行程
+}
+
 function syncCanvasWidth() {
   if (typeof document === 'undefined' || !document.querySelector) return
+  // v1.16.3: 几何交给 CSS + 一条相对内缩量（见 staticCss 里 .bga-dockfx 的注释）。
+  // 这里只做三件事：① 刷新卡面矩形; ② 刷新粒子纵向比例; ③ 量画布实宽 → 重算粒子数量（密度）。
+  syncCanvasInset()
+  syncParticleScale()
   var el = document.querySelector('.bga-dockfx')
   var w = el && el.getBoundingClientRect ? Math.round(el.getBoundingClientRect().width) : 0
   if (!w) {
-    var c = document.querySelector('[data-composer-card]')
-    w = c ? Math.round(c.getBoundingClientRect().width) : 0
+    var ref = document.querySelector('[data-composer-card]')
+    w = ref && ref.getBoundingClientRect ? Math.round(ref.getBoundingClientRect().width) : 0
   }
-  if (!w || Math.abs(w - CANVAS_W) < 24) return
+  if (!w) return
+  w = Math.max(120, w)
+  if (Math.abs(w - CANVAS_W) < 24) return
   CANVAS_W = w
   regenerateParticles()
   rebuildStatic()
   STORE.touch()          // 让 DockFx 用新数量重渲染（不写盘，见 STORE.touch 注释）
+}
+// 窗口/侧栏尺寸一变就重量一次 (带 300ms 去抖: 拖窗口边缘会连发几十次 resize)。
+function scheduleCanvasSync(delay) {
+  if (canvasTimer) clearTimeout(canvasTimer)
+  canvasTimer = setTimeout(function () { canvasTimer = 0; syncCanvasWidth() }, typeof delay === 'number' ? delay : 300)
 }
 
 // ---------------------------------------------------------- 流萤 dock -------
@@ -1579,6 +1890,19 @@ function Section(title, sub) {
     h.apply(null, ['div', null].concat(kids)))
 }
 
+/** 模糊滑杆的档位。用户 2026-10-01: **0–2px 每 0.1 可调**（21 档），2px 之后保持原来的粗档
+ *  (3/4/6/8/12/16/24)。 */
+var BLUR_STOPS = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4, 1.5,
+  1.6, 1.7, 1.8, 1.9, 2, 3, 4, 6, 8, 12, 16, 24]
+
+/** px 值显示：整数就不带小数点，否则显示一位小数（卡面模糊 0–2 段是 0.1 一档）。 */
+function fmtPx(v) {
+  var n = Number(v)
+  if (!isFinite(n)) return '—'
+  var r = Math.round(n * 10) / 10
+  return (Math.abs(r - Math.round(r)) < 0.001 ? String(Math.round(r)) : r.toFixed(1)) + 'px'
+}
+
 /** 滑杆。给了 stops = **不平均档位**滑杆: 控件是等距的 0..n-1 档, 真正的值查表(见 AUTO_STOPS),
  *  回调交出去的也是表里的值。原生 step 表达不了不平均刻度, 所以映射放在这里。 */
 function Slider(label, value, min, max, onChange, unit, stops) {
@@ -1589,7 +1913,7 @@ function Slider(label, value, min, max, onChange, unit, stops) {
   if (stops) { val = stops.indexOf(nearestStop(stops, value)); lo = 0; hi = stops.length - 1; step = '1' }
   // 显示用的是**值**：有 stops 时 val 是档位序号，直接显示就成了"9 分钟"这种事。
   var shownVal = stops ? stops[val] : val
-  var shown = unit === 'px' ? Math.round(shownVal) + 'px'
+  var shown = unit === 'px' ? fmtPx(shownVal)
     : unit === 'ms' ? (shownVal >= 1000 ? (shownVal / 1000) + ' 秒' : Math.round(shownVal) + ' 毫秒')
     : unit === 'x' ? '×' + Number(shownVal).toFixed(2)
     : unit === 'min' ? (shownVal >= 60 ? (shownVal / 60) + ' 小时' : Math.round(shownVal) + ' 分钟')
@@ -1606,6 +1930,41 @@ function TinySwitch(label, value, onChange) {
   return h('label', { className: 'bga-tiny' },
     h('input', { type: 'checkbox', checked: !!value, onChange: function (e) { onChange(e.target.checked) } }),
     label)
+}
+
+// ------------------------------------------------------------- 标签气泡 -----
+// 用户 2026-10-01 附图那套: 每个标签是一个**小气泡**(圆角胶囊, 淡色底 + 同色系描边 + 名).
+// 颜色跟当前配色走: accent 往白/深里混出底色, 文字色按底色亮度选深/浅 (任何 accent 下都读得清)。
+// 文字色/底色都是**字面量**算出来的, 不写 theme token —— 见 settingsSolidColor() 的注释。
+function tagPill(name, style) {
+  var s = STORE.state || {}
+  var accent = hexRgb(s.accent || '#e88ca0')
+  var deep = hexRgb(s.deep || '#241318')
+  var body = typeof document !== 'undefined' ? document.body : null
+  var light = !(body && body.hasAttribute && body.hasAttribute('data-ds-dark-theme'))
+  var bg = mix(accent, light ? WHITE : deep, light ? 0.76 : 0.7)
+  var line = mix(accent, light ? WHITE : deep, 0.52)
+  var luma = (0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b) / 255
+  var fg = luma > 0.62 ? rgba(mix(accent, BLACK, 0.7), 0.95) : rgba(mix(accent, WHITE, 0.88), 0.96)
+  return h('em', {
+    className: 'bga-tagpill' + (style ? ' ' + style : ''),
+    style: { background: rgba(bg, light ? 0.95 : 0.9), borderColor: rgba(line, 0.55), color: fg },
+    title: name,
+  }, name)
+}
+function tagPills(tags) {
+  return h('div', { className: 'bga-tags' }, (tags || []).map(function (t) { return tagPill(t) }))
+}
+function tagPool(items) {
+  var seen = {}, out = []
+  items.forEach(function (it) {
+    (it.tags || []).forEach(function (t) {
+      if (!t || seen[t]) return
+      seen[t] = 1
+      out.push(t)
+    })
+  })
+  return out.sort(function (a, b) { return a.localeCompare(b, 'zh-Hans-CN') }).slice(0, 12)
 }
 
 // ------------------------------------------------- 二级图库网格 (memo 隔离) --
@@ -1629,7 +1988,7 @@ var ItemGrid = React.memo(function ItemGrid(props) {
           props.reordering?h('span',{className:'bga-order-number'},index+1):null,
           current ? h('span', {className:'bga-picture-badge'}, '✓ 当前选择') : null,
           props.multi ? h('span', {className:'bga-check', 'aria-hidden':'true'}, checked ? '✓' : '') : null),
-        h('span', {className:'bga-picture-name', title:it.base}, it.base)),
+        h('span', {className:'bga-picture-name', title:it.base + ' · ' + (it.tags||[]).join(' / ')}, it.base)),
       props.reordering?h('div',{className:'bga-picture-foot bga-order-actions'},
         h('button',{type:'button',className:'bga-icon-btn bga-drag-handle',draggable:true,'aria-label':'拖动排序 '+it.base,'aria-describedby':'bga-sort-hint',
           onDragStart:function(e){drag.current=it.id;e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',JSON.stringify(it.id));e.dataTransfer.setDragImage(e.currentTarget.closest('article'),20,20)},
@@ -1638,7 +1997,7 @@ var ItemGrid = React.memo(function ItemGrid(props) {
         h('button',{type:'button',className:'bga-icon-btn','aria-label':'向前移动 '+it.base,disabled:index===0,onClick:function(){move(it,index-1)}},'←'),
         h('button',{type:'button',className:'bga-icon-btn','aria-label':'向后移动 '+it.base,disabled:index===props.items.length-1,onClick:function(){move(it,index+1)}},'→')):
       h('div', {className:'bga-picture-foot'},
-        h('span', {className:'bga-muted'}, it.hd ? '高清' : it.cat),
+        tagPills(it.tags),
         h('button', {type:'button',className:'bga-icon-btn'+(favorite?' active':''),'aria-label':(favorite?'取消喜欢 ':'喜欢 ')+it.base,'aria-pressed':favorite,onClick:function(){toggleFavorite(it.id)}}, favorite?'♥':'♡'),
         h('button', {type:'button',className:'bga-icon-btn','aria-label':'将 '+it.base+' 加入图单',title:'加入图单',onClick:function(){props.onAdd([it.id])}}, '+')))
   }))
@@ -1703,6 +2062,8 @@ function PlaybackModeSelect() {
 
 function AppearancePanel() {
   var s=useBga(),frame=framingOf(s,s.wallpaper),hasImage=!!s.wallpaper
+  var st=s.styles||{}
+  function patchStyles(values){STORE.set({styles:Object.assign({},STORE.state.styles||{},values)})}
   var fxHint={firefly:'轻盈的光点与流星',bubble:'柔和上浮的透明气泡',petal:'缓缓飘落的花瓣',rain:'细密的斜向雨丝',off:'保持安静，不显示装饰'}
   return h('div',{className:'bga-panel-stack'},
     Section('这张壁纸的构图',hasImage?'缩放与焦点仅为“'+curLabel(s.wallpaper)+'”保存，换回来会自动恢复。':'先选择一张静态壁纸，再调整构图。',
@@ -1715,15 +2076,27 @@ function AppearancePanel() {
       h('div',{className:'bga-control-grid'},
         Slider('壁纸暗纱',s.veil,0,0.85,function(v){STORE.set({veil:v})}),
         Slider('界面透明度',s.glass,0,1,function(v){STORE.set({glass:v})}))),
+    // v1.16.0 分支: 浅色主题下外框/侧栏/会话区原来是一层近白薄纱（底图"盖了层白布"）。
+    // 这里换成带底图色调的浅色 + 单独的不透明度调节。
+    // v1.16.1（用户 2026-10-01）：去掉"官方客户端"字样；上限收在 30%（再高就把底图洗白了）。
+    Section('界面底色', '会话区/侧栏/外框的底色。调低底图更清楚, 调高文字更稳; 上限 30%。',
+      h('div',{className:'bga-control-grid'},
+        Slider('表面不透明度',st.surface,0,SURFACE_MAX,function(v){patchStyles({surface:v})}),
+        Slider('气泡阴影强度',st.bubble,0,1,function(v){patchStyles({bubble:v})})),
+      TinySwitch('高清底图先出预览图，再升清',st.preview!==false,function(v){patchStyles({preview:v})}),
+      h('p',{className:'bga-muted'},'表面不透明度管的是大面积表面(会话区/侧栏/外框); 输入框卡面与「界面透明度」在下面「输入框」一节。气泡阴影跟着气泡里的文字走(清空气泡也看得见), 0 = 关掉。')),
     Section('配色',null,
       h('div',{className:'bga-swatches'},PRESETS.map(function(p){return h('button',{key:p.id,type:'button',className:'bga-swatch'+(s.preset===p.id?' on':''),'aria-pressed':s.preset===p.id,onClick:function(){STORE.set({preset:p.id,accent:p.accent,deep:p.deep})}},
         h('span',{className:'bga-dots'},h('span',{className:'bga-dot',style:{background:p.accent}}),h('span',{className:'bga-dot',style:{background:p.deep}})),p.name)})),
       h('details',{className:'bga-details'},h('summary',null,'自定义颜色'),h('div',{className:'bga-row'},
         h('label',{className:'bga-field'},'强调色 ',h('input',{type:'color',value:s.accent,onChange:function(e){STORE.set({accent:e.target.value,preset:'custom'})}})),
         h('label',{className:'bga-field'},'深色底 ',h('input',{type:'color',value:s.deep,onChange:function(e){STORE.set({deep:e.target.value,preset:'custom'})}}))))),
+    // v1.16.1: 卡面模糊前 2px 才是用户真正在调的区间, 24px 的线性滑杆里那一段只占 8% 行程。
+    // 用 Slider 的 stops 机制把前段拉长: 0 / .5 / 1 / 1.5 / 2 各占 1/6 行程, 2px 之后
+    // 回到 3/4/6/8/12/16/24 的粗档 (用户 2026-10-01: "0~2px 敏感调节, 后面保持现状")。
     Section('输入框',null,h('div',{className:'bga-control-grid'},
       Slider('卡面不透明度',s.cardA,0,1,function(v){STORE.set({cardA:v})}),
-      Slider('卡面模糊',s.cardBlur,0,24,function(v){STORE.set({cardBlur:v})},'px')),
+      Slider('卡面模糊',s.cardBlur,0,24,function(v){STORE.set({cardBlur:v})},'px',BLUR_STOPS)),
       TinySwitch('显示卡面阴影',s.cardShadow!==false,function(v){STORE.set({cardShadow:v})})),
     Section('输入框装饰',null,h('div',{className:'bga-fxopts'},EFFECTS.map(function(fx){return h('button',{key:fx.id,type:'button',className:'bga-fxopt'+(s.effect===fx.id?' on':''),'aria-pressed':s.effect===fx.id,onClick:function(){STORE.set({effect:fx.id})}},h('b',null,fx.name),h('span',null,fxHint[fx.id]))}))))
 }
@@ -1778,6 +2151,8 @@ function SettingsPage() {
   var sourcePair=React.useState('all'),source=sourcePair[0],setSource=sourcePair[1]
   var queryPair=React.useState(''),query=queryPair[0],setQuery=queryPair[1]
   var qualityPair=React.useState('all'),quality=qualityPair[0],setQuality=qualityPair[1]
+  // v1.16.5: 标签筛选。标签气泡点一下就按它筛（一次一个, 再点取消）。
+  var tagPair=React.useState(''),tagFilter=tagPair[0],setTagFilter=tagPair[1]
   var multiPair=React.useState(false),multi=multiPair[0],setMulti=multiPair[1]
   var sortPair=React.useState(false),sorting=sortPair[0],setSorting=sortPair[1]
   var pickedPair=React.useState([]),picked=pickedPair[0],setPicked=pickedPair[1]
@@ -1797,7 +2172,7 @@ function SettingsPage() {
   }
   React.useEffect(function(){life.current=true;refresh();return function(){life.current=false;loadSeq.current++}},[])
   React.useEffect(function(){if(source.indexOf('list:')===0&&!playlistById(source.slice(5))){setSource('all');setPicked([]);setSorting(false)}},[s.playlists,source])
-  function browse(value){setSource(value);setPicked([]);setQuery('');setQuality('all');setSorting(false)}
+  function browse(value){setSource(value);setPicked([]);setQuery('');setQuality('all');setTagFilter('');setSorting(false)}
   function add(ids){setModal({mode:'add',ids:ids})}
   var choose=React.useCallback(function(it){
     if(multi)setPicked(function(prev){return prev.indexOf(it.id)>=0?prev.filter(function(id){return id!==it.id}):prev.concat(it.id)})
@@ -1807,8 +2182,20 @@ function SettingsPage() {
   var reorderCurrent=React.useCallback(function(from,to){if(source.indexOf('list:')===0)reorderPlaylist(source.slice(5),from,to)},[source])
   var items=React.useMemo(function(){
     var q=query.trim().toLocaleLowerCase()
-    return sourceItems(source).filter(function(it){return (quality==='all'||(quality==='hd'?it.hd:!it.hd))&&(!q||(it.base+' '+it.cat).toLocaleLowerCase().indexOf(q)>=0)})
-  },[source,query,quality,s.playlists,source==='recent'?s.recent:null,STORE.list])
+    // v1.16.4: 搜索也匹配**标签** —— 图在「高清」目录里但标签带「重返未来1999」时,
+    // 搜"重返"或"6·1"都能把它翻出来(用户要的"搜 6·1 出两版")。
+    return sourceItems(source).filter(function(it){
+      if(quality!=='all'&&(quality==='hd'?!it.hd:it.hd))return false
+      if(tagFilter&&(it.tags||[]).indexOf(tagFilter)<0)return false
+      if(!q)return true
+      var hay=(it.base+' '+it.cat+' '+(it.tags||[]).join(' ')).toLocaleLowerCase()
+      return hay.indexOf(q)>=0
+    })
+  },[source,query,quality,tagFilter,s.playlists,source==='recent'?s.recent:null,STORE.list])
+  // 标签气泡栏的候选: 当前来源 + 清晰度筛出来的图里出现过的标签（最多 12 个, 按名排）。
+  var tagPoolItems=React.useMemo(function(){
+    return tagPool(sourceItems(source).filter(function(it){return quality==='all'||(quality==='hd'?!!it.hd:!it.hd)}))
+  },[source,quality,s.playlists,STORE.list])
   var pool=sourceItems(s.playbackSource), activeList=source.indexOf('list:')===0?playlistById(source.slice(5)):null
   var missing=activeList?activeList.items.length-sourceItems(source).length:0, liveBg=!!(s.weId||weActive())
   var curFavorite=cur&&favorites.indexOf(cur.id)>=0
@@ -1834,12 +2221,15 @@ function SettingsPage() {
       h('div',{className:'bga-library-heading'},h('div',null,h('h3',null,sourceLabel(source)),h('span',{className:'bga-muted'},items.length+' 张'+(missing?' · '+missing+' 张文件暂不可用':''))),
         h('div',{className:'bga-row'},source!=='recent'?h('button',{type:'button',className:'bga-btn'+(s.playbackSource===source?' bga-active':''),disabled:s.playbackSource===source||!sourceItems(source).length,onClick:function(){setPlaybackSource(source)}},s.playbackSource===source?'✓ 当前切换范围':'设为切换范围'):null,
           activeList&&activeList.id!=='favorites'?h('button',{type:'button',className:'bga-icon-btn','aria-label':'编辑图单 '+activeList.name,onClick:function(){setModal({mode:'edit',id:activeList.id})}},'⋯'):null)),
-      activeList?h('div',{className:'bga-sort-bar'},h('button',{type:'button',className:'bga-btn','aria-pressed':sorting,disabled:sourceItems(source).length<2,onClick:function(){setSorting(!sorting);setMulti(false);setPicked([]);setQuery('');setQuality('all')}},sorting?'完成排序':'调整顺序'),
+      activeList?h('div',{className:'bga-sort-bar'},h('button',{type:'button',className:'bga-btn','aria-pressed':sorting,disabled:sourceItems(source).length<2,onClick:function(){setSorting(!sorting);setMulti(false);setPicked([]);setQuery('');setQuality('all');setTagFilter('')}},sorting?'完成排序':'调整顺序'),
         h('span',{id:'bga-sort-hint',className:'bga-muted'},sorting?'拖动卡片下方手柄，或用左右箭头调整。':'顺序播放时，按这里的排列切换。')):null,
       h('div',{className:'bga-library-toolbar'},
         h('input',{type:'search',className:'bga-input',value:query,disabled:sorting,'aria-label':'搜索静态壁纸',placeholder:'搜索名称或类型',onChange:function(e){setQuery(e.target.value)}}),
         h('select',{'aria-label':'清晰度筛选',value:quality,disabled:sorting,onChange:function(e){setQuality(e.target.value)}},h('option',{value:'all'},'全部清晰度'),h('option',{value:'hd'},'高清'),h('option',{value:'normal'},'普通')),
         h('button',{type:'button',className:'bga-btn','aria-pressed':multi,disabled:sorting,onClick:function(){setMulti(!multi);setPicked([])}},multi?'完成':'多选')),
+      // 标签气泡栏 (v1.16.5): 点一下按该标签筛, 再点取消。气泡只显示标签名, 与卡片上的气泡同一套样式。
+      !sorting&&tagPoolItems.length>1?h('div',{className:'bga-tagbar',role:'group','aria-label':'按标签筛选'},
+        tagPoolItems.map(function(t){return h('button',{key:t,type:'button',className:'bga-chip bga-tagchip'+(tagFilter===t?' on':''),'aria-pressed':tagFilter===t,title:'筛选标签：'+t,onClick:function(){setTagFilter(tagFilter===t?'':t);setPicked([])}},tagPill(t))})):null,
       multi?h('div',{className:'bga-batch'},h('span',{role:'status'},'已选 '+picked.length+' 张'),
         h('button',{type:'button',className:'bga-btn',disabled:!items.length,onClick:function(){setPicked(items.map(function(it){return it.id}))}},'全选结果'),
         h('button',{type:'button',className:'bga-btn',disabled:!picked.length,onClick:function(){add(picked)}},'加入图单'),
@@ -2433,9 +2823,42 @@ function apply(ctx) {
       bgEl = updateStyle(bgEl, backgroundCss(STORE.state, renderedBgUrl(), renderedBgFrame()), 'data-bg-atelier-background')
     }
     function rebuildStyle() {
-      var s=STORE.state,inputs=JSON.stringify([!!s.wallpaper,s.accent,s.deep,s.veil,s.glass,s.cardA,s.cardBlur,s.cardShadow,s.effect])
+      var s=STORE.state,inputs=JSON.stringify([!!s.wallpaper,s.accent,s.deep,s.veil,s.glass,s.cardA,s.cardBlur,s.cardShadow,s.effect,s.styles])
       if(!dynEl||inputs!==dynamicInputs){dynamicInputs=inputs;dynEl = updateStyle(dynEl, dynamicCss(s, true), 'data-bg-atelier-dynamic')}
       rebuildBackground()
+      rebuildBubbleStyle()
+      rebuildSettingsSurface()
+    }
+    // 设置面板的"可读底座" (v1.16.1): 表面越透明, 设置页越难读 —— 本机 surface=0 时
+    // 设置面板整个透出底图。这里只给设置面板自己垫一层近乎不透明的面色, 不动整屏。
+    // 实测本机设置面板是 `[role="dialog"].wCInkW_panel`（自己透明），真正的底色画在它的
+    // `::before` 上（`background:var(--dsw-specific-menu)`）⇒ 两条都要写。
+    // v1.16.2: 颜色**算成字面量**再写进规则, 不走 theme token —— 走 token 会给
+    // overrideTokens 塞自定义名字, 而当前宿主的实现会把整层 override 判废, 结果底图直接不显示。
+    var settingsEl = null, settingsInputs = ''
+    function settingsSurfaceCss(s) {
+      if (!s || !s.wallpaper) return ''
+      var solid = settingsSolidColor(s)
+      return '[role="dialog"]>[class*="settings" i],[role="dialog"][class*="panel"]{background-color:' + solid + '!important}\n' +
+        '[role="dialog"]>[class*="settings" i]::before,[role="dialog"][class*="panel"]::before{background:' + solid + '!important}\n' +
+        '.bga-studio,.bga-page{background:transparent}\n'
+    }
+    function rebuildSettingsSurface() {
+      var s = STORE.state
+      var inputs = JSON.stringify([!!s.wallpaper, s.accent, s.deep, s.styles])
+      if (inputs === settingsInputs) return
+      settingsInputs = inputs
+      settingsEl = updateStyle(settingsEl, settingsSurfaceCss(s), 'data-bg-atelier-settings')
+    }
+    // 消息气泡的淡阴影单独一张样式表: 它管的是会话区 DOM, 跟底图/卡面那张表的生效条件不同。
+    // 只在"有底图 + 强度 > 0"时下发 (没底图时气泡本来就有宿主自己的样式, 不该多一层阴影)。
+    var bubbleEl = null, bubbleInputs = ''
+    function rebuildBubbleStyle() {
+      var s = STORE.state, st = s.styles || {}
+      var inputs = JSON.stringify([!!s.wallpaper, s.accent, s.deep, st.bubble])
+      if (inputs === bubbleInputs) return
+      bubbleInputs = inputs
+      bubbleEl = updateStyle(bubbleEl, bubbleCss(s), 'data-bg-atelier-bubbles')
     }
     ctx.effect(function () {
       shownUrl = bgUrlOnScreen(STORE.state)
@@ -2451,7 +2874,11 @@ function apply(ctx) {
         fadeStop()
         if (dynEl && dynEl.parentNode) dynEl.parentNode.removeChild(dynEl)
         if (bgEl && bgEl.parentNode) bgEl.parentNode.removeChild(bgEl)
-        dynEl = bgEl = null
+        if (bubbleEl && bubbleEl.parentNode) bubbleEl.parentNode.removeChild(bubbleEl)
+        if (settingsEl && settingsEl.parentNode) settingsEl.parentNode.removeChild(settingsEl)
+        bubbleInputs = ''
+        settingsInputs = ''
+        dynEl = bgEl = bubbleEl = settingsEl = null
       }
     }, 'bga-dynamic')
 
@@ -2460,7 +2887,7 @@ function apply(ctx) {
     var tokenInputs = ''
     function rebuildTokens() {
       if (theme === undefined) return
-      var s=STORE.state,hasBackground=!!s.wallpaper||weActive(),inputs=JSON.stringify([hasBackground,s.accent,s.deep,s.glass])
+      var s=STORE.state,hasBackground=!!s.wallpaper||weActive(),inputs=JSON.stringify([hasBackground,s.accent,s.deep,s.styles])
       if(inputs===tokenInputs)return
       tokenInputs=inputs
       // 没有底图时也要下发: WE 动效层同样需要外框半透明才看得见 (见 WE_LAYER 注释)
@@ -2469,7 +2896,7 @@ function apply(ctx) {
       if (signature === tokenSignature) return
       tokenSignature = signature
       if (disposeTokens) { disposeTokens(); disposeTokens = null }
-      disposeTokens = theme.overrideTokens('bg-atelier', tokens)
+      disposeTokens = theme.overrideTokens('bg-atelier-plus', tokens)
     }
     ctx.effect(function () {
       rebuildTokens()
@@ -2515,6 +2942,35 @@ function apply(ctx) {
       return function () { var i = WE_WATCHERS.indexOf(fn); if (i >= 0) WE_WATCHERS.splice(i, 1) }
     }, 'bga-we-watch')
 
+    // 特效画布的密度 + 卡面矩形: 挂载时先量一次, 之后窗口尺寸/侧栏折叠/卡面长高都重量。
+    // 同时盯卡面与画布自身 —— 本机实测两者尺寸不总是一起动（侧栏折叠只动容器）,
+    // 而且宿主重挂 composer 时卡面节点会换人: 每回调一次就把"当前卡面"重新认一遍。
+    ctx.effect(function () {
+      syncCanvasWidth()
+      var onResize = function () { scheduleCanvasSync(300) }
+      window.addEventListener('resize', onResize)
+      var observed = []
+      var ro = null
+      var observe = function () {
+        if (!ro) return
+        var card = document.querySelector('[data-composer-card]')
+        if (observed.indexOf(card) >= 0) return
+        observed.forEach(function (n) { ro.unobserve(n) })
+        observed = [card, document.querySelector('[class*="composerSeat"]')].filter(Boolean)
+        observed.forEach(function (n) { ro.observe(n) })
+      }
+      if (typeof ResizeObserver === 'function') {
+        ro = new ResizeObserver(function () { observe(); scheduleCanvasSync(0) })
+        observe()
+      }
+      return function () {
+        window.removeEventListener('resize', onResize)
+        if (ro) { ro.disconnect(); ro = null }
+        observed = []
+        if (canvasTimer) { clearTimeout(canvasTimer); canvasTimer = 0 }
+      }
+    }, 'bga-canvas-geometry')
+
     if (slots !== undefined) {
       slots.inject('settings.section', function () {
         return slots.register(
@@ -2538,7 +2994,7 @@ function apply(ctx) {
     // 那样"离开会话页"这类正常装卸就会顺手把底图拆掉, 层的存活不该由页面装卸决定。
     ctx.effect(function () { return function () { weDispose() } }, 'bga-we-layer')
 
-    console.log('[dsh-bg-atelier] client up')
+    console.log('[dsh-bg-atelier-plus] client up')
 
     // 恢复上次应用过的 WE 动效底图: 必须等 weId 从 settings.json 拉回来, 所以接在 load 后面。
     // armAuto 也在这里补一次: subscribe 里那次跑在"设置还没拉回来"的默认值上(autoOn 默认关)。
@@ -2574,13 +3030,37 @@ function apply(ctx) {
     AUTO_STOPS: AUTO_STOPS, nearestStop: nearestStop, Slider: Slider,
     autoPending: function () { return autoTimer !== 0 },
     DockFx: DockFx,
+    tagPill: tagPill, tagPills: tagPills, tagPool: tagPool,
+    canvasScale: canvasScale,
     canvasWidth: function () { return CANVAS_W },
     setCanvasWidth: function (w) { CANVAS_W = Math.max(120, Math.round(Number(w) || 985)); regenerateParticles() },
     counts: function () {
       return { fly: countFor('fly'), star: countFor('star'), bub: countFor('bub'), petal: countFor('petal'), rain: countFor('rain') }
     },
     density: function () { return DENSITY },
+    // v1.16.0 官方版分支的三处适配也留测试缝 (tools/ 与 _tests 都靠它跑离线断言):
+    bubbleCss: function () { return bubbleCss(STORE.state) },
+    themeSurface: function () { return { alpha: themeSurfaceAlpha(STORE.state), tone: themeSurfaceTone(STORE.state.styles) } },
+    previewUrlOf: previewUrlOf, largeUrlOf: largeUrlOf,
+    previewUpgradeDim: function () { return PREVIEW_UPGRADE_DIM },
+    largeDecodedCount: function () { return decodedLarges.length },
+    forgetLarges: forgetLarges,
+    settingsSolid: function () { return settingsSolidColor(STORE.state) },
+    // buildTokens 的原始输出（键名白名单断言用）：给 overrideTokens 塞未注册的 token 名
+    // 会让宿主把整层 override 判废 ⇒ 底图被不透明外壳盖住，这条缝专门用来拦那种改动。
+    tokenKeys: function () { return Object.keys(buildTokens(STORE.state)) },
   }
   return module.exports
   }
 })
+
+
+
+
+
+
+
+
+
+
+
