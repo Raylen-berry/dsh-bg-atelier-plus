@@ -2282,13 +2282,25 @@ var WE_TYPE_LABEL = {
   unknown: ['暂不支持', '#6b7280'],
 }
 
+// ---------------------------------------------------------------- WE 端点前缀
+// WE 库/媒体/静态图/启动这几个端点的**唯一准星**。原来 6 处硬编码 '/bga/we/...' 散在
+// 函数、fetch、按钮回调里，改前缀要满文件找。
+//
+// 现在有两套端点可用（移植期并存）：
+//   WE_PREFIX_LEGACY = '/bga/we'  —— 本插件自己的 host 半（we/routes.js）
+//   WE_PREFIX_BRIDGE = '/dwl'     —— 独立的 dsh-WE-library 插件
+// 切哪边只改这一个常量；两者返回同样的库清单与同样的图（同一份扫描代码移植过去的），
+// 所以切换时视觉 oracle 应当**完全没有差异**。
+var WE_PREFIX = '/bga/we'
+function weUrl(pathPart) { return WE_PREFIX + pathPart }
+
 function weMediaUrl(entry, rel) {
   var segs = String(rel).replace(/\\/g, '/').split('/').map(encodeURIComponent).join('/')
-  return '/bga/we/media/' + encodeURIComponent(entry.id) + '/' + segs
+  return weUrl('/media/') + encodeURIComponent(entry.id) + '/' + segs
 }
 
 // scene 类的高清静态图（host 侧解 scene.pkg 合成，见 we/still.js）
-function weStillUrl(id) { return '/bga/we/still/' + encodeURIComponent(id) + '.webp' }
+function weStillUrl(id) { return weUrl('/still/') + encodeURIComponent(id) + '.webp' }
 
 // 先铺 192px 的 preview.gif（秒出），同时让 host 去解包出高清静态图，好了再换上去。
 // 解包一次约 5s，不值得让用户对着空白等，也不该阻塞请求。
@@ -2420,7 +2432,7 @@ function weUpgradeToStill(id, img, prefix) {
   async function check(method, count) {
     if (disposed || !img.isConnected) return
     try {
-      var response = await fetch('/bga/we/still?id=' + encodeURIComponent(id), { method: method, cache: 'no-store', signal: controller.signal })
+      var response = await fetch(weUrl('/still?id=') + encodeURIComponent(id), { method: method, cache: 'no-store', signal: controller.signal })
       var result = await response.json()
       if (disposed) return
       if (!response.ok || result.state === 'error' || result.state === 'busy') throw new Error(result.error || 'HTTP ' + response.status)
@@ -2589,7 +2601,7 @@ function weRestore() {
   if (weActive()) return
   var id = STORE.state.weId
   if (!id) return
-  fetch('/bga/we/library.json', { cache: 'no-store' })
+  fetch(weUrl('/library.json'), { cache: 'no-store' })
     .then(function (r) { return r.ok ? r.json() : {} })
     .then(function (d) {
       var hit = (d.entries || []).filter(function (e) { return e.id === id })[0]
@@ -2699,7 +2711,7 @@ function WeLibraryCard(props) {
     var controller = new AbortController(); pending.current = controller
     set({ busy: true, note: '', error: false })
     try {
-      var response = await fetch('/bga/we/open-in-we?id=' + encodeURIComponent(entry.id), { method: 'POST', cache: 'no-store', signal: controller.signal })
+      var response = await fetch(weUrl('/open-in-we?id=') + encodeURIComponent(entry.id), { method: 'POST', cache: 'no-store', signal: controller.signal })
       var result = await response.json()
       if (!response.ok) throw new Error(result.error || 'HTTP ' + response.status)
       if (mounted.current) set({ busy: false, note: result.message || (result.targeted ? '已发送到 WE' : 'WE 已启动，请再点一次'), error: false })
@@ -2743,7 +2755,7 @@ function WeSection() {
     var controller = new AbortController(); requests.current[kind] = controller
     if (kind === 'library') patch({ loading: true, error: '' })
     try {
-      var response = await fetch('/bga/we/' + (kind === 'library' ? 'library.json' : 'status') + (force ? '?force=1' : ''), { cache: 'no-store', signal: controller.signal })
+      var response = await fetch(weUrl('/') + (kind === 'library' ? 'library.json' : 'status') + (force ? '?force=1' : ''), { cache: 'no-store', signal: controller.signal })
       if (!response.ok) throw new Error('HTTP ' + response.status)
       var result = await response.json()
       if (controller.signal.aborted) return

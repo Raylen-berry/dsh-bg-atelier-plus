@@ -224,22 +224,30 @@ async function freezeRotation(log) {
     if (log) console.log('     轮播: 读不到设置，跳过冻结（不做任何写入）')
     return null
   }
-  if (before.autoOn !== true) {
-    if (log) console.log('     轮播: 本来就是关的，无需冻结')
-    return raw
-  }
-  // 关键：带着**全部字段**写回，只把 autoOn 改掉
-  const patched = JSON.stringify({ ...before, autoOn: false })
+  // **关键是钉住 wallpaper，不只是关轮播**：
+  // 关轮播只保证"从现在起不再换"，但"现在这张"可能与录基准时那张不同（轮播在我们开始前
+  // 已经换过了）—— 实测就这样连续踩了三次：洁西卡金蜜 → 重返未来1999 → 百夫长。
+  // 所以冻结必须同时把 wallpaper 固定成**基准里记下的那一张**（由调用方传入期望值；
+  // 首次 capture 时用当前这张，之后 compare 时读基准 manifest 里的值）。
+  return { raw, before }
+}
+
+/** 把 wallpaper 钉到指定那张（只改 wallpaper，其余整份保留）。 */
+async function pinWallpaper(wallpaper, log) {
+  const nowRaw = await readState(`(async()=>{const r=await fetch('/bga/settings.json',{cache:'no-store'});return await r.text()})()`)
+  let now = null
+  try { now = JSON.parse(nowRaw) } catch { now = null }
+  if (!now || typeof now !== 'object') { if (log) console.log('     钉图: 读不到设置，跳过'); return }
+  const patched = JSON.stringify({ ...now, autoOn: false, wallpaper })
   const r = await readState(`(async()=>{
     const res = await fetch('/bga/settings.json', {
       method:'PUT', headers:{'content-type':'application/json'},
       body: ${JSON.stringify(patched)},
     });
-    return res.ok ? 'autoOn=false（其余 ' + ${Object.keys(before).length} + ' 字段原样写回）' : 'PUT failed ' + res.status;
+    return res.ok ? 'pinned(' + ${JSON.stringify(wallpaper && wallpaper.name)} + ') + autoOn=false' : 'PUT failed ' + res.status;
   })()`)
-  if (log) console.log('     轮播: ' + r)
-  await sleep(1200)
-  return raw
+  if (log) console.log('     钉图: ' + r)
+  await sleep(1300)
 }
 
 /** 还原轮播设置：把捕获前读到的**整份** JSON 原样写回。 */
@@ -249,12 +257,23 @@ async function restoreRotation(before, log) {
   try { want = JSON.parse(before) } catch { /* 原值坏了就不写 */ }
   if (!want || typeof want !== 'object') { if (log) console.log('     轮播: 原值不可解析，不写回'); return }
   if (want.autoOn !== true) { if (log) console.log('     轮播: 原本就是关的，无需还原'); return }
+  // 还原时**把当前 wallpaper 一起带回原值**：冻结期间轮播可能已经换过图，
+  // 磁盘上的 wallpaper 字段可能已经不是原来那张。整份回填会把 wallpaper 也还原成
+  // 采集前那张 —— 但那和"当前页面上正在显示的那张"又可能不一致。
+  // 所以这里只还原 autoOn 与 autoMin（轮播开关与间隔），**不动 wallpaper**：
+  // 用户看到哪张就留哪张，我们把"轮播开着"这个状态还回去即可。
+  const nowRaw = await readState(`(async()=>{const r=await fetch('/bga/settings.json',{cache:'no-store'});return await r.text()})()`)
+  let now = null
+  try { now = JSON.parse(nowRaw) } catch { now = null }
+  const merged = { ...(now && typeof now === 'object' ? now : want), autoOn: true }
+  if (Number.isFinite(want.autoMin)) merged.autoMin = want.autoMin
+  for (const k of Object.keys(want)) if (!(k in merged)) merged[k] = want[k] // 兜底：任何丢掉的字段补回来
   const r = await readState(`(async()=>{
     const res = await fetch('/bga/settings.json', {
       method:'PUT', headers:{'content-type':'application/json'},
-      body: ${JSON.stringify(before)},
+      body: ${JSON.stringify(JSON.stringify(merged))},
     });
-    return res.ok ? '整份还原（autoOn=true 且全部字段回填）' : 'PUT failed ' + res.status;
+    return res.ok ? 'autoOn=true 已还原（字段 ' + ${Object.keys(merged).length} + ' 个）' : 'PUT failed ' + res.status;
   })()`)
   if (log) console.log('     轮播已还原: ' + r)
 }
@@ -290,13 +309,20 @@ async function prepareState(s, log) {
   await sleep(s.settleMs)
 }
 if (mode === 'capture') {
-  // 冻结轮播录制（结束后还原；异常也要还原，所以放 try/finally）
-  const autoBefore = await freezeRotation(true)
+  // 冻结轮播 + 钉住当前这张图（结束后还原；异常也要还原，所以放 try/finally）
+  const frozen = await freezeRotation(true)
+  const autoBefore = frozen ? frozen.raw : null
+  // 录制时以"页面当下正在显示的那张"为准，钉住它，并把 wallpaper 记进 manifest ——
+  // 之后 compare 就按这个值钉回去，与轮播是否跑过无关。
+  const wallpaperNow = frozen && frozen.before ? frozen.before.wallpaper : null
+  if (wallpaperNow) await pinWallpaper(wallpaperNow, true)
   try {
   const manifest = {
     dir, capturedAt: new Date().toISOString(), url: cdp.url,
     // 记下"比的是哪一块"：裁剪比例不藏在代码里，改比对口径必须重录基准
     comparison: { stableKeepRatio: STABLE_KEEP_RATIO, note: '只比视口上方 ' + (STABLE_KEEP_RATIO * 100) + '%（底部实时计数与装饰粒子天然不可复现）' },
+    // 钉住的底图（compare 时按它钉回去，保证比的是同一张）
+    pinnedWallpaper: wallpaperNow,
     rotationFrozenFrom: autoBefore,
     states: [],
   }
@@ -318,8 +344,14 @@ if (mode === 'capture') {
   }
 } else {
   const manifest = JSON.parse(fs.readFileSync(path.join(baseDir, 'manifest.json'), 'utf8'))
-  // 比对时同样冻结轮播（否则基准与当前比的是两张不同的壁纸）
-  const autoBefore = await freezeRotation(true)
+  // 比对时：冻结轮播 + **钉回基准里记的那张底图**。
+  // 只关轮播是不够的：录制之后轮播可能已经换过图，那"现在这张"与基准那张就不是同一张 ——
+  // 实测连踩三次（洁西卡金蜜 → 重返未来1999 → 百夫长），探针里能直接看到 url 不同。
+  // 钉回去之后，比的就一定是同一张图上的差异，那才是绘制核心的回归。
+  const frozen = await freezeRotation(true)
+  const autoBefore = frozen ? frozen.raw : null
+  if (manifest.pinnedWallpaper) await pinWallpaper(manifest.pinnedWallpaper, true)
+  else console.log('   ⚠️ 基准里没有 pinnedWallpaper（旧基准？）—— 只能冻结轮播，可能被换图干扰')
   let same = 0, diff = 0, missing = 0
   const probeDiffs = []
   try {
