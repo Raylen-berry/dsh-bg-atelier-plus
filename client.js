@@ -502,7 +502,7 @@ function canPreviousWallpaper() {
   var cur=STORE.state.wallpaper
   return playbackCursor>0 || playbackTrail.length>0&&cur&&!sourceItems(STORE.state.playbackSource).some(function(it){return it.id===cur.id})
 }
-function previousWallpaper() { if(!STORE.state.weId&&!weActive())historyStep(-1) }
+function previousWallpaper() { if(!weIsBackground())historyStep(-1) }
 function setWallpaper(item, navigation) {
   if (wallpaperBackgrounded()) return
   navigation=navigation||{}
@@ -777,12 +777,12 @@ function buildCycleDeck(ids) {
 }
 
 function cycleWallpaper(options) {
-  if (wallpaperBackgrounded() || STORE.state.weId || weActive()) return
+  if (wallpaperBackgrounded() || weIsBackground()) return
   var epoch = wallpaperEpoch
   var timing=options&&options.automatic===true ? normalFadeTiming() : manualFadeTiming()
   if(historyStep(1,timing))return
   function step(items) {
-    if (epoch !== wallpaperEpoch || wallpaperBackgrounded() || STORE.state.weId || weActive()) return
+    if (epoch !== wallpaperEpoch || wallpaperBackgrounded() || weIsBackground()) return
     items = sourceItems(STORE.state.playbackSource, items)
     if (!items.length) return
     var cur = STORE.state.wallpaper
@@ -918,6 +918,7 @@ function armAuto(force) {
   if (autoTimer) { clearTimeout(autoTimer); autoTimer = 0 }
   if (on) autoTimer = setTimeout(function () { autoTick(generation) }, autoDelayMs())
 }
+
 
 function autoTick(generation) {
   if ((generation !== undefined && generation !== autoGeneration) || wallpaperBackgrounded() || STORE.state.autoOn !== true) return
@@ -1103,7 +1104,7 @@ function dynamicCss(s, withoutBackground) {
   return css
 }
 function backgroundCss(s, url, frame) {
-  if (!url || weActive()) return ''
+  if (!url || hasWeVisual()) return ''
   var deep = hexRgb(s.deep)
   return 'body{background-color:' + s.deep + '}\n' +
     bgLayerCss('body::before', Object.assign({},s,frame||framingForUrl(s,url)), url, rgba(deep, s.veil) + ',' + rgba(deep, s.veil * 0.55))
@@ -1361,7 +1362,7 @@ function switchFade(prevUrl, url, timing) {
 
 /** 此刻**真的画在屏幕上**的底图 url; 没底图或 WE 动效层接管时为空(那时旧图并不在屏幕上, 淡它没意义)。*/
 function bgUrlOnScreen(s) {
-  if (!s.wallpaper || weActive()) return ''
+  if (!s.wallpaper || hasWeVisual()) return ''
   return s.wallpaper.url
 }
 
@@ -2176,7 +2177,7 @@ function SettingsPage() {
   function add(ids){setModal({mode:'add',ids:ids})}
   var choose=React.useCallback(function(it){
     if(multi)setPicked(function(prev){return prev.indexOf(it.id)>=0?prev.filter(function(id){return id!==it.id}):prev.concat(it.id)})
-    else {if(STORE.state.weId||weActive()){weDispose();STORE.set({weId:null})}setWallpaper(it)}
+    else {releaseWeForStatic();setWallpaper(it)}
   },[multi])
   var openAdd=React.useCallback(function(ids){setModal({mode:'add',ids:ids})},[])
   var reorderCurrent=React.useCallback(function(from,to){if(source.indexOf('list:')===0)reorderPlaylist(source.slice(5),from,to)},[source])
@@ -2197,7 +2198,7 @@ function SettingsPage() {
     return tagPool(sourceItems(source).filter(function(it){return quality==='all'||(quality==='hd'?!!it.hd:!it.hd)}))
   },[source,quality,s.playlists,STORE.list])
   var pool=sourceItems(s.playbackSource), activeList=source.indexOf('list:')===0?playlistById(source.slice(5)):null
-  var missing=activeList?activeList.items.length-sourceItems(source).length:0, liveBg=!!(s.weId||weActive())
+  var missing=activeList?activeList.items.length-sourceItems(source).length:0, liveBg=weIsBackground()
   var curFavorite=cur&&favorites.indexOf(cur.id)>=0
   var tabs=[['library','图库'],['appearance','外观'],['playback','切换'],['dynamic','动态壁纸']]
   function tabKeys(e){
@@ -2489,6 +2490,32 @@ var WE_WATCHERS = []
 
 function weActive() { return !!WE_LAYER.root }
 
+// ---------------------------------------------------------------- 背景来源（background source）
+// 「现在是谁在当背景」这件事，重构前散在 15 处判断里、且**两种信号混用**：
+//   · STORE.state.weId  = 用户**意图**（选了一张 WE 壁纸，但可能还没挂上/已失败回落静态）
+//   · weActive()        = WE 动效层**真的挂上了**（实际生效）
+// 两处混用是有意的、也是必要的（例如"换一张"按钮在意图阶段就该禁用、不该等它挂上），
+// 但散落着写会有两个问题：① 想加第三种背景来源（例如未来的静态 WE 合成图独立成源）就得
+// 满文件改；② 不同地方对"算不算有背景"的口径会悄悄漂移。
+//
+// 所以集中到这里：**判断只从这两个函数走**，别再散写 `s.weId || weActive()`。
+//   hasWeIntent()  —— 用户选了 WE（意图）
+//   hasWeVisual()  —— WE 真的在画面里（实际）
+//   weIsBackground() —— "WE 是否正占着背景位"：两种信号取或（与原有 15 处的口径完全一致）
+//   hasAnyBackground(s) —— 有没有任何一种背景（静态底图或 WE）；给 token/样式计算用
+function hasWeIntent() { return !!STORE.state.weId }
+function hasWeVisual() { return weActive() }
+function weIsBackground() { return hasWeIntent() || hasWeVisual() }
+function hasAnyBackground(s) { return !!(s && s.wallpaper) || weIsBackground() }
+// 换回静态底图的统一入口：先把 WE 意图与实际都撤掉，再交给调用方去设静态底图。
+// 顺序不能反 —— 先 setWallpaper 再 weDispose 的话，中间那一刻两种来源同时在场。
+function releaseWeForStatic() {
+  if (!weIsBackground()) return false
+  weDispose()
+  STORE.set({ weId: null })
+  return true
+}
+
 function weNotify() {
   for (var i = 0; i < WE_WATCHERS.length; i++) {
     try { WE_WATCHERS[i]() } catch (e) { /* noop */ }
@@ -2566,7 +2593,7 @@ function weRestore() {
     .then(function (r) { return r.ok ? r.json() : {} })
     .then(function (d) {
       var hit = (d.entries || []).filter(function (e) { return e.id === id })[0]
-      if (hit && STORE.state.weId === id && !weActive()) weShow(hit)
+      if (hit && STORE.state.weId === id && !hasWeVisual()) weShow(hit)
     })
     .catch(function () { /* host 路由没就绪: 下次启动再说 */ })
 }
@@ -2887,7 +2914,7 @@ function apply(ctx) {
     var tokenInputs = ''
     function rebuildTokens() {
       if (theme === undefined) return
-      var s=STORE.state,hasBackground=!!s.wallpaper||weActive(),inputs=JSON.stringify([hasBackground,s.accent,s.deep,s.styles])
+      var s=STORE.state,hasBackground=hasAnyBackground(s),inputs=JSON.stringify([hasBackground,s.accent,s.deep,s.styles])
       if(inputs===tokenInputs)return
       tokenInputs=inputs
       // 没有底图时也要下发: WE 动效层同样需要外框半透明才看得见 (见 WE_LAYER 注释)
@@ -3012,6 +3039,7 @@ function apply(ctx) {
     createPlaylist: createPlaylist, renamePlaylist: renamePlaylist, removePlaylist: removePlaylist,
     changeMembership: changeMembership, removeFromPlaylist: removeFromPlaylist, toggleFavorite: toggleFavorite,
     sourceItems: sourceItems, setPlaybackSource: setPlaybackSource, cycleWallpaper: cycleWallpaper,
+
     reorderPlaylist: reorderPlaylist, setPlaybackMode: setPlaybackMode, previousWallpaper: previousWallpaper, canPreviousWallpaper: canPreviousWallpaper,
     framingOf: framingOf, normalizeImageFraming: normalizeImageFraming, setImageFraming: setImageFraming, resetImageFraming: resetImageFraming,
     weShow: weShow, weDispose: weDispose, weStartNative: weStartNative, weApplySchemeColor: weApplySchemeColor, WeSection: WeSection, WeProperties: WeProperties, weFilterLibrary: weFilterLibrary, weMediaUrl: weMediaUrl,

@@ -132,6 +132,7 @@ if (mode === 'list') {
   process.exit(0)
 }
 
+let exitCode = 0
 const baseDir = path.join(OUT_ROOT, dir)
 if (mode === 'compare' && !fs.existsSync(path.join(baseDir, 'manifest.json'))) {
   console.error('基准不完整：' + baseDir + ' 里没有 manifest.json（先跑 capture）')
@@ -143,8 +144,18 @@ const cdp = await cdpSession(port)
 console.log('  已连上: ' + cdp.url)
 
 /** 读页面当前状态（探针表达式）。 */
+/**
+ * 读页面状态。**必须带 awaitPromise** —— 表达式里一旦有 `(async()=>{...})()`（例如
+ * 读设置要走 fetch），不带的话拿回来是个 Promise 对象而不是值，`JSON.parse` 直接失败。
+ * 这个坑踩过：冻结轮播时读到 null，于是"跳过冻结"，一路静默不生效。
+ * returnByValue 也一起开着，否则拿到的是远程对象引用、取不到值。
+ */
 async function readState(expr) {
-  const r = await cdp.send('Runtime.evaluate', { expression: expr, returnByValue: true })
+  const r = await cdp.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
+  if (r && r.exceptionDetails) {
+    // 页面里抛错时不要静默返回 null —— 那会让"读不到"和"读到 null"混在一起
+    throw new Error('页面表达式抛错: ' + JSON.stringify(r.exceptionDetails.exception && r.exceptionDetails.exception.description || r.exceptionDetails.text))
+  }
   return r && r.result ? r.result.value : null
 }
 
@@ -194,6 +205,60 @@ async function closeObserver(log) {
   // 关面板会调 closeStream()（停掉实时帧流），留一点时间让它真的停
   await sleep(700)
 }
+// **冻结轮播**：底图插件的自动换图会在"录基准"与"比对"之间换掉底图 —— 实测踩到过：
+// 两次捕获差 98%，因为壁纸从"瓦伦塞梅"轮到了"洁西卡金蜜"。那不是回归，是插件在正常工作。
+//
+// ⚠️ **这个 PUT 是整份覆盖写，不是合并**（host 的 writeSettings 直接 writeFile(body)）。
+// 我第一次写成 `PUT {autoOn:false}`，**把用户的 25 个设置字段全清了**（wallpaper/accent/
+// 全部外观参数），只剩两个字段。已用老插件的同 schema 文件 + 当天读到的真实值重建。
+// 所以这里必须：① 先 GET 整份；② 只改 autoOn；③ 把**整份**写回。
+// 好在窗口尺寸/DPI 没变，基准本身不受影响；但这是必须记下来的教训。
+async function freezeRotation(log) {
+  const raw = await readState(`(async()=>{
+    const r = await fetch('/bga/settings.json', {cache:'no-store'});
+    return await r.text();
+  })()`)
+  let before = null
+  try { before = JSON.parse(raw) } catch { /* 读不到就不动 */ }
+  if (!before || typeof before !== 'object') {
+    if (log) console.log('     轮播: 读不到设置，跳过冻结（不做任何写入）')
+    return null
+  }
+  if (before.autoOn !== true) {
+    if (log) console.log('     轮播: 本来就是关的，无需冻结')
+    return raw
+  }
+  // 关键：带着**全部字段**写回，只把 autoOn 改掉
+  const patched = JSON.stringify({ ...before, autoOn: false })
+  const r = await readState(`(async()=>{
+    const res = await fetch('/bga/settings.json', {
+      method:'PUT', headers:{'content-type':'application/json'},
+      body: ${JSON.stringify(patched)},
+    });
+    return res.ok ? 'autoOn=false（其余 ' + ${Object.keys(before).length} + ' 字段原样写回）' : 'PUT failed ' + res.status;
+  })()`)
+  if (log) console.log('     轮播: ' + r)
+  await sleep(1200)
+  return raw
+}
+
+/** 还原轮播设置：把捕获前读到的**整份** JSON 原样写回。 */
+async function restoreRotation(before, log) {
+  if (!before) { if (log) console.log('     轮播: 没有可还原的原值'); return }
+  let want = null
+  try { want = JSON.parse(before) } catch { /* 原值坏了就不写 */ }
+  if (!want || typeof want !== 'object') { if (log) console.log('     轮播: 原值不可解析，不写回'); return }
+  if (want.autoOn !== true) { if (log) console.log('     轮播: 原本就是关的，无需还原'); return }
+  const r = await readState(`(async()=>{
+    const res = await fetch('/bga/settings.json', {
+      method:'PUT', headers:{'content-type':'application/json'},
+      body: ${JSON.stringify(before)},
+    });
+    return res.ok ? '整份还原（autoOn=true 且全部字段回填）' : 'PUT failed ' + res.status;
+  })()`)
+  if (log) console.log('     轮播已还原: ' + r)
+}
+
 async function prepareState(s, log) {
   // 先把页面复位到"干净"：关掉任何已打开的设置对话框。
   // 为什么必须做：上一次状态可能开着面板，不复位的话后面的状态会**继承**它 ——
@@ -225,10 +290,14 @@ async function prepareState(s, log) {
   await sleep(s.settleMs)
 }
 if (mode === 'capture') {
+  // 冻结轮播录制（结束后还原；异常也要还原，所以放 try/finally）
+  const autoBefore = await freezeRotation(true)
+  try {
   const manifest = {
     dir, capturedAt: new Date().toISOString(), url: cdp.url,
     // 记下"比的是哪一块"：裁剪比例不藏在代码里，改比对口径必须重录基准
     comparison: { stableKeepRatio: STABLE_KEEP_RATIO, note: '只比视口上方 ' + (STABLE_KEEP_RATIO * 100) + '%（底部实时计数与装饰粒子天然不可复现）' },
+    rotationFrozenFrom: autoBefore,
     states: [],
   }
   for (const s of STATES) {
@@ -244,10 +313,16 @@ if (mode === 'capture') {
   fs.writeFileSync(path.join(baseDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
   console.log('\n基准已建立：' + manifest.states.length + ' 个状态 → ' + baseDir)
   console.log('重构后跑： node tools/visual-baseline.mjs compare ' + dir)
+  } finally {
+    await restoreRotation(autoBefore, true)
+  }
 } else {
   const manifest = JSON.parse(fs.readFileSync(path.join(baseDir, 'manifest.json'), 'utf8'))
+  // 比对时同样冻结轮播（否则基准与当前比的是两张不同的壁纸）
+  const autoBefore = await freezeRotation(true)
   let same = 0, diff = 0, missing = 0
   const probeDiffs = []
+  try {
   for (const s of manifest.states) {
     const baseFile = path.join(baseDir, s.file)
     const state = STATES.find((x) => x.name === s.name)
@@ -279,8 +354,14 @@ if (mode === 'capture') {
   console.log('\n视觉回归：' + same + ' 一致 / ' + diff + ' 有差异 / ' + missing + ' 尺寸不符')
   const okAll = diff === 0 && missing === 0 && probeDiffs.length === 0
   console.log(okAll ? '✓ 视觉无回归' : '✗ 有差异 —— 逐张看 *.after.png')
+  // 不在这里 process.exit：finally 里的还原必须先跑完。
+  // 退出码放到 finally 之后统一设置（原来在 try 里直接 exit 会让还原被跳过）。
+  exitCode = okAll ? 0 : 1
+  } finally {
+    await restoreRotation(autoBefore, true)
+  }
   cdp.close()
-  process.exit(okAll ? 0 : 1)
+  process.exit(exitCode)
 }
 
 cdp.close()
