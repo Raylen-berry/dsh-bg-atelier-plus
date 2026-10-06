@@ -72,7 +72,7 @@ export const STATES = [
   {
     name: '03-settings-studio',
     note: '底图工坊设置页（自绘 UI；重构最容易被带偏的地方）',
-    settleMs: 2500,
+    settleMs: 6000,  // 设置页里的底图预览要解码一张几 MB 的图 + 套 framing；2500 实测不够，会拍到半成品
     // 打开路径：侧边栏"设置" → 左导航"底图工坊"。用 DOM 直点，不依赖 :has-text（本工具链不支持）。
     // 实测：走完之后 .bga-studio 存在且是 560×1341 —— 这才是真正覆盖到插件 UI 的状态。
     open: `(()=>{const b=[...document.querySelectorAll('button,[role="button"]')].find(x=>String(x.textContent||'').trim()==='设置');if(b)b.click();return 'clicked-settings'})()`,
@@ -118,7 +118,14 @@ async function cdpSession(port) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-const port = Number(process.env.VB_CDP_PORT || 9799)
+// 端口从 dsh-browser-live 的 state.json 读（**不写死**）：浏览器重启后端口会变，
+// 实测重启一次就从 9799 变成 9614 —— 写死会导致"连得上但 evaluate 全部超时"这种难查的症状。
+const port = Number(process.env.VB_CDP_PORT || (() => {
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(process.env.DSH_HOME || '', 'dsh-browser-live', 'state.json'), 'utf8'))
+    return st.port
+  } catch { return 9799 }
+})())
 
 if (mode === 'list') {
   const dirs = fs.existsSync(OUT_ROOT) ? fs.readdirSync(OUT_ROOT).filter((d) => d !== '.profile' && fs.statSync(path.join(OUT_ROOT, d)).isDirectory()) : []
@@ -143,7 +150,36 @@ console.log('=== 视觉基准 ' + mode + '：' + dir + ' ===')
 const cdp = await cdpSession(port)
 console.log('  已连上: ' + cdp.url)
 
-/** 读页面当前状态（探针表达式）。 */
+// 开工前先探页面网络通道（见 preflightPageFetch 注释：挂了的话后面会以一个看不懂的超时崩）
+{
+  const probe = await preflightPageFetch()
+  console.log('  预检 page fetch: ' + probe)
+  if (probe !== 'ok:200') {
+    console.error('\n✗ 页面里的 fetch 通道不可用（' + probe + '）。')
+    console.error('  这不是本脚本的问题，重启浏览器即可恢复：')
+    console.error('    browser_close{} → browser_open{gui:true}')
+    console.error('  不要在这个状态下继续比 —— 后面冻结轮播/钉图都会崩在一个看不懂的超时上。')
+    process.exit(3)
+  }
+}
+
+/**
+ * 开工前的自检：页面的 fetch 通道还活着吗？
+ *
+ * 为什么需要：浏览器用久了（反复刷新/反复跑本脚本之后）会出现一种**很难查的状态** ——
+ * `Runtime.evaluate` 里的纯计算（1+1）秒回，但只要表达式里 `await fetch(...)` 就永久挂住，
+ * 表现为本脚本在 freezeRotation 那步 "CDP 超时: Runtime.evaluate" 然后整个 run 崩掉。
+ * 根因在页面/浏览器侧的网络通道（不是本脚本），**重启浏览器即恢复**。
+ * 与其让它以一个看不懂的超时崩，不如开工前先探一下并给出明确修法。
+ */
+async function preflightPageFetch() {
+  return await readState(`(async()=>{
+    const c=new AbortController(); setTimeout(()=>c.abort(),5000);
+    try { const r=await fetch('/bga/settings.json',{cache:'no-store',signal:c.signal}); return 'ok:'+r.status }
+    catch(e){ return 'err:'+e.name }
+  })()`)
+}
+
 /**
  * 读页面状态。**必须带 awaitPromise** —— 表达式里一旦有 `(async()=>{...})()`（例如
  * 读设置要走 fetch），不带的话拿回来是个 Promise 对象而不是值，`JSON.parse` 直接失败。
@@ -164,30 +200,50 @@ async function readState(expr) {
  * 两个 open 是因为"打开设置对话框"与"点开底图工坊导航项"是两步，中间要各自等一次渲染。
  */
 /**
- * 裁到稳定区：去掉底部那条随实时计数与装饰粒子变动的带子。
+ * 稳定区：裁掉"会自己变"的部分，只留底图插件真正负责渲染的区域。
  *
- * 比例是**量出来的**，不是拍的：实测两次捕获（零代码改动）的差异最早出现在
- * y=740（视口 905 高 ⇒ 0.817）。取 0.80 留余量 —— 保留上面的 80%。
+ * 三条竖切（实测坐标，1654×905 视口）：
+ *   · 左侧栏 x[0,300]     —— 底图插件的 orb 与主题染色都在这里，是**必须比**的；
+ *   · 会话区 x[300,1300]  —— **必须排除**：对话内容随会话实时变化（正在跑 agent 时每帧都在变）。
+ *                            实测：同一份代码连捕两次，会话区差 7.2%、而左侧栏差 0.000%。
+ *   · 右侧   x[1300,1654] —— 观察窗/滚动条等，排除。
+ * 竖切之后按 STABLE_KEEP_RATIO 再横向裁掉底部（宿主状态栏实时计数 + 装饰粒子）。
  *
- * 为什么接受这个裁剪而不是继续追：
- *   · 被裁掉的带子里是宿主状态栏的实时计数（"8 轮 399 步 · 70 tok/s"）与底图插件的
- *     装饰粒子 bga-ptl（位置随机漂移）—— 对它们做像素回归本来就没意义；
- *   · 稳定区仍包含真正的视觉契约：整幅底图、主题染色、设置面板的头部/预览/按钮/滑杆。
- *   · 要保护被裁掉的部分（例如面板底部的图库网格），应该**另加一个专门的状态**，
- *     而不是放宽容差 —— 放容差会把真回归一起放过去。
- * 比例写进 manifest；改比例等于改口径，必须重录基准。
+ * 换句话说：**只看插件自己画的那一条**。会话内容是宿主的、且天然在变，把它算进"视觉回归"
+ * 只会制造假警报 —— 实测就是这样把一次"其实完全没变"的切换报成了 5%。
  */
 export const STABLE_KEEP_RATIO = Number(process.env.VB_STABLE_RATIO || 0.80)
+/**
+ * 每个状态比哪一块 —— **不能一刀切**：
+ *   · 静态底图/特效那两屏：插件画的是左侧栏那条（orb + 主题染色），会话区在实时变必须排除；
+ *   · 设置页那屏：插件画的正是**中间的设置面板**，反而要排除左侧栏与会话正文。
+ * 一刀切会把 03 状态整屏裁没（面板 x≈370–1290 落在会话区里），那是把 oracle 弄瞎。
+ */
+export const STABLE_X_BY_STATE = {
+  '01-static-wallpaper': [0, 300],
+  '02-fx-nodes': [0, 300],
+  '03-settings-studio': [340, 1300],
+}
+const DEFAULT_X = [0, 300]
 
-function cropStable(img) {
+function cropStable(img, stateName) {
   const keep = Math.max(1, Math.floor(img.height * STABLE_KEEP_RATIO))
-  if (keep >= img.height) return img
-  return { width: img.width, height: keep, channels: 4, data: img.data.subarray(0, img.width * keep * 4) }
+  const range = STABLE_X_BY_STATE[stateName] || DEFAULT_X
+  // 视口尺寸可能因 DPI/窗口变化 ⇒ 竖切按比例换算（基准视口宽 1654），不写死像素
+  const scale = img.width / 1654
+  const x0 = Math.max(0, Math.min(img.width - 1, Math.round(range[0] * scale)))
+  const x1 = Math.max(x0 + 1, Math.min(img.width, Math.round(range[1] * scale)))
+  const w = x1 - x0
+  const out = Buffer.alloc(w * keep * 4)
+  for (let y = 0; y < keep; y++) {
+    img.data.copy(out, y * w * 4, (y * img.width + x0) * 4, (y * img.width + x0) * 4 + w * 4)
+  }
+  return { width: w, height: keep, channels: 4, data: out }
 }
 
 /** 读 PNG → 裁稳定区。比对一律走这里，避免有的地方漏裁。 */
-function stableFrom(file) {
-  return cropStable(decodePng(fs.readFileSync(file)))
+function stableFrom(file, stateName) {
+  return cropStable(decodePng(fs.readFileSync(file)), stateName)
 }
 
 /** 关掉 dsh-browser-live 的观察窗（它实时镜像页面，是不确定性的主源）。 */
@@ -247,7 +303,13 @@ async function pinWallpaper(wallpaper, log) {
     return res.ok ? 'pinned(' + ${JSON.stringify(wallpaper && wallpaper.name)} + ') + autoOn=false' : 'PUT failed ' + res.status;
   })()`)
   if (log) console.log('     钉图: ' + r)
-  await sleep(1300)
+  // **写完必须刷新页面**：设置是 host 侧文件，而客户端只在启动时 STORE.load() 一次
+  // （见 client.js 末尾）。只写不刷新的话，磁盘上是新值、画面还是旧图 ——
+  // 实测踩到：manifest 记的是"玛尔莎"、基准图里却是"牙仙1"，一路 93% 假回归。
+  await sleep(400)
+  try { await cdp.send('Page.reload', { ignoreCache: false }) } catch { /* 用 navigate 兜底 */ }
+  await sleep(3500) // 等重载 + 底图解码
+  if (log) console.log('     钉图后已刷新页面')
 }
 
 /** 还原轮播设置：把捕获前读到的**整份** JSON 原样写回。 */
@@ -278,8 +340,27 @@ async function restoreRotation(before, log) {
   if (log) console.log('     轮播已还原: ' + r)
 }
 
+/**
+ * 把页面复位到「干净首页」：关掉任何已打开的设置对话框。
+ *
+ * 为什么必须**每帧之前**都做：03 状态会主动打开设置面板，而它**不会自己关**。下一个状态
+ * （甚至下一次运行）如果不先复位，就会带着上一个状态的面板 —— 实测踩到两次：
+ *   · 三个状态全都带着同一个面板，基准之间只差 0.05%，等于没区分开；
+ *   · 上一轮 run 结束后面板还开着，下一轮 run 的 01 状态拍到了"面板开着"，
+ *     与"干净首页"的基准差 93% —— 看起来像严重回归，其实只是状态没复位。
+ * 所以复位不能只写在 prepareState 里（那只覆盖"下一个状态"），必须在每次 run 开始时也来一次。
+ */
+async function resetToCleanHome(log) {
+  const closed = await readState(`(()=>{const d=document.querySelector('[role="dialog"]');
+    if(!d) return 'already-clean';
+    const btn=[...d.querySelectorAll('button')].find(b=>String(b.getAttribute('aria-label')||b.textContent||'').trim()==='关闭');
+    if(btn){btn.click();return 'closed'} return 'no-close-button'})()`)
+  if (log) console.log('     复位: ' + closed)
+  await sleep(900)
+  return closed
+}
+
 async function prepareState(s, log) {
-  // 先把页面复位到"干净"：关掉任何已打开的设置对话框。
   // 为什么必须做：上一次状态可能开着面板，不复位的话后面的状态会**继承**它 ——
   // 实测踩到过：三个状态全都带着同一个面板，基准之间只差 0.05%，等于没区分开。
   // 关掉 dsh-browser-live 的观察窗：它**实时镜像当前页面**（截出来的图里能看到 FPS 计数与
@@ -289,12 +370,7 @@ async function prepareState(s, log) {
   await closeObserver(log)
 
   if (s.reset !== false) {
-    const closed = await readState(`(()=>{const d=document.querySelector('[role="dialog"]');
-      if(!d) return 'already-clean';
-      const btn=[...d.querySelectorAll('button')].find(b=>String(b.getAttribute('aria-label')||b.textContent||'').trim()==='关闭');
-      if(btn){btn.click();return 'closed'} return 'no-close-button'})()`)
-    if (log) console.log('     复位: ' + closed)
-    await sleep(900)
+    await resetToCleanHome(log)
   }
   if (s.open) {
     const r1 = await readState(s.open)
@@ -307,6 +383,57 @@ async function prepareState(s, log) {
     await sleep(800)
   }
   await sleep(s.settleMs)
+  // **等图片真的解码完**，而不是靠固定时长赌。
+  // 实测踩到：页面刚重载（冷缓存）时，设置页里的底图预览要现解一张几 MB 的图，
+  // 6 秒都不一定够 —— 表现为"重载后第一次 run 必挂 03、之后再跑就过"（4.209% 差异，
+  // 差异全在面板头部的预览图上，文字一字不差）。固定时长永远只是赌，改成等条件。
+  await waitImagesReady(log)
+}
+
+/**
+ * 等「画面上真正会看到的那几张图」解码完。
+ *
+ * ⚠️ 不能等 `document.images` 全部就绪：设置页的图库网格有 **300+ 张缩略图**，
+ * 实测 316 张里 288 张是懒加载/屏外的（它们永远不会在我们截图时解码完）。
+ * 等全部就会一直等到超时，等于没等。
+ * 所以只等**在视口内可见**且 complete=false 的图 —— 那才是会进画面的。
+ * 底图本身是 body::before 的 background-image，另用一幅隐藏 Image() 探它的解码状态。
+ */
+async function waitImagesReady(log, waitMs = 25000) {
+  const t0 = Date.now()
+  let last = null
+  for (;;) {
+    const r = await readState(`(async()=>{
+      const seen=(el)=>{const b=el.getBoundingClientRect();
+        return b.bottom>0 && b.top<innerHeight && b.right>0 && b.left<innerWidth && b.width>0 && b.height>0};
+      const vis=[...document.images].filter(i=>{const s=getComputedStyle(i);
+        return s.display!=='none' && s.visibility!=='hidden' && seen(i)});
+      const pending=vis.filter(i=>!i.complete||i.naturalWidth===0);
+      // 底图：body::before 的 background-image。用一幅探针 Image 查它解码了没有
+      let bg='unknown';
+      const m=(getComputedStyle(document.body,'::before').backgroundImage||'').match(/url\\("([^"]+)"\\)/);
+      if(m){
+        bg = await new Promise(res=>{const im=new Image();
+          if(im.complete&&im.naturalWidth>0){res('ready');return}
+          im.onload=()=>res('ready'); im.onerror=()=>res('error'); im.src=m[1];
+          setTimeout(()=>res('timeout'),8000)})
+      }
+      return JSON.stringify({pending:pending.length, visible:vis.length, bg});
+    })()`)
+    let v = null
+    try { v = JSON.parse(r) } catch { v = null }
+    last = v
+    if (!v) { if (log) console.log('     图片就绪: 读不到（按就绪处理）'); return true }
+    if (v.pending === 0 && v.bg !== 'timeout') {
+      if (log) console.log('     图片就绪: 可见 ' + v.visible + ' 张全解码，底图 ' + v.bg + '（' + (Date.now() - t0) + 'ms）')
+      return true
+    }
+    if (Date.now() - t0 > waitMs) {
+      if (log) console.log('     ⚠️ 等图超时：可见区还有 ' + v.pending + ' 张没解码、底图 ' + v.bg + '（' + (Date.now() - t0) + 'ms）')
+      return false
+    }
+    await sleep(300)
+  }
 }
 if (mode === 'capture') {
   // 冻结轮播 + 钉住当前这张图（结束后还原；异常也要还原，所以放 try/finally）
@@ -316,11 +443,12 @@ if (mode === 'capture') {
   // 之后 compare 就按这个值钉回去，与轮播是否跑过无关。
   const wallpaperNow = frozen && frozen.before ? frozen.before.wallpaper : null
   if (wallpaperNow) await pinWallpaper(wallpaperNow, true)
+  await resetToCleanHome(true)  // 上一轮 run 可能留下开着面板
   try {
   const manifest = {
     dir, capturedAt: new Date().toISOString(), url: cdp.url,
     // 记下"比的是哪一块"：裁剪比例不藏在代码里，改比对口径必须重录基准
-    comparison: { stableKeepRatio: STABLE_KEEP_RATIO, note: '只比视口上方 ' + (STABLE_KEEP_RATIO * 100) + '%（底部实时计数与装饰粒子天然不可复现）' },
+    comparison: { stableKeepRatio: STABLE_KEEP_RATIO, stableXByState: STABLE_X_BY_STATE, note: '每状态只比它自己那块（视口上方 ' + (STABLE_KEEP_RATIO * 100) + '% 且按状态竖切）；底部实时计数、装饰粒子、会话正文都不参与' },
     // 钉住的底图（compare 时按它钉回去，保证比的是同一张）
     pinnedWallpaper: wallpaperNow,
     rotationFrozenFrom: autoBefore,
@@ -352,6 +480,10 @@ if (mode === 'capture') {
   const autoBefore = frozen ? frozen.raw : null
   if (manifest.pinnedWallpaper) await pinWallpaper(manifest.pinnedWallpaper, true)
   else console.log('   ⚠️ 基准里没有 pinnedWallpaper（旧基准？）—— 只能冻结轮播，可能被换图干扰')
+  // **必须**在开始逐个状态之前先复位。03 状态会主动打开设置面板且不会自己关，
+  // 而 DSH 还会把"面板开着"这个状态跨刷新保留 —— 于是下一次 run 的 01 状态直接拍到
+  // 面板开着的样子，与"干净首页"的基准差 93%。看起来像严重回归，其实只是状态没复位。
+  await resetToCleanHome(true)
   let same = 0, diff = 0, missing = 0
   const probeDiffs = []
   try {
@@ -367,7 +499,7 @@ if (mode === 'capture') {
     // 裁稳定区 →（尺寸不同时）跨 DPI 归一 → 逐像素比。
     // 注意：裁的是**解码后**的像素，不是文件；encodePng 只用于写差异图。
     const cmp = comparePngEither(
-      encodePng(stableFrom(baseFile)), encodePng(stableFrom(nowFile)),
+      encodePng(stableFrom(baseFile, s.name)), encodePng(stableFrom(nowFile, s.name)),
       { allowScale: true, tolerance: 0, maxDiffRatio: 0 })
     const probeSame = String(probeNow) === String(s.probe)
     if (!probeSame) probeDiffs.push({ name: s.name, before: s.probe, after: probeNow })

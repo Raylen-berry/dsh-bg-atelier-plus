@@ -2287,11 +2287,13 @@ var WE_TYPE_LABEL = {
 // 函数、fetch、按钮回调里，改前缀要满文件找。
 //
 // 现在有两套端点可用（移植期并存）：
-//   WE_PREFIX_LEGACY = '/bga/we'  —— 本插件自己的 host 半（we/routes.js）
-//   WE_PREFIX_BRIDGE = '/dwl'     —— 独立的 dsh-WE-library 插件
-// 切哪边只改这一个常量；两者返回同样的库清单与同样的图（同一份扫描代码移植过去的），
-// 所以切换时视觉 oracle 应当**完全没有差异**。
-var WE_PREFIX = '/bga/we'
+//   '/bga/we'  —— 本插件自己的 host 半（we/routes.js）
+//   '/dwl'     —— 独立的 dsh-WE-library 插件（已建库 + 实机验证）
+// 切哪边只改这一个常量。两边共用同一份扫描代码（新插件就是从这移植过去的），
+// 实测 library.json 返回**同样的 37 条、同样的 id 序列**，所以切换时视觉 oracle
+// 应当完全没有差异 —— 那正是这次切换的验收判据。
+// 当前值：'/dwl'（独立插件）。回退就把这行改回 '/bga/we'。
+var WE_PREFIX = '/dwl'
 function weUrl(pathPart) { return WE_PREFIX + pathPart }
 
 function weMediaUrl(entry, rel) {
