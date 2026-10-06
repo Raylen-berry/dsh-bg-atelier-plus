@@ -24,15 +24,17 @@
 // ============================================================================
 
 import { promises as fs } from 'node:fs'
+import fsSync from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 // 底图取回：与 tools/fetch-wallpapers.mjs 共用同一份实现（见 fetch-wallpapers.js 顶部注释）
 import { readManifest, fetchWallpapers } from './fetch-wallpapers.js'
 // WE (Wallpaper Engine) 库接入: /bga/we/* 路由, 详见 we/ 目录与 README「WE 壁纸库」节。
 import { registerWeRoutes } from './we/routes.js'
 
-export const name = 'dsh-bg-atelier'
+export const name = 'dsh-bg-atelier-plus'
 export const inject = ['webServer']
 
 // Package root: index.js 位于包根, 无需再往上一层.
@@ -83,34 +85,85 @@ function sendJson(res, status, obj) {
 // "缩略图=原图"(每次打开工坊都拉整张原图, 这就是"点开很卡"的元凶之一)。所以先试裸
 // import, 再按部署路径逐个试 app 自带的 sharp 入口, 全失败才退回原样输出。
 let sharpPromise = null
+/** sharp 的候选来源, 按"最可能成功"排序。
+ *
+ *  为什么需要这么多候选: 插件目录被 link/junction 挂进 profile 时, ESM 的裸 import 是按
+ *  **真实路径** (E:\dsh-plugins\...) 往上找 node_modules 的 —— 那里没有 sharp, 于是静默退化成
+ *  "缩略图=原图"(每次打开工坊都拉整张原图), 连带 ?sz=large 中间档也一起失效。
+ *  所以除了裸 import, 还要显式去三个地方找:
+ *    ① profile 树共享的 node_modules (DSH_HOME/profiles/node_modules) —— 桌面版宿主自带的 sharp
+ *       就在这儿 (0.35.x, 已用 require 实测可加载);
+ *    ② 宿主 asar 里的 sharp (<app>/resources/app.asar/node_modules/sharp) —— Electron 的
+ *       require 能读 asar;
+ *    ③ asar 旁边解包出来的那份 (<app>/resources/app.asar.unpacked/...) —— 原生 .node 从
+ *       asar 里加载会失败, 解包目录才是正路。 */
 function sharpCandidates() {
   const candidates = []
-  candidates.push('sharp')   // ① 标准解析: 插件装在真正有 node_modules 的树里时有效
+  // ⓪ 显式指定 (排障/测试): 判据用 "://" 而不是 /^[a-zA-Z]+:/ —— 后者会把盘符 "D:\..." 当协议,
+  //    把裸路径喂给 import() ⇒ ERR_UNSUPPORTED_ESM_URL_SCHEME。
+  if (process.env.DSH_BG_ATELIER_SHARP) {
+    const p = process.env.DSH_BG_ATELIER_SHARP
+    candidates.push(p.indexOf('://') > 0 ? p : pathToFileURL(path.resolve(p)).href)
+  }
+  // ① 裸 import: 插件装在真有 node_modules 的树里、或 profile 树正好能兜住时有效
+  candidates.push('sharp')
+  // ①b profile 树共享 node_modules 的绝对路径 (link/junction 场景下裸 import 兜不到这里)
+  const home = dshHome()
+  for (const rel of [['profiles', 'node_modules'], ['node_modules']]) {
+    const p = path.join(home, ...rel, 'sharp', 'dist', 'index.cjs')
+    try { if (fsSync.existsSync(p)) candidates.push(pathToFileURL(p).href) } catch { /* ignore */ }
+  }
+  // ②③ 宿主自带的 sharp: 桌面版把它打在 asar 里, 路径从 process.execPath 现推, 不写死盘符
+  const probes = []
   try {
-    // ② 从当前 node 可执行文件反推宿主 node_modules: exe 通常在
-    //    <app>/node_modules/node/bin/node.exe ⇒ 上两级就是 <app>/node_modules。
-    const exe = process.execPath
-    const appNm = path.join(path.dirname(exe), '..', '..')
-    candidates.push(pathToFileURL(path.join(appNm, 'sharp', 'dist', 'index.cjs')).href)
+    const exeDir = path.dirname(process.execPath)                 // <app>
+    const resources = path.join(exeDir, 'resources')
+    for (const rel of [
+      ['app.asar.unpacked', 'node_modules', 'sharp', 'dist', 'index.cjs'], // 原生模块要这份
+      ['app.asar', 'node_modules', 'sharp', 'dist', 'index.cjs'],          // Electron 能读 asar
+      ['app', 'node_modules', 'sharp', 'dist', 'index.cjs'],               // 解包版
+    ]) probes.push(path.join(resources, ...rel))
+    // node 可执行文件在 <app>/node_modules/node/bin/node.exe 时: 上两级就是 <app>/node_modules
+    probes.push(path.join(exeDir, '..', '..', 'sharp', 'dist', 'index.cjs'))
   } catch { /* ignore */ }
-  // ③ 本机桌面版安装位置兜底
-  candidates.push(pathToFileURL('D:\\deepseek-harness\\DSH Desktop\\resources\\app\\node_modules\\sharp\\dist\\index.cjs').href)
+  for (const p of probes) {
+    // asar 路径**不先探存在性**: 普通 Node 的 fs 看不见 asar 内部, existsSync 会是 false,
+    // 而 Electron 里它是真的能 import 的 —— 先探反而会把正确的候选筛掉。探不到的 import 会
+    // 自己失败 (下面的循环逐个兜), 不算错。
+    const spec = /[\\/]app\.asar[\\/]/.test(p) ? pathToFileURL(p).href : (fsSync.existsSync(p) ? pathToFileURL(p).href : null)
+    if (spec && candidates.indexOf(spec) < 0) candidates.push(spec)
+  }
   return candidates
+}
+/** 从模块命名空间里挑出"能调用的 sharp 函数"。
+ *  0.35 的 CJS 导出是个函数 (带 versions), 但也有版本是 { default: fn } —— 两种都认。 */
+function pickSharp(m) {
+  if (!m) return null
+  if (typeof m === 'function') return m
+  if (typeof m.default === 'function') return m.default
+  if (m.default && typeof m.default === 'object') return m.default
+  return typeof m === 'object' ? m : null
 }
 async function getSharp() {
   if (sharpPromise === null) {
     sharpPromise = (async () => {
-      let lastErr = null
+      const tried = []
       for (const spec of sharpCandidates()) {
-        try {
-          const m = await import(spec)
-          const s = m && (m.default || m)
-          if (s && typeof s === 'function' && s.default) return s.default
-          if (s && typeof s === 'function') return s
-          if (s && typeof s === 'object') return s
-        } catch (e) { lastErr = e }
+        // 裸 import 之外再兜一次 require: Electron 的 require 能读 asar, 而 import 到原生
+        // 模块 (sharp 的 .node) 时 asar 里那条路会失败。
+        for (const how of ['import', 'require']) {
+          try {
+            let s
+            if (how === 'import') s = pickSharp(await import(spec))
+            else {
+              const req = createRequire(import.meta.url)
+              s = pickSharp(req(spec === 'sharp' ? 'sharp' : fileURLToPath(spec)))
+            }
+            if (s) return s
+          } catch (e) { tried.push(how + ' ' + spec + ' :: ' + String((e && e.message) || e)) }
+        }
       }
-      console.error('[dsh-bg-atelier] sharp unavailable, serving originals: ' + String(lastErr))
+      console.error('[dsh-bg-atelier] sharp unavailable, serving originals.\n  ' + tried.join('\n  '))
       return null
     })()
   }
@@ -149,6 +202,7 @@ function stemOf(name) {
 function isIgnoredName(name) {
   if (!name) return true
   if (name.charCodeAt(0) === 46) return true // . 开头隐藏文件
+  if (name === FOLDERS_FILE) return true     // 标签配置, 不是图
   return /^(readme|说明|安装说明|notes)(\..*)?$/i.test(name)
 }
 
@@ -205,12 +259,42 @@ function compareNames(a, b) {
 
 // ------------------------------------------------------------- 持久化状态 ---
 
-// 设置持久化到 host 侧文件 ($DSH_HOME/dsh-bg-atelier/settings.json),
+// 设置持久化到 host 侧文件 ($DSH_HOME/dsh-bg-atelier-plus/settings.json),
 // 客户端通过 /bga/settings.json GET/PUT 读写 —— 与 dsh-whale-widget 的
 // size.json 一致, 比 localStorage 可靠 (不受站点数据清理/沙箱影响)。
-const SETTINGS_DIR = path.join(dshHome(), 'dsh-bg-atelier')
-const SETTINGS_FILE = path.join(SETTINGS_DIR, 'settings.json')
-const USER_WALLPAPER_DIR = path.join(dshHome(), 'dsh-bg-atelier', 'wallpapers')
+//
+// 官方版分支 (dsh-bg-atelier-plus): 两个客户端很可能共用同一个 DSH_HOME, 所以这份设置
+// **默认**落在和原插件不同的目录名上, 不然两边会互相覆盖底图/配色/特效; 派生图缓存跟着走。
+//   · DSH_BG_ATELIER_SETTINGS_DIR 仍可显式覆盖 (排障/多实例);
+//   · 自己那份目录还不存在、而原插件那份在时, 直接沿用原插件那份 —— 刚把 profile 从
+//     dsh-bg-atelier 换成 dsh-bg-atelier-plus 时, 底图/配色/特效不用重调。
+//     一旦本插件写过一次盘, 自己那份目录就存在了, 之后各写各的。
+function settingsDirCandidates() {
+  const env = process.env.DSH_BG_ATELIER_SETTINGS_DIR
+  if (env) return [path.resolve(env)]
+  const own = path.join(dshHome(), 'dsh-bg-atelier-plus')
+  const original = path.join(dshHome(), 'dsh-bg-atelier')
+  try {
+    if (!fsSync.existsSync(path.join(own, 'settings.json')) && fsSync.existsSync(path.join(original, 'settings.json'))) {
+      return [own, original]   // 先在自己那份上找, 找不到读原插件那份
+    }
+  } catch { /* 探不动就按默认走 */ }
+  return [own]
+}
+function pickSettingsFile() {
+  for (const dir of settingsDirCandidates()) {
+    try { if (fsSync.existsSync(path.join(dir, 'settings.json'))) return { dir, file: path.join(dir, 'settings.json') } } catch { /* 下一个 */ }
+  }
+  const dir = settingsDirCandidates()[0]
+  return { dir, file: path.join(dir, 'settings.json') }
+}
+const SETTINGS_PICK = pickSettingsFile()
+const SETTINGS_DIR = SETTINGS_PICK.dir
+const SETTINGS_FILE = SETTINGS_PICK.file
+// 放图目录也可单独指向 (默认仍是原插件那个共享图库, 免得把 9GB 图片再拷一份)。
+const USER_WALLPAPER_DIR = process.env.DSH_BG_ATELIER_WALLPAPERS
+  ? path.resolve(process.env.DSH_BG_ATELIER_WALLPAPERS)
+  : path.join(dshHome(), 'dsh-bg-atelier', 'wallpapers')
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -250,11 +334,19 @@ async function writeSettings(obj) {
 const POSTERS_DIR = path.join(SETTINGS_DIR, 'posters')
 // v1.4.0: 设置页图库主图 (640px) 与类型卡迷你图 (112px) 都落盘成派生图, 只生成一次。
 const PREVIEWS_DIR = path.join(SETTINGS_DIR, 'previews')
+// 官方版分支新增: 「升清」用的中间档 (默认 3840 长边) 也落盘, 只生成一次。
+const LARGES_DIR = path.join(SETTINGS_DIR, 'larges')
+// 升清中间档的目标长边; 0 = 直接用原图 (退回"唯一一档就是原图"的老行为)。
+const LARGE_DIM = 3840
+const LARGE_QUALITY = 88
 
 // 派生图规格: kind → 分辨率 / 编码质量 / 落盘目录。
 const DERIVED = {
   poster:  { dim: POSTER_DIM,  quality: POSTER_QUALITY,  dir: POSTERS_DIR },
   preview: { dim: PREVIEW_DIM, quality: PREVIEW_QUALITY, dir: PREVIEWS_DIR },
+  // large: 比 640 预览清楚得多、又不像 8K 原图那样要解 130MB 位图的一档。
+  // 长边 ≤ LARGE_DIM 的原图不会进这条 (见 resolveWallpaper), 所以它只服务超大图。
+  large:   { dim: LARGE_DIM,   quality: LARGE_QUALITY,   dir: LARGES_DIR },
 }
 
 function derivedHash(s) {
@@ -281,6 +373,65 @@ function wallpaperCandidates() {
 
 function isSupportedFile(e) {
   return e.isFile() && !isIgnoredName(e.name) && MIME[extOf(e.name)]
+}
+
+// ---- 标签体系 (v1.16.4) ------------------------------------------------------
+// 用户要的是"一张图可能带**多个**标签": 高清版的 6·1 既要挂「重返未来1999」也要挂「高清」,
+// 而普通版的 6·1 只挂「重返未来1999」; 线稿的物语花绫普通版只挂「线稿风」, 高清版两个都挂。
+// 于是不能只靠"目录名 = 类型"这一条, 得让每个目录能声明它给图打什么标签。
+//
+// 配置放放图目录根部的 `folders.json`（可写用户目录里那份, 不进插件仓库）:
+//   {
+//     "folderTags": {
+//       "高清": ["高清", "重返未来1999"],   // 这个目录里的图额外挂上这些
+//       "线稿风": ["线稿风", "!subject"]     // "!subject" = 保留用目录名当标签
+//     }
+//   }
+// 取值顺序: folders.json 里显式声明的 → 目录名本身 → "未分类"。
+// 另外文件名里可以塞 `!主体` 覆盖（如 `亚丝娜!线稿风_高清.png`）—— 换主题时不用改 json。
+const FOLDERS_FILE = 'folders.json'
+const TAG_SUBJECT_HINT = '!subject'
+
+async function readFolderTags(dir) {
+  try {
+    const raw = JSON.parse(await fs.readFile(path.join(dir, FOLDERS_FILE), 'utf8'))
+    const map = raw && typeof raw === 'object' ? (raw.folderTags || raw) : {}
+    const out = {}
+    if (map && typeof map === 'object') {
+      for (const [name, value] of Object.entries(map)) {
+        const list = (Array.isArray(value) ? value : [value])
+          .filter((v) => typeof v === 'string' && v.trim().length > 0)
+          .map((v) => v.trim())
+        if (list.length) out[name] = list
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+/** 文件名里的 `!主体` 覆盖（`某某!线稿风.png` ⇒ base 去掉这段, 标签加「线稿风」）。 */
+function splitSubjectHint(stem) {
+  const at = stem.lastIndexOf('!')
+  if (at <= 0) return { stem, subject: '' }
+  const hint = stem.slice(at + 1).trim()
+  if (!hint || /[\\/]/.test(hint)) return { stem, subject: '' }
+  return { stem: stem.slice(0, at), subject: hint }
+}
+
+/** 一个目录给图打的标签（去掉 "!subject" 这种指令, 保留目录名本身当标签）。 */
+function tagsForFolder(folderTags, catName) {
+  const declared = folderTags[catName]
+  const keepFolderName = !declared || declared.includes(TAG_SUBJECT_HINT)
+  const list = []
+  if (declared) for (const t of declared) { if (t !== TAG_SUBJECT_HINT && !list.includes(t)) list.push(t) }
+  if (keepFolderName) {
+    const name = catName || '未分类'
+    if (!list.includes(name)) list.unshift(name)
+  }
+  if (!list.length) list.push(catName || '未分类')
+  return list
 }
 
 // 目录可用判定: 顶层有受支持图片, 或某个非隐藏子目录里有一张受支持图片。
@@ -334,6 +485,8 @@ export async function apply(ctx) {
       return { items, skipped }
     }
     entries.sort((a, b) => compareNames(a.name, b.name))
+    const folderTags = await readFolderTags(dir)
+    const baseTags = tagsForFolder(folderTags, catName)
     let no = 0
     for (const e of entries) {
       if (!e.isFile()) continue
@@ -341,7 +494,17 @@ export async function apply(ctx) {
       const ext = extOf(e.name)
       if (!MIME[ext]) { skipped.push((catName ? catName + '/' : '') + e.name); continue }
       const stem = stemOf(e.name)
-      const hdInfo = splitHd(stem)
+      const hint = splitSubjectHint(stem)
+      const hdInfo = splitHd(hint.stem)
+      // v1.16.2: **目录名「高清」也当高清标记**。用户把图高清化之后放进高清文件夹, 文件名
+      // 不带 _高清 后缀, 只认后缀的话这批图在筛选里全算"普通"; 而且"同名两版"的方案要靠
+      // 文件夹区分清晰度 (高清/ 与 重返未来1999/), 目录本身就是最可靠的判据。
+      const hd = hdInfo.hd || catName === '高清'
+      // v1.16.4 标签: 目录声明 + 文件名 `!主体` 覆盖 + 高清时补「高清」。
+      // 一张图可以同时挂「重返未来1999」和「高清」—— 用户要的就是这个(搜 6·1 出两版)。
+      const tags = baseTags.slice()
+      if (hint.subject && !tags.includes(hint.subject)) tags.unshift(hint.subject)
+      if (hd && !tags.includes('高清')) tags.push('高清')
       no += 1
       let size = 0
       try {
@@ -349,8 +512,9 @@ export async function apply(ctx) {
       } catch { /* unknown size */ }
       items.push({
         name: e.name,            // 原始文件名 (内部标识用)
-        base: hdInfo.base,       // 显示名 (去扩展名、去高清标记)
-        hd: hdInfo.hd,           // 是否高清
+        base: hdInfo.base,       // 显示名 (去扩展名、去高清标记、去 `!主体`)
+        hd,                      // 是否高清 (文件名标记 或 在「高清」目录里)
+        tags,                    // 标签（≥1 个）: [主体, ...] + 「高清」
         no,                      // 类型内编号 (1 起, 按文件名自然序)
         url: catName
           ? URL_PREFIX + encodeURIComponent(catName) + '/' + encodeURIComponent(e.name)
@@ -537,6 +701,22 @@ export async function apply(ctx) {
     const key = targetPath + ':' + info.size + ':' + info.mtimeMs
     // poster(112px 类型卡) / preview(640px 图库主图) 走"落盘派生图"这条: 只生成一次。
     if (kind === 'poster' || kind === 'preview') return resolveDerived(targetPath, info, kind)
+    // 「升清」中间档 (官方版分支新增): 客户端先铺 640 预览、再换这一档。
+    // 只对**比中间档还大**的原图有意义 —— 长边 ≤ LARGE_DIM 的图连派生都不做,
+    // 直接把原文件字节送出去 (清晰度零损失, 也省掉一次重编码)。
+    if (kind === 'large') {
+      if (LARGE_DIM <= 0) return { buffer: await fs.readFile(targetPath), mime: MIME[extOf(targetPath)] }
+      const sh = await getSharp()
+      if (sh) {
+        try {
+          const meta = await sh(targetPath).metadata()
+          const long = Math.max(meta.width || 0, meta.height || 0)
+          if (long > 0 && long <= LARGE_DIM) return { buffer: await fs.readFile(targetPath), mime: MIME[extOf(targetPath)] }
+          return await resolveDerived(targetPath, info, 'large')
+        } catch { /* 读不出尺寸就退回原图, 宁可大也不要空 */ }
+      }
+      return { buffer: await fs.readFile(targetPath), mime: MIME[extOf(targetPath)] }
+    }
     const thumb = kind === 'thumb'
     const dim = thumb ? THUMB_DIM : SERVED_MAX_DIM
     // 不设上限 (dim === 0): 直接把原文件**字节**送出去 —— 不缩放、不重编码、也不进内存缓存。
@@ -614,6 +794,15 @@ export async function apply(ctx) {
               await fs.access(path.join(spec.dir, h + '.webp'))
               continue   // 已落盘, 跳过 (不读原图, 不重编码)
             } catch { /* 需要生成 */ }
+            // large 档只对"比中间档还大"的原图存在: 小图那条路直接送原文件,
+            // 先探一次尺寸, 免得白给 313 张图各生成一份永远没人请求的派生图。
+            if (kind === 'large') {
+              try {
+                const meta = await sh(file).metadata()
+                const long = Math.max(meta.width || 0, meta.height || 0)
+                if (long > 0 && long <= LARGE_DIM) continue
+              } catch { continue }
+            }
             await resolveDerived(file, info, kind)
             made += 1
           }
@@ -651,8 +840,8 @@ export async function apply(ctx) {
       const raw = qIndex >= 0 ? url.slice(0, qIndex) : url
       const query = qIndex >= 0 ? url.slice(qIndex + 1) : ''
       const szM = /(^|[?&])sz=([a-z0-9]+)/i.exec(query)
-      const kind = szM ? szM[2].toLowerCase() : ''   // '' 原图 | thumb | poster | preview
-      if (kind !== '' && kind !== 'thumb' && kind !== 'poster' && kind !== 'preview') { reply(400); return }
+      const kind = szM ? szM[2].toLowerCase() : ''   // '' 原图 | large(升清档) | thumb | poster | preview
+      if (kind !== '' && kind !== 'large' && kind !== 'thumb' && kind !== 'poster' && kind !== 'preview') { reply(400); return }
       if (raw.indexOf(URL_PREFIX) !== 0) { reply(404); return }
       const rest = raw.slice(URL_PREFIX.length)
       if (!rest) { reply(400); return }

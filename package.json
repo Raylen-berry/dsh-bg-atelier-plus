@@ -1,7 +1,7 @@
 {
-  "name": "dsh-bg-atelier",
-  "version": "1.15.2",
-  "description": "DSH Desktop 底图工坊：静态底图、Wallpaper Engine 实时场景与鼠标视差、场景属性及预设、琉璃卡面和对话特效。",
+  "name": "dsh-bg-atelier-plus",
+  "version": "1.16.0",
+  "description": "底图工坊 · 官方版分支：在 dsh-bg-atelier 1.15.2 基础上适配官方 DSH 客户端（浅色表面不再发白、整条会话列宽的特效画布、高清底图先预览后升清、消息气泡淡阴影可调）。原插件 E:/dsh-plugins/dsh-desktop-wallpaper 保持不变。",
   "keywords": [
     "dsh",
     "dsh-plugin",

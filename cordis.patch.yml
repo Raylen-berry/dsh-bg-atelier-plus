@@ -1,5 +1,5 @@
 # ============================================================================
-# dsh-bg-atelier —— DSH bundle patch
+# dsh-bg-atelier-plus —— DSH bundle patch (官方版分支; 原版是 dsh-bg-atelier)
 # ============================================================================
 # 这是插件的"挂载声明"。DSH 启动时按 bundle 层栈叠加各插件 patch,
 # 本文件把底图工坊插入 Web profile 的配置树, 使其作为标准 DSH 插件
@@ -18,6 +18,8 @@
 #   而 client 半是按请求重建的，刷新窗口即可。
 # ============================================================================
 
+# 包名必须跟着 package.json 走: 改成 plus 之后这里的 name 如果还写 dsh-bg-atelier,
+# 宿主就 import 不到 (启动日志: "bg-atelier (dsh-bg-atelier): failed to import")。
 - insert:
-    - id: bg-atelier
-      name: dsh-bg-atelier
+    - id: bg-atelier-plus
+      name: dsh-bg-atelier-plus

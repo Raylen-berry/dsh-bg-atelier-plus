@@ -27,7 +27,10 @@ const dir = () => path.join(dshHome(), PLUGIN)
 const settingsFile = () => path.join(dir(), 'settings.json')
 
 // 与插件源码同口径的默认值 / 枚举 / 区间（改插件时这里要跟着改，注意别漂）
-const DEFAULTS = { wallpaper: null, effect: 'firefly', accent: '#e88ca0', deep: '#241318', veil: 0, glass: 0.8, cardA: 0, cardBlur: 10, focus: '50% 50%', zoom: 1, preset: 'sakura', cardShadow: true, autoOn: false, autoMin: 30, fadeOn: true, fadeDelayMs: 0, fadeMs: 900, playlists: [], playbackSource: 'all', playbackMode: 'random', imageFraming: {}, recent: [], weId: null, weMode: 'live', weQuality: 'balanced' }
+const DEFAULTS = { wallpaper: null, effect: 'firefly', accent: '#e88ca0', deep: '#241318', veil: 0, glass: 0.8, cardA: 0, cardBlur: 10, focus: '50% 50%', zoom: 1, preset: 'sakura', cardShadow: true, autoOn: false, autoMin: 30, fadeOn: true, fadeDelayMs: 0, fadeMs: 900, playlists: [], playbackSource: 'all', playbackMode: 'random', imageFraming: {}, recent: [], weId: null, weMode: 'live', weQuality: 'balanced',
+  // v1.16.0 (官方版分支) 外观适配三项, 与 client.js 的 normalizeStyles 同口径
+  styles: { surface: 0.30, preview: true, bubble: 0.5 } }
+const STYLES_RANGE = { surface: [0, 0.8], bubble: [0, 1] }
 const EFFECT_IDS = ['firefly', 'bubble', 'petal', 'rain', 'off']
 const PRESETS = ['sakura', 'teal', 'amber', 'violet', 'mint', 'crimson', 'mist', 'lavender', 'peach', 'mono', 'custom']
 const RANGE = { veil: [0, 0.85], glass: [0, 1], cardA: [0, 1], cardBlur: [0, 24], zoom: [1, 2.2], autoMin: [1, 120], fadeDelayMs: [0, 1000], fadeMs: [100, 5000] }
@@ -76,6 +79,19 @@ export function validate(raw) {
     out.autoMin = snapped
   }
   out.focus = (typeof src.focus === 'string' && /^-?\d+(\.\d+)?% -?\d+(\.\d+)?%$/.test(src.focus.trim())) ? src.focus.trim() : DEFAULTS.focus
+  { // v1.16.0 外观适配三项: 缺字段(老文件)保持默认, 数值越界钳制, preview 默认开
+    const raw = src.styles && typeof src.styles === 'object' && !Array.isArray(src.styles) ? src.styles : {}
+    const next = { ...DEFAULTS.styles }
+    for (const k of Object.keys(STYLES_RANGE)) {
+      const n = Number(raw[k])
+      if (!Number.isFinite(n)) continue
+      const c = Math.min(STYLES_RANGE[k][1], Math.max(STYLES_RANGE[k][0], n))
+      if (c !== n) notes.push('styles.' + k + ' ' + n + ' 越界 ⇒ 钳到 ' + c)
+      next[k] = c
+    }
+    next.preview = raw.preview !== false
+    out.styles = next
+  }
   out.preset = PRESETS.includes(src.preset) ? src.preset : DEFAULTS.preset
   out.cardShadow = src.cardShadow !== false          // 默认开
   out.autoOn = src.autoOn === true                   // v1.10.0 默认关（不请自来的换图很烦）

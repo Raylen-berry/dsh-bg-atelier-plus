@@ -1,99 +1,99 @@
-# dsh-bg-atelier 安装指南（居家电脑）
+# dsh-bg-atelier-plus —— 官方版分支（安装 / 验证 / 回退）
 
-本版是**标准 DSH 插件**：随 DSH 启动自动加载、重启保留、可在 设置 → 插件 管理。
-不再需要“每台机器手动复制源码再让 agent cordis_define”。
+「底图工坊」的**官方客户端适配分支**，从原插件 `dsh-bg-atelier 1.15.2` 复制出来改的。
 
-## 1. 拿源码
+- 原插件目录：`E:\dsh-plugins\dsh-desktop-wallpaper`（**一个字没改**；社区版与回退都用它）
+- 本分支目录：`E:\dsh-plugins\dsh-bg-atelier-official`（包名 `dsh-bg-atelier-plus`）
+- 原版自己的安装说明在 GitHub 仓库 README，与本文件无关
 
-```powershell
-git clone https://github.com/Raylen-berry/dsh-desktop-wallpaper.git
-# 或 GitHub → Code → Download ZIP 解压
+## 装在哪
+
+| profile | 现状 |
+| --- | --- |
+| `desktop`（本机官方客户端启动时用的就是它） | 已挂 `dsh-bg-atelier-plus`；原 `dsh-bg-atelier` 已从 bundles 里摘掉 |
+| `web`（官方 app 代码里的默认值，本机没用上） | 也装了一份，无害 |
+
+两个 profile 里都**不会同时挂两个底图插件**。
+
+## 重启 DSH Desktop 后要看的日志
+
+启动日志里找这两行：
+
+```
+[dsh-bg-atelier] host up (v1.16.0), serving ...
+[dsh-bg-atelier] sharp unavailable, serving originals.   ← 出现这行才是问题
 ```
 
-解压后路径记为 `$PLUGIN_DIR`（建议 `D:\DeepSeek\dsh-plugins\dsh-desktop-wallpaper`，与仓库名一致）。
+出现 `sharp unavailable` 说明宿主自带的 sharp 没被找到（那 `?sz=preview` / `?sz=large`
+会退化成送原图，两段式加载失效）。修法：启动前设置环境变量指向任意一份 sharp 入口：
 
-## 2. 安装进 DSH profile
-
-在 DSH Desktop 的会话里让 agent 执行，或在本机 PowerShell 运行：
-
-```powershell
-dsh plugin --profile web add link:"$PLUGIN_DIR"
+```
+DSH_BG_ATELIER_SHARP=C:\Users\陈道云\.dsh\profiles\node_modules\sharp\dist\index.cjs
 ```
 
-装完**重启一次 DSH Desktop**。启动后：
-- 设置页顶部出现 **底图工坊** 入口（先选底图类型、再进该类型图库选图；调色、特效）
-- 侧边栏底部出现「流光宝珠」一键随机换图（跨全部类型，同轮 2/3 内不重复）
-- 插件出现在 设置 → 插件 清单里，可随时开启/关闭
+## 回退（一分钟）
 
-> 首次安装需要能解析 `dsh` CLI 与联网（若走仓库安装）。`link:` 本地安装无需联网。
+1. 打开 `C:\Users\陈道云\.dsh\profiles\desktop\package.json`，把 `bundles` 里的
+   `dsh-bg-atelier-plus` 换回 `dsh-bg-atelier`；
+2. 备份文件就在同目录（改动前的原样）：
+   - `package.json.bak-bgaplus-20261001-142711`
+   - `cordis.patch.yml.bak-bgaplus-20261001-142711`
+3. 重启 DSH Desktop。
 
-## 3. 放底图（按类型 = 子文件夹）
+原插件从没被改动过，换回去就是原来的行为。
 
-**开箱即用**：插件自带「线稿风」类型 11 张底图（亚丝娜/月蔷薇/流萤/物语花绫/远坂凛/青缭 及高清版），装完即可选。
-**自己加图**：放进任一命中目录下**一个子文件夹 = 一个类型**，例如建 `重返未来1999` 文件夹再把图丢进去：
+## 改了什么（相对原版 1.15.2）
+
+1. **界面底色不再发白**：浅色主题下 `--dsw-alias-bg-base` 等一批表面 token 原来是
+   「深色底往白提亮 96%」（近白薄纱 —— 就是「底图上盖了层白布」）。现在提亮 60%，
+   面透明度由新设置项「表面不透明度」单独控制（**0–30%，默认 30%**）。
+   深色主题那套值一个字没动。
+2. **高清底图先预览后升清**：点大图先请求 `?sz=preview`（实测 16–40 KB）立刻上屏，
+   再后台加载 `?sz=large`（host 侧把长边 >3840 的原图缩成 3840 的 webp，实测 400–900 KB），
+   好了再换上去。本机「高清」目录 157 张单张 15–80 MB，原来一把梭原图。
+   设置页可关（「高清底图先出预览图，再升清」）。
+3. **对话特效跟输入框卡面同宽**：特效画布所在的宿主 slot 是居中收缩的 flex 行，原来量出来
+   只有 194px（整行 434px），粒子按 194px 算密度只剩 6 只、超出 194px 的还被 clip 切掉。
+   现在画布 `position:fixed`，左右/底部由 JS 按**输入框卡面**实测写进 `--bga-fx-*`，
+   并用 ResizeObserver 跟着卡面长高（打多行字/加附件）。粒子数按画布宽走**自适应密度**
+   （无硬顶）：912px 卡面流萤 22 只、4000px 画布 88 只。
+4. **消息气泡淡阴影（可调 0–1）**：气泡本体一道接触阴影 + 一层 `::before` 描边环。
+   为什么要有描边环：开着 `dsh-cache-control` 的「清空气泡」时气泡 `background:transparent`，
+   透明盒子上直接画 box-shadow 看不见。**不要**改成 `filter:drop-shadow` —— 那是文字阴影。
+5. **卡面模糊 0–2px 每 0.1 一档**（21 档），2px 之后保持原来的粗档 3/4/6/8/12/16/24。
+6. **设置面板可读底座**：设置面板（`[role="dialog"].wCInkW_panel` 及其 `::before`，底图会透出来）
+   单独垫近乎不透明的一层。
+7. **标签体系（v1.16.4）**：一张图可以挂**多个**标签。标签来自三处，按顺序叠加：
+   ① 目录声明：放图目录根部的 `folders.json` → `folderTags: { "高清": ["高清","重返未来1999"] }`；
+   ② 目录名本身（`"线稿风": ["!subject"]` 里的 `!subject` 表示保留这条）；
+   ③ 文件名里的 `!主体` 覆盖（`某图!线稿风_高清.png` ⇒ 标签加「线稿风」，显示名去掉这段）。
+   目录名是「高清」或文件名尾部带 `_高清`/`·高清`/`4K` 等标记时，再自动补一个「高清」标签。
+   效果：`高清/6·1.png` = [高清, 重返未来1999]，`重返未来1999/6·1.png` = [重返未来1999]，
+   搜 `6·1` 两版都出来；搜索同时匹配标签，卡片上直接显示标签角标。
+
+> ⚠️ **别给 `theme.overrideTokens` 传自定义 token 名字**（比如 `--bga-surface-solid`）。
+> 本机实测：塞未注册的 token 名会让宿主把**整层 override 判废** → 界面 token 全回默认
+> （`--dsw-alias-bg-base: #fff`）、底图被不透明外壳盖住 = 「壁纸直接不显示」。
+> 需要自定义颜色就**算成字面量**写进插件自己的样式表（见 `settingsSolidColor`）。
+
+设置文件：本分支默认写 `$DSH_HOME\dsh-bg-atelier-plus\settings.json`；若那份还不存在而
+原插件的 `dsh-bg-atelier\settings.json` 在，会直接沿用原插件那份（切过来不用重调底图/配色）。
+`DSH_BG_ATELIER_SETTINGS_DIR` 可显式覆盖。派生图缓存（previews/posters/larges）跟着设置目录走。
+
+## 离线自检
 
 ```powershell
-New-Item -ItemType Directory -Force "C:\...\wallpapers\重返未来1999"   # 换下面的命中目录
-Copy-Item "D:\图包\*.png" "C:\...\wallpapers\重返未来1999\"
+node E:\deepseekagent\_tests\bga-live-check.mjs   # 33 项：设置归一化 / 画布几何+密度 / 升清 URL / 气泡规则 / 设置底座色
 ```
 
-放好点设置页「刷新」即出现新类型/新图（无需重启）。支持 png / jpg / webp / gif / svg / avif / bmp。
-根目录的散图会自动归为「未分类」类型（兼容旧版）。
-
-命中目录顺序（首个**有图**的命中，① 最高）：
-
-| 顺序 | 目录 |
-|---|---|
-| ① | `$env:DSH_BG_ATELIER_WALLPAPERS`（绝对路径，显式覆盖） |
-| ② | `$DSH_HOME\dsh-bg-atelier\wallpapers`（**推荐**，启动自动建好，随时丢图） |
-| ③ | 插件包内置 `wallpapers/`（当作默认图集） |
-| ④ | 工作区相对 `dsh-plugins/dsh-desktop-wallpaper/wallpapers` |
-
-**高清细分**：文件名去掉扩展名后尾部带 `高清 / _高清 / ·高清 / 4K / HD` 等标记的自动打「高清」，
-类型图库内可用 `全部 / 高清 / 普通` 筛选。显示名自动去掉该标记（如 `亚丝娜_高清.png` 显示为「亚丝娜·高清」角标），
-编号仅作为角标、不改文件名/显示名。
-
-## 4. 升级
+host 半（要用本机真实底图，以及一份能加载的 sharp）：
 
 ```powershell
-dsh plugin --profile web update dsh-bg-atelier
+$env:DSH_BG_ATELIER_WALLPAPERS="C:\Users\陈道云\.dsh\dsh-bg-atelier\wallpapers"
+$env:DSH_BG_ATELIER_SETTINGS_DIR="$env:TEMP\bga-check"
+$env:DSH_BG_ATELIER_SHARP="D:\deepseek dsh\DSH Desktop\resources\app.asar.unpacked\node_modules\sharp\dist\index.cjs"
+node E:\deepseekagent\_tests\bga-host-check.mjs   # 10 项：large 档真的变小 / 小图逐字节原样 / 设置目录隔离
 ```
 
-或对 agent 说“更新底图插件”，让它重新拉取源码后 `dsh plugin --profile web add link:$PLUGIN_DIR`。
-
-## 5. 卸载 / 停用
-
-```powershell
-dsh plugin --profile web remove dsh-bg-atelier
-```
-
-或在 设置 → 插件 里停用该插件后重启 Harness。所有底图/特效/主题覆盖立即还原，
-不残留改动（主题覆盖是运行时 token 覆盖，不写底层文件）。
-
-## 常见问题
-
-- **底图不出图**：浏览器直接访问 `http://127.0.0.1:<DSH端口>/bga/wallpapers.json` 看返回；
-  `/bga/wallpapers/<类型>/<文件名>` 404 说明目录没解析对（看上面第 3 步顺序）；
-  400 是路径安全拦截（不要含 `..`、多余斜杠）。
-- **类型没出现**：类型 = 放图目录下的**子文件夹**；文件夹里还没有受支持图片时类型卡显示为「空」，
-  放入图片后点「刷新」。
-- **安装后没生效**：确认 `dsh plugin add` 已把 `dsh-bg-atelier` 写进 profile 的
-  `dsh.profile.bundles`，且已**重启一次** DSH Desktop。
-- **底图选择不记住**：设置持久化到 host 侧文件 `$DSH_HOME\dsh-bg-atelier\settings.json`，
-  重启 DSH 后自动恢复上次选择（旧版根目录 URL 也会自动对回新类型里的文件）。
-
-## WE 壁纸库（v1.7.0）
-
-设置页「底图工坊 → Wallpaper Engine 库」：列出本机 WE 订阅/本地项目，点卡片即铺成 DSH 背景。
-
-- **改完 host 半必须重启 DSH Desktop**：`/bga/we/*` 与 `/bga/we/still…` 都是 host 路由，
-  在 bundle 挂载时注册（实测：只改插件文件、只改 `cordis.patch.yml` 都不会触发热重载）。
-  client 半相反，是按请求重建的，刷新窗口即可。
-- **scene 类高清静态图**：WE 只给 192×192 的 `preview.gif`，铺 4K 屏等于放大约 10 倍。
-  host 现在会解 `scene.pkg`（PKGV00200 容器 + .tex 解码，见 `we/pkg.js`/`we/tex.js`/`we/still.js`）
-  合成一张 4367×2456 的静态图，落盘在 `$DSH_HOME\dsh-bg-atelier\we-stills\<id>.webp`（约 1 MB）。
-  首次约 5s，之后直接读盘；客户端先铺 gif、生成好了自动换上。
-  近似之处（不重写 WE 渲染器）：相机用"整屏覆盖层"矩形推断、origin 按中心解释、
-  puppet 骨骼层用最近的非骨骼祖先近似、特效（blur/水波/音频响应/脚本动画）不渲染。
-  想要**动态**就只能回到 gif；想要"动得对"需要 WE 的运行时，本插件不做。
-
+插件自带的老套件（`node tools/run-all.mjs`）也照跑，只有 `tools/test-we-client.mjs`
+因为缺 `react` 依赖会红 —— 原插件目录同样红，属于既有问题。
