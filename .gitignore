@@ -15,3 +15,7 @@ dsh-we-*.zip
 
 # 开发测试依赖（lockfile 保留，供 CI 使用）
 node_modules/
+
+# 视觉基准图（tools/visual-baseline.mjs 产出）：机器/DPI/窗口尺寸专属，**不进仓库**。
+# 换机器要重新 capture；基准入库会让不同机器互相判红。脚本与状态定义入库，图不入库。
+baselines/
