@@ -237,7 +237,12 @@ export const STABLE_KEEP_RATIO = Number(process.env.VB_STABLE_RATIO || 0.80)
 export const STABLE_X_BY_STATE = {
   '01-static-wallpaper': [0, 282],
   '02-fx-nodes': [0, 282],
-  '03-settings-studio': [340, 1300],
+  // 右边界 **1280 而不是 1300**：x1294–1299 那几列是**设置面板的滚动条**。
+  // 实测：03 曾稳定报 11952 像素差异（1.720%），其中 Δ>10 的 78 个像素**全部**落在
+  // x1294–1299，颜色从亮灰 rgb(114,115,116) 变成暗色 rgb(16,20,20)——就是滚动条
+  // 出现/消失/位置微移造成的 ±98 级差；其余 11385 个是 Δ≤2 的亚像素抖动。
+  // 滚动条是浏览器/宿主画的，不属于插件的视觉契约 ⇒ 收边界避开它。
+  '03-settings-studio': [340, 1280],
 }
 const DEFAULT_X = [0, 282]
 
@@ -385,14 +390,39 @@ async function restoreRotation(before, log) {
   const merged = { ...(now && typeof now === 'object' ? now : want), autoOn: true }
   if (Number.isFinite(want.autoMin)) merged.autoMin = want.autoMin
   for (const k of Object.keys(want)) if (!(k in merged)) merged[k] = want[k] // 兜底：任何丢掉的字段补回来
+
+  // ⚠️ **只写磁盘是不够的** —— 这是本脚本一个真实的缺陷（审核方复现指出）：
+  //   客户端的内存 state 里 autoOn 仍是 false，而它在**任何**状态变更时都会把整个内存
+  //   state 整份 PUT 写回（client.js 的 STORE.save → flushSave）。于是我们这次"还原"
+  //   会在用户下一次点任何开关时被内存里的 false 覆盖掉。
+  //   实测证据：跑完若干次 oracle 之后，磁盘上 autoOn=False（而本文档与提交信息都写了
+  //   "已还原为 true"）—— 那个说法是错的，特此更正。
+  // 正确做法：写盘**之后**再刷新页面，让客户端重新 load 一次、把内存也变成 true。
+  // 这样内存与磁盘一致，后续任何写回都不会再把 autoOn 变回 false。
   const r = await readState(`(async()=>{
     const res = await fetch('/bga/settings.json', {
       method:'PUT', headers:{'content-type':'application/json'},
       body: ${JSON.stringify(JSON.stringify(merged))},
     });
-    return res.ok ? 'autoOn=true 已还原（字段 ' + ${Object.keys(merged).length} + ' 个）' : 'PUT failed ' + res.status;
+    return res.ok ? 'autoOn=true 已写盘（字段 ' + ${Object.keys(merged).length} + ' 个）' : 'PUT failed ' + res.status;
   })()`)
-  if (log) console.log('     轮播已还原: ' + r)
+  if (log) console.log('     轮播还原·写盘: ' + r)
+
+  // 刷新让客户端内存同步；随后回读确认磁盘也仍是 true（防止刷新过程中又被写回 false）
+  await sleep(300)
+  try { await cdp.send('Page.reload', { ignoreCache: false }) } catch { /* 用 navigate 兜底 */ }
+  await sleep(3500)
+  const verifyRaw = await readState(`(async()=>{const x=await fetch('/bga/settings.json',{cache:'no-store'});return await x.text()})()`).catch(() => null)
+  let v = null
+  try { v = JSON.parse(verifyRaw) } catch { v = null }
+  const restored = !!(v && v.autoOn === true)
+  if (log) console.log('     轮播还原·回读: autoOn=' + (v ? v.autoOn : '读不到') + (restored ? ' ✅' : ' ❌ 仍未还原'))
+  if (!restored) {
+    // 不静默放过：还原失败意味着"用户的轮播被我们关掉了"，必须让人看见
+    console.error('     ⚠️ 轮播未能还原（autoOn 仍不是 true）—— 请手动检查 ' +
+      '$DSH_HOME/dsh-bg-atelier-plus/settings.json 的 autoOn，或重新跑一次本脚本')
+  }
+  return restored
 }
 
 /**
@@ -441,22 +471,32 @@ async function prepareState(s, log) {
   // **等图片真的解码完**，而不是靠固定时长赌。
   // 实测踩到：页面刚重载（冷缓存）时，设置页里的底图预览要现解一张几 MB 的图，
   // 6 秒都不一定够 —— 表现为"重载后第一次 run 必挂 03、之后再跑就过"（4.209% 差异，
-  // 差异全在面板头部的预览图上，文字一字不差）。固定时长永远只是赌，改成等条件。
-  await waitImagesReady(log)
+  // 差异全在面板头部的预览图上、文字一字不差）。固定时长永远只是赌，改成等条件。
+  //
+  // ⚠️ 返回值**必须检查**：原来这里直接忽略，于是等超时/底图加载失败时照样截图，
+  // 把未完成的画面录成基准（审核方复现指出）。现在把结果交给调用方决定。
+  const ready = await waitImagesReady(log)
+  return { imagesReady: ready }
 }
 
 /**
- * 等「画面上真正会看到的那几张图」解码完。
+ * 等「画面上真正会看到的那几张图」解码完，**并且底图确实加载成功**。
  *
  * ⚠️ 不能等 `document.images` 全部就绪：设置页的图库网格有 **300+ 张缩略图**，
  * 实测 316 张里 288 张是懒加载/屏外的（它们永远不会在我们截图时解码完）。
- * 等全部就会一直等到超时，等于没等。
- * 所以只等**在视口内可见**且 complete=false 的图 —— 那才是会进画面的。
- * 底图本身是 body::before 的 background-image，另用一幅隐藏 Image() 探它的解码状态。
+ * 等全部就会一直等到超时，等于没等。所以只等**在视口内可见**的。
+ *
+ * ⚠️ 本函数修过两个**会放过失败**的缺陷（审核方复现指出）：
+ *   ① 底图加载 **error** 原来也被判"就绪"（只排除了 `timeout`）⇒ 一张根本没出来的底图
+ *      会被当成"准备好"，把坏画面录成基准。现在 **error 一律算未就绪**。
+ *   ② 原来的判断只看 `pending===0`：如果预览 `<img>` 还没被插进 DOM（React 尚未渲染完），
+ *      pending 天然是 0 ⇒ 立刻"就绪"，于是冷缓存下会拍到没有预览图的画面。
+ *      现在额外要求**关键图（.bga-hero-image 或面板里的大图）确实 complete**。
+ *
+ * 返回 true/false，**调用方必须检查** —— 原来调用方直接忽略返回值继续截图（见下）。
  */
-async function waitImagesReady(log, waitMs = 25000) {
+async function waitImagesReady(log, waitMs = 30000) {
   const t0 = Date.now()
-  let last = null
   for (;;) {
     const r = await readState(`(async()=>{
       const seen=(el)=>{const b=el.getBoundingClientRect();
@@ -464,45 +504,81 @@ async function waitImagesReady(log, waitMs = 25000) {
       const vis=[...document.images].filter(i=>{const s=getComputedStyle(i);
         return s.display!=='none' && s.visibility!=='hidden' && seen(i)});
       const pending=vis.filter(i=>!i.complete||i.naturalWidth===0);
-      // 底图：body::before 的 background-image。用一幅探针 Image 查它解码了没有
+      const broken=vis.filter(i=>i.complete && i.naturalWidth===0);   // 已加载但失败（坏图）
+      // 关键图：设置页里的底图预览。它没就绪就不能算稳定。
+      const hero=document.querySelector('.bga-hero-image');
+      const heroState = hero ? (hero.complete ? (hero.naturalWidth>0 ? 'ready' : 'error') : 'loading') : 'absent';
+      // 底图：body::before 的 background-image。**不能用 new Image() 查**：
+      //   实测踩到 —— 用 plain URL 建 Image() 会命中一条**失效的缓存记录**，
+      //   立刻 complete 但 naturalWidth=0，被误判成"底图加载失败"，
+      //   于是所有状态都被判"未就绪"、整轮 oracle 全跳过。
+      //   同一 URL 加随机参数绕开缓存后 onload nw=9744；直接 fetch 是 HTTP 200 / 59MB；
+      //   createImageBitmap 解出 9744×4500 ⇒ **图本身完全正常，是探测方法不对**。
+      // 正确做法：fetch（no-store）拿字节 + createImageBitmap 真正解码一次。
+      //   这才叫"图片就绪"——它同时验证了传输与解码，而不是只看一个缓存标志。
       let bg='unknown';
       const m=(getComputedStyle(document.body,'::before').backgroundImage||'').match(/url\\("([^"]+)"\\)/);
       if(m){
-        bg = await new Promise(res=>{const im=new Image();
-          if(im.complete&&im.naturalWidth>0){res('ready');return}
-          im.onload=()=>res('ready'); im.onerror=()=>res('error'); im.src=m[1];
-          setTimeout(()=>res('timeout'),8000)})
+        bg = await (async()=>{
+          try {
+            const resp = await fetch(m[1], { cache:'no-store' });
+            if (!resp.ok) return 'http-'+resp.status;
+            const blob = await resp.blob();
+            const bm = await createImageBitmap(blob);
+            const ok = bm.width>0 && bm.height>0;
+            if (bm.close) bm.close();
+            return ok ? 'ready' : 'zero-size';
+          } catch(e) { return 'error:' + String(e && e.name || e).slice(0,30) }
+        })();
       }
-      return JSON.stringify({pending:pending.length, visible:vis.length, bg});
+      return JSON.stringify({pending:pending.length, broken:broken.length, visible:vis.length, bg, heroState});
     })()`)
     let v = null
     try { v = JSON.parse(r) } catch { v = null }
-    last = v
-    if (!v) { if (log) console.log('     图片就绪: 读不到（按就绪处理）'); return true }
-    if (v.pending === 0 && v.bg !== 'timeout') {
-      if (log) console.log('     图片就绪: 可见 ' + v.visible + ' 张全解码，底图 ' + v.bg + '（' + (Date.now() - t0) + 'ms）')
-      return true
+    // 读不到就**不算就绪**（原来"按就绪处理"是放过失败）——继续等，等超时由调用方处理
+    if (v) {
+      const allGood = v.pending === 0
+        && v.broken === 0
+        && v.bg === 'ready'
+        && (v.heroState === 'ready' || v.heroState === 'absent')   // absent = 该状态本就没有预览图
+      if (allGood) {
+        if (log) console.log('     图片就绪: 可见 ' + v.visible + ' 张全解码，底图 ready，预览图 ' + v.heroState + '（' + (Date.now() - t0) + 'ms）')
+        return true
+      }
+      if (String(v.bg).startsWith('error') || String(v.bg).startsWith('http-') || v.bg === 'zero-size' || v.heroState === 'error' || v.broken > 0) {
+        // 明确的加载失败：再等也不会好，立刻报出来（不要静默截一张坏画面）
+        console.log('     ❌ 图片加载失败：底图=' + v.bg + ' 预览图=' + v.heroState + ' 坏图=' + v.broken + ' —— 画面不完整，本次不该当基准')
+        return false
+      }
     }
     if (Date.now() - t0 > waitMs) {
-      if (log) console.log('     ⚠️ 等图超时：可见区还有 ' + v.pending + ' 张没解码、底图 ' + v.bg + '（' + (Date.now() - t0) + 'ms）')
+      console.log('     ⚠️ 等图超时（' + (Date.now() - t0) + 'ms）：' + (v
+        ? '可见区待解码 ' + v.pending + ' 张、底图 ' + v.bg + '、预览图 ' + v.heroState
+        : '读不到状态'))
       return false
     }
     await sleep(300)
   }
 }
 if (mode === 'capture') {
-  // 冻结轮播 + 钉住当前这张图（结束后还原；异常也要还原，所以放 try/finally）
-  const frozen = await freezeRotation(true)
-  const autoBefore = frozen ? frozen.raw : null
-  // 录制时以"页面当下正在显示的那张"为准，钉住它，并把 wallpaper 记进 manifest ——
-  // 之后 compare 就按这个值钉回去，与轮播是否跑过无关。
-  const wallpaperNow = frozen && frozen.before ? frozen.before.wallpaper : null
-  if (wallpaperNow) await pinWallpaper(wallpaperNow, true)
-  await resetToCleanHome(true)  // 上一轮 run 可能留下开着面板
+  // ⚠️ 冻结/钉图/复位**必须包进 try/finally 里**：
+  //   原来这三步写在 `try {` 之前，于是它们自己抛错时 finally 不会执行 ⇒
+  //   **轮播永远停留在被关闭的状态**（用户的设置被我们改坏）。
+  //   审核方复现指出过这一点；现在把它们移进来，并让 autoBefore 先声明再赋值。
+  let autoBefore = null
+  let restored = false
   try {
-  const manifest = {
-    dir, capturedAt: new Date().toISOString(), url: cdp.url,
-    // 记下"比的是哪一块"：裁剪比例不藏在代码里，改比对口径必须重录基准
+    // 冻结轮播 + 钉住当前这张图（结束后还原；异常也要还原，所以放 try/finally）
+    const frozen = await freezeRotation(true)
+    autoBefore = frozen ? frozen.raw : null
+    // 录制时以"页面当下正在显示的那张"为准，钉住它，并把 wallpaper 记进 manifest ——
+    // 之后 compare 就按这个值钉回去，与轮播是否跑过无关。
+    const wallpaperNow = frozen && frozen.before ? frozen.before.wallpaper : null
+    if (wallpaperNow) await pinWallpaper(wallpaperNow, true)
+    await resetToCleanHome(true)  // 上一轮 run 可能留下开着面板
+    const manifest = {
+      dir, capturedAt: new Date().toISOString(), url: cdp.url,
+      // 记下"比的是哪一块"：裁剪比例不藏在代码里，改比对口径必须重录基准
     comparison: { stableKeepRatio: STABLE_KEEP_RATIO, stableXByState: STABLE_X_BY_STATE, note: '每状态只比它自己那块（视口上方 ' + (STABLE_KEEP_RATIO * 100) + '% 且按状态竖切）；底部实时计数、装饰粒子、会话正文都不参与' },
     // 钉住的底图（compare 时按它钉回去，保证比的是同一张）
     pinnedWallpaper: wallpaperNow,
@@ -510,7 +586,13 @@ if (mode === 'capture') {
     states: [],
   }
   for (const s of STATES) {
-    await prepareState(s, true)
+    // 图片没就绪就不录 —— 录下去等于把未完成的画面当基准（审核方指出的缺陷）
+    const prep = await prepareState(s, true)
+    if (prep && prep.imagesReady === false) {
+      console.error('  ✗ ' + s.name + ' 图片未就绪，拒绝录基准（避免把不完整画面固化）。检查网络/底图文件后重跑。')
+      process.exitCode = 4
+      throw new Error('图片未就绪：' + s.name)
+    }
     const probeValue = await readState(s.probe)
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
     const file = path.join(baseDir, s.name + '.png')
@@ -531,22 +613,34 @@ if (mode === 'capture') {
   // 只关轮播是不够的：录制之后轮播可能已经换过图，那"现在这张"与基准那张就不是同一张 ——
   // 实测连踩三次（洁西卡金蜜 → 重返未来1999 → 百夫长），探针里能直接看到 url 不同。
   // 钉回去之后，比的就一定是同一张图上的差异，那才是绘制核心的回归。
-  const frozen = await freezeRotation(true)
-  const autoBefore = frozen ? frozen.raw : null
-  if (manifest.pinnedWallpaper) await pinWallpaper(manifest.pinnedWallpaper, true)
-  else console.log('   ⚠️ 基准里没有 pinnedWallpaper（旧基准？）—— 只能冻结轮播，可能被换图干扰')
-  // **必须**在开始逐个状态之前先复位。03 状态会主动打开设置面板且不会自己关，
-  // 而 DSH 还会把"面板开着"这个状态跨刷新保留 —— 于是下一次 run 的 01 状态直接拍到
-  // 面板开着的样子，与"干净首页"的基准差 93%。看起来像严重回归，其实只是状态没复位。
-  await resetToCleanHome(true)
-  let same = 0, diff = 0, missing = 0
+  //
+  // ⚠️ 同 capture：冻结/钉图/复位都必须在 try 内，否则它们抛错时 finally 不执行，
+  //    轮播会停留在被关闭的状态（用户设置被改坏）。
+  let autoBefore = null
+  let same = 0, diff = 0, missing = 0, notReady = 0
   const probeDiffs = []
   try {
+    const frozen = await freezeRotation(true)
+    autoBefore = frozen ? frozen.raw : null
+    if (manifest.pinnedWallpaper) await pinWallpaper(manifest.pinnedWallpaper, true)
+    else console.log('   ⚠️ 基准里没有 pinnedWallpaper（旧基准？）—— 只能冻结轮播，可能被换图干扰')
+    // **必须**在开始逐个状态之前先复位。03 状态会主动打开设置面板且不会自己关，
+    // 而 DSH 还会把"面板开着"这个状态跨刷新保留 —— 于是下一次 run 的 01 状态直接拍到
+    // 面板开着的样子，与"干净首页"的基准差 93%。看起来像严重回归，其实只是状态没复位。
+    await resetToCleanHome(true)
   for (const s of manifest.states) {
     const baseFile = path.join(baseDir, s.file)
     const state = STATES.find((x) => x.name === s.name)
-    if (state) await prepareState(state, false)
+    let prep = null
+    if (state) prep = await prepareState(state, false)
     else await sleep(2000)
+    // 图片没就绪 ⇒ **本次比对不算数**，记为"就绪失败"而不是"有回归"。
+    // 两者必须分开：混在一起会把"图没加载完"误报成视觉回归（审核方指出的缺陷）。
+    if (prep && prep.imagesReady === false) {
+      notReady++
+      console.log('  ⚠️  ' + s.name + '  图片未就绪，本次跳过（不算回归，也不算通过）')
+      continue
+    }
     const probeNow = await readState(state ? state.probe : 'null')
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
     const nowFile = path.join(baseDir, s.name + '.after.png')
@@ -569,9 +663,15 @@ if (mode === 'capture') {
     console.log('\n状态探针差异（比像素更早说明问题）：')
     for (const p of probeDiffs) { console.log('  · ' + p.name); console.log('      基准: ' + String(p.before).slice(0, 150)); console.log('      现在: ' + String(p.after).slice(0, 150)) }
   }
-  console.log('\n视觉回归：' + same + ' 一致 / ' + diff + ' 有差异 / ' + missing + ' 尺寸不符')
-  const okAll = diff === 0 && missing === 0 && probeDiffs.length === 0
-  console.log(okAll ? '✓ 视觉无回归' : '✗ 有差异 —— 逐张看 *.after.png')
+  console.log('\n视觉回归：' + same + ' 一致 / ' + diff + ' 有差异 / ' + missing + ' 尺寸不符'
+    + (notReady ? ' / ' + notReady + ' 未就绪跳过' : ''))
+  // 「未就绪」也**不算通过** —— 不能让"图没加载完"悄悄变成绿灯（审核方指出的缺陷）
+  const okAll = diff === 0 && missing === 0 && probeDiffs.length === 0 && notReady === 0
+  console.log(okAll
+    ? '✓ 视觉无回归'
+    : (notReady && diff === 0
+      ? '✗ 有状态未就绪（图未加载完）—— 重跑一次通常就好；持续出现请查底图文件与网络'
+      : '✗ 有差异 —— 逐张看 *.after.png'))
   // 不在这里 process.exit：finally 里的还原必须先跑完。
   // 退出码放到 finally 之后统一设置（原来在 try 里直接 exit 会让还原被跳过）。
   exitCode = okAll ? 0 : 1
