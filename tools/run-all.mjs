@@ -38,6 +38,9 @@ const SUITES = [
   'tools/verify-background-lifecycle.mjs',
   // 迁移脚本 tools/settings.mjs 的校验口径：间隔档位吸附（那张 14 档表是 client.js AUTO_STOPS 的副本，
   // 两处各写一遍就得有人盯着）+ v1.11.0 两个新字段的默认值/钳制 + 老设置文件兼容。
+  // WeSource 异步语义：六场景（乱序/切源/销毁/失败重试/连发/冷热启动）+ 两条 abort 竞态。
+  // 做过**变异测试**：删掉 then 分支的 aborted 保护后本套件会失败 —— 证明它测的是真代码。
+  'tools/verify-we-source-async.mjs',
   'tools/verify-settings.mjs',
   'tools/test-playlists.mjs',
   // 底图去重（贝利尔两对：同内容两个名字 → 硬链接）。离线自足：清单校验那几项在 CI 照跑，
@@ -52,6 +55,8 @@ const EXCLUDED = [
   ['tools/fetch-wallpapers.mjs --check', '只读校验本机原图，不联网；依赖已下载的底图，图片不进 git，因此不在 CI 运行'],
   ['tools/test-served-bytes.mjs', '要 wallpapers/ 里的真实图片才能起供图路由断言（离线跑本机复现退出码 1：没有 wallpapers/）'],
   ['tools/make-release.mjs --dry-run', '唯一不上传的分支也要**联网**查 Release 资产表 ⇒ CI（尤其 GitHub Actions 自带 GITHUB_TOKEN 时）不该顺手打外网 API；发布机上手动跑'],
+  ['tools/audit-oracle-coverage.mjs', 'oracle 覆盖边界审计：需要 baselines/<名称>/ 里的基准图（图不入库）⇒ CI 里没有基准；本机跑 `node tools/audit-oracle-coverage.mjs [基准名]`'],
+  ['tools/visual-baseline.mjs', '视觉 oracle：需要 GUI 在 127.0.0.1:19387 跑着 + 已连接的浏览器（走 CDP）⇒ 不是纯离线测试，本机手动跑 capture/compare'],
 ]
 
 const ENV = {}
