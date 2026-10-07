@@ -31,7 +31,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { decodePng, encodePng, comparePngEither } from '../../dsh-browser-live/pixdiff.js'
+import { decodePng, encodePng, resizePixels, comparePngEither } from '../../dsh-browser-live/pixdiff.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const OUT_ROOT = path.resolve(HERE, '..', 'baselines')
@@ -173,11 +173,21 @@ console.log('  已连上: ' + cdp.url)
  * 与其让它以一个看不懂的超时崩，不如开工前先探一下并给出明确修法。
  */
 async function preflightPageFetch() {
-  return await readState(`(async()=>{
-    const c=new AbortController(); setTimeout(()=>c.abort(),5000);
-    try { const r=await fetch('/bga/settings.json',{cache:'no-store',signal:c.signal}); return 'ok:'+r.status }
-    catch(e){ return 'err:'+e.name }
-  })()`)
+  // ⚠️ 必须用**短超时且容忍超时**，不能走普通 readState（它 30s 才放弃）。
+  // 实测：坏状态下页面里 `await fetch(...)` 连表达式自带的 AbortController 都不生效
+  // （请求把事件循环一起卡住），preflight 自己会挂满 30s 才崩 —— 那就完全没起到
+  // "早点明确报错" 的作用。所以这里自带超时，超时即判通道不可用。
+  const r = await cdp.send('Runtime.evaluate', {
+    expression: `(async()=>{
+      const c=new AbortController(); setTimeout(()=>c.abort(),4000);
+      try { const x=await fetch('/bga/settings.json',{cache:'no-store',signal:c.signal}); return 'ok:'+x.status }
+      catch(e){ return 'err:'+e.name }
+    })()`,
+    returnByValue: true, awaitPromise: true,
+  }, 9000).catch((e) => ({ __timeout: true, message: String(e && e.message) }))
+  if (r.__timeout) return 'timeout(页面 fetch 卡住，9s 未返回)'
+  if (r && r.exceptionDetails) return 'exception:' + String(r.exceptionDetails.exception && r.exceptionDetails.exception.description || '').slice(0, 60)
+  return r && r.result ? r.result.value : 'no-value'
 }
 
 /**
@@ -249,6 +259,46 @@ function cropStable(img, stateName) {
 /** 读 PNG → 裁稳定区。比对一律走这里，避免有的地方漏裁。 */
 function stableFrom(file, stateName) {
   return cropStable(decodePng(fs.readFileSync(file)), stateName)
+}
+
+/**
+ * 跨 DPI 比对：**先把两张图归一到同一尺度，再各自裁剪**，最后逐像素比。
+ *
+ * 为什么不能沿用"各自裁剪 → 交给 comparePngEither 归一"：
+ * 那条路径会**误报**。实测同一张图，基准按 1.0x、当前按 1.25x：
+ *   各自裁剪得 282×724 与 353×904（宽高比 0.38950 vs 0.39049，已经不同了），
+ *   再交给归一化 ⇒ 报 **70.81% 差异、maxΔ=88**，而两张图内容**完全一样**。
+ * 根因是 resizePixels 的采样式 `sx=(x+0.5)*xRatio-0.5` 对两条路径给出不同相位
+ * （0.799 vs 0.800，差 0.3 像素），加上宽高各自 round 造成的比例漂移，
+ * 在壁纸纹理这类高频区域就是几十级色差。
+ *
+ * 修法：**统一在"归一后"的尺度上裁剪**。两张图先缩放到同一个规范尺寸（取较大者），
+ * 然后才按状态裁区域。这样两边经历**完全相同的一次重采样 + 完全相同的裁剪**，
+ * 唯一变量只剩内容本身。同尺寸时退回"各自裁剪后精确比"，不做多余的重采样。
+ */
+function compareStable(baseFile, nowFile, stateName) {
+  const rawA = decodePng(fs.readFileSync(baseFile))
+  const rawB = decodePng(fs.readFileSync(nowFile))
+  if (rawA.width === rawB.width && rawA.height === rawB.height) {
+    // 同机同窗口（绝大多数情况）：精确比，不归一、不重采样
+    const cmp = comparePngEither(
+      encodePng(cropStable(rawA, stateName)), encodePng(cropStable(rawB, stateName)),
+      { allowScale: false, tolerance: 0, maxDiffRatio: 0 })
+    return { ...cmp, resampled: false }
+  }
+  // 尺寸不同（跨 DPI/跨窗口）：先归一到同一尺度，再裁
+  const W = Math.max(rawA.width, rawB.width)
+  const H = Math.max(rawA.height, rawB.height)
+  const upA = resizePixels(rawA, W, H)
+  const upB = resizePixels(rawB, W, H)
+  const cmp = comparePngEither(
+    encodePng(cropStable(upA, stateName)), encodePng(cropStable(upB, stateName)),
+    { allowScale: false, tolerance: 0, maxDiffRatio: 0 })
+  return {
+    ...cmp, resampled: true,
+    normalizedTo: { width: W, height: H },
+    sizedFrom: { a: { width: rawA.width, height: rawA.height }, b: { width: rawB.width, height: rawB.height } },
+  }
 }
 
 /** 关掉 dsh-browser-live 的观察窗（它实时镜像页面，是不确定性的主源）。 */
@@ -503,9 +553,8 @@ if (mode === 'capture') {
     fs.writeFileSync(nowFile, Buffer.from(shot.data, 'base64'))
     // 裁稳定区 →（尺寸不同时）跨 DPI 归一 → 逐像素比。
     // 注意：裁的是**解码后**的像素，不是文件；encodePng 只用于写差异图。
-    const cmp = comparePngEither(
-      encodePng(stableFrom(baseFile, s.name)), encodePng(stableFrom(nowFile, s.name)),
-      { allowScale: true, tolerance: 0, maxDiffRatio: 0 })
+    const cmp = compareStable(baseFile, nowFile, s.name)
+
     const probeSame = String(probeNow) === String(s.probe)
     if (!probeSame) probeDiffs.push({ name: s.name, before: s.probe, after: probeNow })
     if (cmp.same && probeSame) { same++; console.log('  ✅ ' + s.name + '  像素与状态都一致' + (cmp.scaled ? '（已归一尺寸）' : '')) }
