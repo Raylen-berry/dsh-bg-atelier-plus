@@ -218,13 +218,18 @@ export const STABLE_KEEP_RATIO = Number(process.env.VB_STABLE_RATIO || 0.80)
  *   · 静态底图/特效那两屏：插件画的是左侧栏那条（orb + 主题染色），会话区在实时变必须排除；
  *   · 设置页那屏：插件画的正是**中间的设置面板**，反而要排除左侧栏与会话正文。
  * 一刀切会把 03 状态整屏裁没（面板 x≈370–1290 落在会话区里），那是把 oracle 弄瞎。
+ *
+ * 01/02 右边界取 **282 而不是 300**：侧边栏 x283–300 那一列是宿主会话列表右侧的
+ * "X天/X小时前"标签。跨天之后再跑就会从"2天"变"3天" —— 实测隔了一天之后，01/02 稳定报
+ * 35 像素差异（0.016%，位置正是那几个数字字形），天天误报且与插件无关。
+ * 收窄到 282 后归零；底图插件真正画的东西（左侧 orb 与整条主题染色）仍在范围内。
  */
 export const STABLE_X_BY_STATE = {
-  '01-static-wallpaper': [0, 300],
-  '02-fx-nodes': [0, 300],
+  '01-static-wallpaper': [0, 282],
+  '02-fx-nodes': [0, 282],
   '03-settings-studio': [340, 1300],
 }
-const DEFAULT_X = [0, 300]
+const DEFAULT_X = [0, 282]
 
 function cropStable(img, stateName) {
   const keep = Math.max(1, Math.floor(img.height * STABLE_KEEP_RATIO))

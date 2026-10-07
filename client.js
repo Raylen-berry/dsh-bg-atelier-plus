@@ -2304,6 +2304,65 @@ function weMediaUrl(entry, rel) {
 // scene 类的高清静态图（host 侧解 scene.pkg 合成，见 we/still.js）
 function weStillUrl(id) { return weUrl('/still/') + encodeURIComponent(id) + '.webp' }
 
+// ---------------------------------------------------------------- WE 库数据来源层
+// 库浏览要的两个接口（库清单 + 桥状态）原先内联在 WeSection 的 load() 里，另一处
+// weRestore 又自己 fetch 了一遍 library.json。抽成一层有两个好处：
+//   ① 将来把库浏览 UI 整体搬到独立插件时，这层可以直接换成"调新插件的 API"，UI 不用动；
+//   ② abort/竞态处理只有一份 —— 现在 WeSection 里那套 AbortController + requests 簿记，
+//      和 weRestore 里裸 fetch 的写法是两套，容易漏。
+// 只做**数据**，不碰渲染；实时消费链路（weStartNative/getDisplayMedia）完全不经这里。
+var WeSource = (function () {
+  var inflight = {}   // kind -> AbortController：后一次请求取消前一次，防竞态覆盖
+  function abort(kind) {
+    if (inflight[kind]) { try { inflight[kind].abort() } catch (e) { /* noop */ } inflight[kind] = null }
+  }
+  function abortAll() { for (var k in inflight) abort(k) }
+
+  /** 取库清单。force=true 让 host 跳过缓存重扫。返回 {ok, entries, weFound, error}。 */
+  function library(force, signal) {
+    abort('library')
+    var ctl = new AbortController()
+    inflight['library'] = ctl
+    if (signal) signal.addEventListener('abort', function () { try { ctl.abort() } catch (e) { /* noop */ } })
+    return fetch(weUrl('/library.json') + (force ? '?force=1' : ''), { cache: 'no-store', signal: ctl.signal })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status)
+        return r.json()
+      })
+      .then(function (d) {
+        if (ctl.signal.aborted) return { ok: false, aborted: true }
+        return { ok: true, entries: d.entries || [], weFound: !!d.weFound }
+      })
+      .catch(function (e) {
+        if (ctl.signal.aborted) return { ok: false, aborted: true }
+        return { ok: false, error: String((e && e.message) || e) }
+      })
+  }
+
+  /** 取桥状态（原生桥是否可用/在跑）。 */
+  function status(force, signal) {
+    abort('status')
+    var ctl = new AbortController()
+    inflight['status'] = ctl
+    if (signal) signal.addEventListener('abort', function () { try { ctl.abort() } catch (e) { /* noop */ } })
+    return fetch(weUrl('/status') + (force ? '?force=1' : ''), { cache: 'no-store', signal: ctl.signal })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status)
+        return r.json()
+      })
+      .then(function (d) {
+        if (ctl.signal.aborted) return { ok: false, aborted: true }
+        return { ok: true, bridge: d.bridge }
+      })
+      .catch(function (e) {
+        if (ctl.signal.aborted) return { ok: false, aborted: true }
+        return { ok: false, error: String((e && e.message) || e) }
+      })
+  }
+
+  return { library: library, status: status, abort: abort, abortAll: abortAll }
+})()
+
 // 先铺 192px 的 preview.gif（秒出），同时让 host 去解包出高清静态图，好了再换上去。
 // 解包一次约 5s，不值得让用户对着空白等，也不该阻塞请求。
 var WE_NOTICES = new Map()
@@ -2603,10 +2662,12 @@ function weRestore() {
   if (weActive()) return
   var id = STORE.state.weId
   if (!id) return
-  fetch(weUrl('/library.json'), { cache: 'no-store' })
-    .then(function (r) { return r.ok ? r.json() : {} })
-    .then(function (d) {
-      var hit = (d.entries || []).filter(function (e) { return e.id === id })[0]
+  // 走 WeSource 而不是自己再 fetch 一遍：库清单的取法只该有一份。
+  // 注意**不 abort 共享请求**：这条是启动时的独立读，与设置页那次无竞争关系。
+  WeSource.library(false)
+    .then(function (result) {
+      if (!result.ok) return   // host 路由没就绪: 下次启动再说
+      var hit = (result.entries || []).filter(function (e) { return e.id === id })[0]
       if (hit && STORE.state.weId === id && !hasWeVisual()) weShow(hit)
     })
     .catch(function () { /* host 路由没就绪: 下次启动再说 */ })
@@ -2746,24 +2807,23 @@ function WePlaybackControls(props) {
 function WeSection() {
   var stPair = React.useState({ loading: true, entries: [], weFound: false, bridge: null, error: '' })
   var st = stPair[0], setState = stPair[1], active = React.useRef(false)
-  var requests = React.useRef({ library: null, status: null })
+  // （原来这里有个 requests ref 自己管 AbortController，已交给 WeSource —— 请求簿记不再有两套）
   var selPair = React.useState(STORE.state.weId || null), selId = selPair[0], setSelId = selPair[1]
   var searchPair = React.useState(''), query = searchPair[0], setQuery = searchPair[1]
   var typePair = React.useState('all'), type = typePair[0], setType = typePair[1]
   function patch(values) { if (active.current) setState(function (previous) { return Object.assign({}, previous, values) }) }
   // Independent status/library requests cannot overwrite each other or a newer refresh.
+  // 取数走 WeSource（见上方注释）：这里只管"拿到结果后怎么进 state"，不管怎么发请求。
   async function load(kind, force) {
-    if (requests.current[kind]) requests.current[kind].abort()
-    var controller = new AbortController(); requests.current[kind] = controller
     if (kind === 'library') patch({ loading: true, error: '' })
-    try {
-      var response = await fetch(weUrl('/') + (kind === 'library' ? 'library.json' : 'status') + (force ? '?force=1' : ''), { cache: 'no-store', signal: controller.signal })
-      if (!response.ok) throw new Error('HTTP ' + response.status)
-      var result = await response.json()
-      if (controller.signal.aborted) return
-      patch(kind === 'library' ? { loading: false, entries: result.entries || [], weFound: !!result.weFound, error: '' } : { bridge: result.bridge })
-    } catch (e) {
-      if (!controller.signal.aborted) patch(kind === 'library' ? { loading: false, error: '扫描失败：' + String(e.message || e) } : { bridge: { running: null } })
+    var result = kind === 'library' ? await WeSource.library(force) : await WeSource.status(force)
+    if (result.aborted) return
+    if (kind === 'library') {
+      patch(result.ok
+        ? { loading: false, entries: result.entries, weFound: result.weFound, error: '' }
+        : { loading: false, error: '扫描失败：' + result.error })
+    } else {
+      patch({ bridge: result.ok ? result.bridge : { running: null } })
     }
   }
   function refresh(force) { load('status', force); load('library', force) }
@@ -2773,7 +2833,8 @@ function WeSection() {
     WE_WATCHERS.push(update)
     return function () {
       active.current = false
-      Object.keys(requests.current).forEach(function (key) { if (requests.current[key]) requests.current[key].abort() })
+      // 取消在飞的请求改由 WeSource 统一管（原来这里自己遍历 requests ref，与 fetch 那侧两套簿记）
+      WeSource.abortAll()
       var i = WE_WATCHERS.indexOf(update); if (i >= 0) WE_WATCHERS.splice(i, 1)
     }
   }, [])
