@@ -222,111 +222,20 @@ async function readState(expr) {
  * 换句话说：**只看插件自己画的那一条**。会话内容是宿主的、且天然在变，把它算进"视觉回归"
  * 只会制造假警报 —— 实测就是这样把一次"其实完全没变"的切换报成了 5%。
  */
-export const STABLE_KEEP_RATIO = Number(process.env.VB_STABLE_RATIO || 0.80)
-/**
- * 每个通道允许的抖动（默认 0 = 逐字节相同）。
- *
- * ⚠️ 这是**唯一一条容差**，来历必须写清楚（审核方反对"放宽容差掩盖差异"，这里不是掩盖）：
- *
- * 把滚动条排除掉之后，03 状态仍会稳定报约 11794 像素差异。逐像素分档后发现：
- *   Δ1-2: 11313    Δ3-5: 481    Δ>5: **0**
- * 也就是说**没有任何一个像素变化超过 5 级**。这不是"内容变了"，而是同一内容被渲染两次时
- * 文字/边框的抗锯齿边缘差几级 —— 人眼看不出，也不是插件的绘制逻辑差异。
- *
- * 为什么不用"差异像素比例"当容差（那才是掩盖）：比例型容差会**放过一大片同时变了 1 级的
- * 像素**，也可能放过"整块颜色变了但只差 1 级"的情况。而按**每通道幅度**限制在 5 级以内，
- * 意味着任何超过 5 级的实质变化仍然 100% 会被抓到。
- *
- * 可复核：把 VB_TOLERANCE 设为 0 可回到严格逐字节比对（此时 03 会因抗锯齿抖动报差异）。
- * 阈值 5 的依据：实测 Δ>5 的像素数为 0（两侧都有余量），且远低于肉眼可辨的约 10+ 级。
- */
-export const PIXEL_TOLERANCE = Number(process.env.VB_TOLERANCE || 5)
-/**
- * 每个状态比哪一块 —— **不能一刀切**：
- *   · 静态底图/特效那两屏：插件画的是左侧栏那条（orb + 主题染色），会话区在实时变必须排除；
- *   · 设置页那屏：插件画的正是**中间的设置面板**，反而要排除左侧栏与会话正文。
- * 一刀切会把 03 状态整屏裁没（面板 x≈370–1290 落在会话区里），那是把 oracle 弄瞎。
- *
- * 01/02 右边界取 **282 而不是 300**：侧边栏 x283–300 那一列是宿主会话列表右侧的
- * "X天/X小时前"标签。跨天之后再跑就会从"2天"变"3天" —— 实测隔了一天之后，01/02 稳定报
- * 35 像素差异（0.016%，位置正是那几个数字字形），天天误报且与插件无关。
- * 收窄到 282 后归零；底图插件真正画的东西（左侧 orb 与整条主题染色）仍在范围内。
- */
-export const STABLE_X_BY_STATE = {
-  '01-static-wallpaper': [0, 282],
-  '02-fx-nodes': [0, 282],
-  // 右边界 **1280 而不是 1300**：x1294–1299 那几列是**设置面板的滚动条**。
-  // 实测：03 曾稳定报 11952 像素差异（1.720%），其中 Δ>10 的 78 个像素**全部**落在
-  // x1294–1299，颜色从亮灰 rgb(114,115,116) 变成暗色 rgb(16,20,20)——就是滚动条
-  // 出现/消失/位置微移造成的 ±98 级差；其余 11385 个是 Δ≤2 的亚像素抖动。
-  // 滚动条是浏览器/宿主画的，不属于插件的视觉契约 ⇒ 收边界避开它。
-  '03-settings-studio': [340, 1280],
-}
-const DEFAULT_X = [0, 282]
+// ---------------------------------------------------------------- 比对口径
+// 口径（裁剪范围 / 容差 / compareStable）已抽到 tools/oracle-compare.mjs ——
+// 原因是审计脚本 audit-oracle-coverage.mjs 也需要同一份口径，而本文件是可执行脚本
+// （顶层有 await，import 会直接跑起来）没法被复用，于是审计只能自己复制一份、
+// 结果两份实现漂移了（审核方指出：审计还是旧的"先裁后缩"顺序，11/11 没测到真实路径）。
+// 现在两边都 import 同一份，不再有第二份实现。
+import {
+  STABLE_KEEP_RATIO, STABLE_X_BY_STATE, compareStableFiles,
+} from './oracle-compare.mjs'
 
-function cropStable(img, stateName) {
-  const keep = Math.max(1, Math.floor(img.height * STABLE_KEEP_RATIO))
-  const range = STABLE_X_BY_STATE[stateName] || DEFAULT_X
-  // 视口尺寸可能因 DPI/窗口变化 ⇒ 竖切按比例换算（基准视口宽 1654），不写死像素
-  const scale = img.width / 1654
-  const x0 = Math.max(0, Math.min(img.width - 1, Math.round(range[0] * scale)))
-  const x1 = Math.max(x0 + 1, Math.min(img.width, Math.round(range[1] * scale)))
-  const w = x1 - x0
-  const out = Buffer.alloc(w * keep * 4)
-  for (let y = 0; y < keep; y++) {
-    img.data.copy(out, y * w * 4, (y * img.width + x0) * 4, (y * img.width + x0) * 4 + w * 4)
-  }
-  return { width: w, height: keep, channels: 4, data: out }
-}
-
-/** 读 PNG → 裁稳定区。比对一律走这里，避免有的地方漏裁。 */
-function stableFrom(file, stateName) {
-  return cropStable(decodePng(fs.readFileSync(file)), stateName)
-}
-
-/**
- * 跨 DPI 比对：**先把两张图归一到同一尺度，再各自裁剪**，最后逐像素比。
- *
- * 为什么不能沿用"各自裁剪 → 交给 comparePngEither 归一"：
- * 那条路径会**误报**。实测同一张图，基准按 1.0x、当前按 1.25x：
- *   各自裁剪得 282×724 与 353×904（宽高比 0.38950 vs 0.39049，已经不同了），
- *   再交给归一化 ⇒ 报 **70.81% 差异、maxΔ=88**，而两张图内容**完全一样**。
- * 根因是 resizePixels 的采样式 `sx=(x+0.5)*xRatio-0.5` 对两条路径给出不同相位
- * （0.799 vs 0.800，差 0.3 像素），加上宽高各自 round 造成的比例漂移，
- * 在壁纸纹理这类高频区域就是几十级色差。
- *
- * 修法：**统一在"归一后"的尺度上裁剪**。两张图先缩放到同一个规范尺寸（取较大者），
- * 然后才按状态裁区域。这样两边经历**完全相同的一次重采样 + 完全相同的裁剪**，
- * 唯一变量只剩内容本身。同尺寸时退回"各自裁剪后精确比"，不做多余的重采样。
- */
+// 本文件内部沿用旧名字，避免大改调用点
 function compareStable(baseFile, nowFile, stateName) {
-  const rawA = decodePng(fs.readFileSync(baseFile))
-  const rawB = decodePng(fs.readFileSync(nowFile))
-  // 容差只按**每通道幅度**（见 PIXEL_TOLERANCE 注释），maxDiffRatio 仍为 0：
-  // 不设"允许多少比例的像素不同"，因为那会放过一大片同时变化 1 级的像素。
-  const opts = { tolerance: PIXEL_TOLERANCE, maxDiffRatio: 0 }
-  if (rawA.width === rawB.width && rawA.height === rawB.height) {
-    // 同机同窗口（绝大多数情况）：精确比，不归一、不重采样
-    const cmp = comparePngEither(
-      encodePng(cropStable(rawA, stateName)), encodePng(cropStable(rawB, stateName)),
-      { ...opts, allowScale: false })
-    return { ...cmp, resampled: false, tolerance: PIXEL_TOLERANCE }
-  }
-  // 尺寸不同（跨 DPI/跨窗口）：先归一到同一尺度，再裁
-  const W = Math.max(rawA.width, rawB.width)
-  const H = Math.max(rawA.height, rawB.height)
-  const upA = resizePixels(rawA, W, H)
-  const upB = resizePixels(rawB, W, H)
-  const cmp = comparePngEither(
-    encodePng(cropStable(upA, stateName)), encodePng(cropStable(upB, stateName)),
-    { ...opts, allowScale: false })
-  return {
-    ...cmp, resampled: true, tolerance: PIXEL_TOLERANCE,
-    normalizedTo: { width: W, height: H },
-    sizedFrom: { a: { width: rawA.width, height: rawA.height }, b: { width: rawB.width, height: rawB.height } },
-  }
+  return compareStableFiles(baseFile, nowFile, stateName)
 }
-
 /** 关掉 dsh-browser-live 的观察窗（它实时镜像页面，是不确定性的主源）。 */
 async function closeObserver(log) {
   const r = await readState(`(()=>{

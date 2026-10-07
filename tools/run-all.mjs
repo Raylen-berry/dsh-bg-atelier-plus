@@ -55,6 +55,8 @@ const EXCLUDED = [
   ['tools/fetch-wallpapers.mjs --check', '只读校验本机原图，不联网；依赖已下载的底图，图片不进 git，因此不在 CI 运行'],
   ['tools/test-served-bytes.mjs', '要 wallpapers/ 里的真实图片才能起供图路由断言（离线跑本机复现退出码 1：没有 wallpapers/）'],
   ['tools/make-release.mjs --dry-run', '唯一不上传的分支也要**联网**查 Release 资产表 ⇒ CI（尤其 GitHub Actions 自带 GITHUB_TOKEN 时）不该顺手打外网 API；发布机上手动跑'],
+  // oracle-compare.mjs 是纯模块（只导出、不执行），不是套件，无需登记；它是 audit 与
+  // visual-baseline 共用的比对口径（原来两份实现漂移过，见该文件头部注释）。
   ['tools/audit-oracle-coverage.mjs', 'oracle 覆盖边界审计：需要 baselines/<名称>/ 里的基准图（图不入库）⇒ CI 里没有基准；本机跑 `node tools/audit-oracle-coverage.mjs [基准名]`'],
   ['tools/visual-baseline.mjs', '视觉 oracle：需要 GUI 在 127.0.0.1:19387 跑着 + 已连接的浏览器（走 CDP）⇒ 不是纯离线测试，本机手动跑 capture/compare'],
 ]

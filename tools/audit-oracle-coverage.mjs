@@ -14,50 +14,27 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { decodePng, encodePng, comparePngEither } from '../../dsh-browser-live/pixdiff.js'
+import { decodePng, resizePixels } from '../../dsh-browser-live/pixdiff.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const BASE = path.join(HERE, '..', 'baselines', process.argv[2] || 'before-refactor')
 const manifest = JSON.parse(fs.readFileSync(path.join(BASE, 'manifest.json'), 'utf8'))
 
-// 与 visual-baseline.mjs 保持一致的口径（改那边要同步改这里）
-const KEEP_RATIO = Number(process.env.VB_STABLE_RATIO || 0.80)
-const X_BY_STATE = {
-  '01-static-wallpaper': [0, 282],
-  '02-fx-nodes': [0, 282],
-  '03-settings-studio': [340, 1300],
-}
+// 口径**直接从真实实现 import**，不再自己复制一份。
+// 审核方指出：本脚本原来自己写了 crop()/wouldDetect()，而且已经与真实路径漂移
+// （它还是旧的"先裁剪、再缩放"顺序，真实 compareStable 早已改成"先归一尺度、再裁剪"）
+// ⇒ 那句 11/11 **根本没测到真实比对路径**。现在两边共用 tools/oracle-compare.mjs。
+import {
+  STABLE_KEEP_RATIO as KEEP_RATIO,
+  STABLE_X_BY_STATE as X_BY_STATE,
+  PIXEL_TOLERANCE,
+  compareStableImages,
+  paint,
+} from './oracle-compare.mjs'
 
-/** 复刻 visual-baseline 的裁剪口径。 */
-function crop(img, stateName) {
-  const keep = Math.max(1, Math.floor(img.height * KEEP_RATIO))
-  const range = X_BY_STATE[stateName] || [0, 282]
-  const scale = img.width / 1654
-  const x0 = Math.max(0, Math.min(img.width - 1, Math.round(range[0] * scale)))
-  const x1 = Math.max(x0 + 1, Math.min(img.width, Math.round(range[1] * scale)))
-  const w = x1 - x0
-  const out = Buffer.alloc(w * keep * 4)
-  for (let y = 0; y < keep; y++) img.data.copy(out, y * w * 4, (y * img.width + x0) * 4, (y * img.width + x0) * 4 + w * 4)
-  return { width: w, height: keep, channels: 4, data: out }
-}
-
-/** 在图上涂一块纯色（模拟"这里有真实变化"）。 */
-function paint(img, x0, y0, x1, y1, rgb) {
-  const out = { width: img.width, height: img.height, channels: 4, data: Buffer.from(img.data) }
-  for (let y = Math.max(0, y0); y < Math.min(img.height, y1); y++) {
-    for (let x = Math.max(0, x0); x < Math.min(img.width, x1); x++) {
-      const o = (y * img.width + x) * 4
-      out.data[o] = rgb[0]; out.data[o + 1] = rgb[1]; out.data[o + 2] = rgb[2]; out.data[o + 3] = 255
-    }
-  }
-  return out
-}
-
-/** 按 oracle 的口径比两张图，返回是否判"有差异"。 */
+/** 按**真实** oracle 口径比两张图（走 compareStableImages），返回是否判"有差异"。 */
 function wouldDetect(baseImg, changedImg, stateName) {
-  const a = encodePng(crop(baseImg, stateName))
-  const b = encodePng(crop(changedImg, stateName))
-  const r = comparePngEither(a, b, { allowScale: true, tolerance: 0, maxDiffRatio: 0 })
+  const r = compareStableImages(baseImg, changedImg, stateName)
   return { detected: !r.same, diff: r.diff, ratio: r.ratio }
 }
 
@@ -69,7 +46,8 @@ const ok = (name, cond, extra = '') => {
 
 console.log('=== oracle 覆盖边界审计 ===')
 console.log('基准目录: ' + BASE)
-console.log('口径: 保留高度 ' + (KEEP_RATIO * 100) + '%，竖切 ' + JSON.stringify(X_BY_STATE))
+console.log('口径（从 oracle-compare.mjs import）：保留高度 ' + (KEEP_RATIO * 100) + '%，竖切 '
+  + JSON.stringify(X_BY_STATE) + '，每通道容差 ' + PIXEL_TOLERANCE)
 
 const W = 1654, H = 905
 const keptH = Math.floor(H * KEEP_RATIO)
@@ -122,42 +100,31 @@ for (const s of manifest.states) {
 //   与"先缩后裁"（xRatio=0.800）给出**不同相位**，差 0.3 像素；在壁纸纹理这类高频区域，
 //   0.3 像素偏移就是几十级色差。⇒ **两种顺序不是同一个变换**，不能混用来造对照。
 //
-// 正确测法：**裁剪固定在原尺度做一次，缩放只作为最后一步**，这样唯一变量才是补丁本身。
-console.log('\n— 跨 DPI 归一化的检出能力（关键：归一化会不会把真实变化抹掉）—')
+// 正确测法：**整个比对走真实 compareStableImages**（它自己会先归一尺度再裁剪），
+// 我们只负责造"另一台机器倍率下的同一画面"这一点输入，不再自己复制裁剪/缩放顺序。
+console.log('\n— 跨 DPI 归一化的检出能力（走**真实** compareStableImages）—')
 {
-  const { resizePixels } = await import('../../dsh-browser-live/pixdiff.js')
   const s0 = manifest.states[0]
   const img = decodePng(fs.readFileSync(path.join(BASE, s0.file)))
   const factor = 1.25
-  // 约定：先在原尺度裁好，再决定是否缩放。整条链路只有一次 resize。
-  const cropped = crop(img, s0.name)
   const upscale = (p) => resizePixels(p, Math.round(p.width * factor), Math.round(p.height * factor))
 
-  // 参照组：同一块内容，一处不缩放、一处缩放 ⇒ 应判"无差异"
-  const rClean = (() => {
-    const a = encodePng(cropped)
-    const b = encodePng(upscale(cropped))
-    const r = comparePngEither(a, b, { allowScale: true, tolerance: 0, maxDiffRatio: 0 })
-    return { detected: !r.same, diff: r.diff, ratio: r.ratio }
-  })()
-  ok('同一内容仅换倍率（单次重采样）⇒ 判无差异', rClean.detected === false,
+  // 参照组：同一张图、只是倍率不同 ⇒ **必须**判"无差异"（否则就是跨 DPI 误报）
+  const rClean = wouldDetect(img, upscale(img), s0.name)
+  ok('同一内容仅换倍率 ⇒ 判无差异（不再误报 70.81%）', rClean.detected === false,
     rClean.detected ? '**误报** ' + rClean.diff + ' 像素（' + (rClean.ratio * 100).toFixed(2) + '%）' : 'diff=0')
 
-  // 实验组：先在原尺度涂补丁 → 裁剪 → 缩放。两图都只经过一次 resize。
-  const keptH = Math.floor(img.height * KEEP_RATIO)
+  // 实验组：先涂补丁 → 再按同一套算法缩放 ⇒ 应仍抓得到
+  const keptH2 = Math.floor(img.height * KEEP_RATIO)
   const [rx0, rx1] = X_BY_STATE[s0.name] || [0, 282]
-  const midX = Math.round((rx0 + rx1) / 2), midY = Math.round(keptH / 2)
+  const midX = Math.round((rx0 + rx1) / 2), midY = Math.round(keptH2 / 2)
   const findings = []
   for (const [label, w, h] of [['10×10', 10, 10], ['6×6', 6, 6], ['3×3', 3, 3], ['1×1', 1, 1]]) {
-    const patched = crop(paint(img, midX, midY, midX + w, midY + h, [255, 0, 255]), s0.name)
-    const r = (() => {
-      const a = encodePng(cropped)
-      const b = encodePng(upscale(patched))
-      const rr = comparePngEither(a, b, { allowScale: true, tolerance: 0, maxDiffRatio: 0 })
-      return { detected: !rr.same, diff: rr.diff }
-    })()
+    const patched = paint(img, midX, midY, midX + w, midY + h, [255, 0, 255])
+    const r = wouldDetect(img, upscale(patched), s0.name)
     findings.push({ label, detected: r.detected, diff: r.diff })
   }
+
   for (const f of findings) console.log('    ' + f.label.padEnd(7) + ' 变化 → ' + (f.detected ? '抓到' : '**漏掉**') + '（' + f.diff + ' 像素）')
   const lost = findings.filter((f) => !f.detected).map((f) => f.label)
   ok('跨 DPI 下 10×10 的变化仍能抓到', findings.find((f) => f.label === '10×10').detected,
