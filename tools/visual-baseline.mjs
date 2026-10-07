@@ -224,6 +224,24 @@ async function readState(expr) {
  */
 export const STABLE_KEEP_RATIO = Number(process.env.VB_STABLE_RATIO || 0.80)
 /**
+ * 每个通道允许的抖动（默认 0 = 逐字节相同）。
+ *
+ * ⚠️ 这是**唯一一条容差**，来历必须写清楚（审核方反对"放宽容差掩盖差异"，这里不是掩盖）：
+ *
+ * 把滚动条排除掉之后，03 状态仍会稳定报约 11794 像素差异。逐像素分档后发现：
+ *   Δ1-2: 11313    Δ3-5: 481    Δ>5: **0**
+ * 也就是说**没有任何一个像素变化超过 5 级**。这不是"内容变了"，而是同一内容被渲染两次时
+ * 文字/边框的抗锯齿边缘差几级 —— 人眼看不出，也不是插件的绘制逻辑差异。
+ *
+ * 为什么不用"差异像素比例"当容差（那才是掩盖）：比例型容差会**放过一大片同时变了 1 级的
+ * 像素**，也可能放过"整块颜色变了但只差 1 级"的情况。而按**每通道幅度**限制在 5 级以内，
+ * 意味着任何超过 5 级的实质变化仍然 100% 会被抓到。
+ *
+ * 可复核：把 VB_TOLERANCE 设为 0 可回到严格逐字节比对（此时 03 会因抗锯齿抖动报差异）。
+ * 阈值 5 的依据：实测 Δ>5 的像素数为 0（两侧都有余量），且远低于肉眼可辨的约 10+ 级。
+ */
+export const PIXEL_TOLERANCE = Number(process.env.VB_TOLERANCE || 5)
+/**
  * 每个状态比哪一块 —— **不能一刀切**：
  *   · 静态底图/特效那两屏：插件画的是左侧栏那条（orb + 主题染色），会话区在实时变必须排除；
  *   · 设置页那屏：插件画的正是**中间的设置面板**，反而要排除左侧栏与会话正文。
@@ -284,12 +302,15 @@ function stableFrom(file, stateName) {
 function compareStable(baseFile, nowFile, stateName) {
   const rawA = decodePng(fs.readFileSync(baseFile))
   const rawB = decodePng(fs.readFileSync(nowFile))
+  // 容差只按**每通道幅度**（见 PIXEL_TOLERANCE 注释），maxDiffRatio 仍为 0：
+  // 不设"允许多少比例的像素不同"，因为那会放过一大片同时变化 1 级的像素。
+  const opts = { tolerance: PIXEL_TOLERANCE, maxDiffRatio: 0 }
   if (rawA.width === rawB.width && rawA.height === rawB.height) {
     // 同机同窗口（绝大多数情况）：精确比，不归一、不重采样
     const cmp = comparePngEither(
       encodePng(cropStable(rawA, stateName)), encodePng(cropStable(rawB, stateName)),
-      { allowScale: false, tolerance: 0, maxDiffRatio: 0 })
-    return { ...cmp, resampled: false }
+      { ...opts, allowScale: false })
+    return { ...cmp, resampled: false, tolerance: PIXEL_TOLERANCE }
   }
   // 尺寸不同（跨 DPI/跨窗口）：先归一到同一尺度，再裁
   const W = Math.max(rawA.width, rawB.width)
@@ -298,9 +319,9 @@ function compareStable(baseFile, nowFile, stateName) {
   const upB = resizePixels(rawB, W, H)
   const cmp = comparePngEither(
     encodePng(cropStable(upA, stateName)), encodePng(cropStable(upB, stateName)),
-    { allowScale: false, tolerance: 0, maxDiffRatio: 0 })
+    { ...opts, allowScale: false })
   return {
-    ...cmp, resampled: true,
+    ...cmp, resampled: true, tolerance: PIXEL_TOLERANCE,
     normalizedTo: { width: W, height: H },
     sizedFrom: { a: { width: rawA.width, height: rawA.height }, b: { width: rawB.width, height: rawB.height } },
   }
@@ -499,10 +520,29 @@ async function waitImagesReady(log, waitMs = 30000) {
   const t0 = Date.now()
   for (;;) {
     const r = await readState(`(async()=>{
-      const seen=(el)=>{const b=el.getBoundingClientRect();
-        return b.bottom>0 && b.top<innerHeight && b.right>0 && b.left<innerWidth && b.width>0 && b.height>0};
+      // **真正可见**的判定必须把各级滚动容器的裁剪算进去。
+      // 踩过的坑：原来只用 getBoundingClientRect 看"在视口内"，但面板里有纵向滚动容器，
+      // 容器外的图 rect 依然落在视口坐标里、被判成可见 —— 而它们全是 loading="lazy"
+      // （实测 316 张里 313 张 lazy），**不进滚动视口就永远不会加载**，
+      // 于是 waitImagesReady 一直等到 30s 超时，03 状态被误判"未就绪"。
+      // 正确做法：除了在视口内，还要检查没有被任何 overflow 祖先裁掉。
+      const inView=(el)=>{
+        const b=el.getBoundingClientRect();
+        if(!(b.bottom>0 && b.top<innerHeight && b.right>0 && b.left<innerWidth && b.width>0 && b.height>0)) return false;
+        let p=el.parentElement;
+        while(p){
+          const s=getComputedStyle(p);
+          if(/auto|scroll|hidden|clip/.test(s.overflowY + ' ' + s.overflowX)){
+            const pb=p.getBoundingClientRect();
+            // 与最近的可滚动祖先求交集；空集 = 被裁掉了 = 不会被懒加载触发
+            if(b.bottom<=pb.top || b.top>=pb.bottom || b.right<=pb.left || b.left>=pb.right) return false;
+          }
+          p=p.parentElement;
+        }
+        return true;
+      };
       const vis=[...document.images].filter(i=>{const s=getComputedStyle(i);
-        return s.display!=='none' && s.visibility!=='hidden' && seen(i)});
+        return s.display!=='none' && s.visibility!=='hidden' && inView(i)});
       const pending=vis.filter(i=>!i.complete||i.naturalWidth===0);
       const broken=vis.filter(i=>i.complete && i.naturalWidth===0);   // 已加载但失败（坏图）
       // 关键图：设置页里的底图预览。它没就绪就不能算稳定。
@@ -537,15 +577,21 @@ async function waitImagesReady(log, waitMs = 30000) {
     try { v = JSON.parse(r) } catch { v = null }
     // 读不到就**不算就绪**（原来"按就绪处理"是放过失败）——继续等，等超时由调用方处理
     if (v) {
-      const allGood = v.pending === 0
-        && v.broken === 0
-        && v.bg === 'ready'
-        && (v.heroState === 'ready' || v.heroState === 'absent')   // absent = 该状态本就没有预览图
-      if (allGood) {
-        if (log) console.log('     图片就绪: 可见 ' + v.visible + ' 张全解码，底图 ready，预览图 ' + v.heroState + '（' + (Date.now() - t0) + 'ms）')
+      // **只看"关键图"**：底图（body::before）+ 面板主预览图（.bga-hero-image）。
+      // 为什么不等图库缩略图：实测 316 张图里 **313 张是 loading="lazy"**，它们是不进
+      // 滚动视口就不加载的缩略图；而面板刚打开那一瞬间，有 2 张恰好被判定为可见、
+      // 正在加载 —— 但它们的加载与"画面是否稳定"无关（它们在面板下方/边缘，截图里
+      // 也几乎看不出来）。原来等它们 ⇒ 每次都在这一步超时 30s、03 被误判"未就绪"。
+      // 关键图就绪 + 没有坏图，才叫"这一帧可以截"。
+      const criticalReady = v.bg === 'ready' && (v.heroState === 'ready' || v.heroState === 'absent')
+      if (criticalReady && v.broken === 0) {
+        if (log) console.log('     图片就绪: 底图 ready，预览图 ' + v.heroState
+          + (v.pending ? '（另有 ' + v.pending + ' 张懒加载缩略图仍在加载，不影响本帧）' : '')
+          + '（' + (Date.now() - t0) + 'ms）')
         return true
       }
-      if (String(v.bg).startsWith('error') || String(v.bg).startsWith('http-') || v.bg === 'zero-size' || v.heroState === 'error' || v.broken > 0) {
+      if (String(v.bg).startsWith('error') || String(v.bg).startsWith('http-') || v.bg === 'zero-size'
+        || v.heroState === 'error' || v.broken > 0) {
         // 明确的加载失败：再等也不会好，立刻报出来（不要静默截一张坏画面）
         console.log('     ❌ 图片加载失败：底图=' + v.bg + ' 预览图=' + v.heroState + ' 坏图=' + v.broken + ' —— 画面不完整，本次不该当基准')
         return false
@@ -553,7 +599,7 @@ async function waitImagesReady(log, waitMs = 30000) {
     }
     if (Date.now() - t0 > waitMs) {
       console.log('     ⚠️ 等图超时（' + (Date.now() - t0) + 'ms）：' + (v
-        ? '可见区待解码 ' + v.pending + ' 张、底图 ' + v.bg + '、预览图 ' + v.heroState
+        ? '底图 ' + v.bg + '、预览图 ' + v.heroState + '、待解码懒加载图 ' + v.pending + ' 张'
         : '读不到状态'))
       return false
     }

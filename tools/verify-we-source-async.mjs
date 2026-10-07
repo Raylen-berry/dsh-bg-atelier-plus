@@ -285,6 +285,62 @@ console.log('\n— ⑥ 冷启动 vs 缓存命中：force 参数与结果一致�
   await p3
 }
 
+console.log('\n— 关键补充：调用方隔离（审核方复现指出的真缺陷）—')
+{
+  // 原缺陷：请求槽只按 kind 记（library/status 各一个），于是 library() 一进来就
+  // abort('library') —— **任何调用方都会取消别的调用方**在飞的那次。真实后果：
+  // 启动恢复正在取库清单时用户打开设置页，设置页那次 library() 把恢复请求取消掉
+  // ⇒ **选中的 WE 背景恢复不出来，而且不报错**。
+  // 修法：key = caller + ':' + kind，同调用方同 kind 才互相取消。
+  const { WeSource, calls } = makeWeSource()
+
+  // 启动恢复先发起
+  const pRestore = WeSource.library(false, null, 'restore')
+  await tick()
+  ok('恢复请求已发出', calls.length === 1 && calls[0].aborted === false)
+
+  // 设置页随后发起（用户打开设置页）—— 这**不能**取消恢复那条
+  const pSection = WeSource.library(false, null, 'section')
+  await tick()
+  ok('设置页请求已发出', calls.length === 2)
+  ok('★ 设置页发起**不会**取消启动恢复（核心断言）', calls[0].aborted === false,
+    calls[0].aborted ? '被取消了 —— 缺陷未修' : '未被取消')
+
+  // 恢复那条能正常拿到结果（= 背景能恢复出来）
+  calls[0].resolve({ entries: [{ id: 'the-one-user-picked' }], weFound: true })
+  const rRestore = await pRestore
+  ok('★ 恢复请求拿到结果（背景能恢复）', rRestore.ok === true && rRestore.entries[0].id === 'the-one-user-picked',
+    JSON.stringify(rRestore.entries && rRestore.entries[0]))
+
+  calls[1].resolve({ entries: [{ id: 'section-list' }], weFound: true })
+  const rSection = await pSection
+  ok('设置页也拿到自己的结果', rSection.ok === true && rSection.entries[0].id === 'section-list')
+
+  // 同调用方再发起 ⇒ 仍应取消自己的前一个
+  const pSection2 = WeSource.library(false, null, 'section')
+  await tick()
+  ok('同调用方（section）再发起 ⇒ 取消自己前一个', calls[1].aborted === true)
+  ok('但**不影响**恢复那条（早已完成）', calls[0].aborted === false)
+  calls[calls.length - 1].resolve({ entries: [], weFound: true })
+  await pSection2
+
+  // abortAll(caller) 只取消该调用方
+  const p3 = WeSource.library(false, null, 'restore')
+  await tick()
+  const p4 = WeSource.library(false, null, 'section')
+  await tick()
+  const idxR = calls.length - 2, idxS = calls.length - 1
+  WeSource.abortAll('section')
+  await tick()
+  ok('abortAll("section") 只取消 section，不动 restore', calls[idxS].aborted === true && calls[idxR].aborted === false)
+  // 防御：若上面断言失败（缺陷版），这里两条 promise 可能都已 settle，await 不会挂住；
+  // 若仍 pending，用 Promise.allSettled 兜底，避免整个套件以一个"未 settle 的顶层 await"
+  // 崩掉（那会让退出码变成 13 而不是明确的 1，掩盖真正的断言失败）。
+  calls[idxR].resolve({ entries: [], weFound: true })
+  calls[idxS].resolve({ entries: [], weFound: true })
+  await Promise.allSettled([p3, p4])
+}
+
 console.log('\n— 补充：返回值形状稳定（调用方依赖这些字段）—')
 {
   const { WeSource, calls } = makeWeSource()

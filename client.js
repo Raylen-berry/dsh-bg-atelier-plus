@@ -2312,17 +2312,34 @@ function weStillUrl(id) { return weUrl('/still/') + encodeURIComponent(id) + '.w
 //      和 weRestore 里裸 fetch 的写法是两套，容易漏。
 // 只做**数据**，不碰渲染；实时消费链路（weStartNative/getDisplayMedia）完全不经这里。
 var WeSource = (function () {
-  var inflight = {}   // kind -> AbortController：后一次请求取消前一次，防竞态覆盖
-  function abort(kind) {
-    if (inflight[kind]) { try { inflight[kind].abort() } catch (e) { /* noop */ } inflight[kind] = null }
+  // ⚠️ 请求槽**按调用方隔离**，不是按 kind 共享。这是修一个真缺陷：
+  //   原来 `inflight` 只按 kind 记（library/status 各一个槽），于是 `library()` 一进来
+  //   就 `abort('library')` —— **任何调用方都会取消别的调用方**在飞的那次。
+  //   实际后果：启动恢复（weRestore）正在取库清单时，用户一打开设置页，设置页那次
+  //   `library()` 就把恢复请求取消掉 ⇒ **选中的 WE 背景恢复不出来**，而且不报错。
+  //   审核方复现指出了这一点；我原来那句"启动时的独立读、与设置页无竞争"的注释是**错的**。
+  // 现在：key = 调用方名 + kind，同调用方同 kind 才互相取消（那才是真正的"后发覆盖先发"）。
+  var inflight = {}   // "caller:kind" -> AbortController
+  function slot(caller, kind) { return String(caller) + ':' + kind }
+  function abort(key) {
+    if (inflight[key]) { try { inflight[key].abort() } catch (e) { /* noop */ } inflight[key] = null }
   }
-  function abortAll() { for (var k in inflight) abort(k) }
+  /** 取消某个调用方的所有在飞请求（组件卸载用；不传 caller 则全取消）。 */
+  function abortAll(caller) {
+    for (var k in inflight) {
+      if (caller === undefined || k.indexOf(String(caller) + ':') === 0) abort(k)
+    }
+  }
 
-  /** 取库清单。force=true 让 host 跳过缓存重扫。返回 {ok, entries, weFound, error}。 */
-  function library(force, signal) {
-    abort('library')
+  /**
+   * 取库清单。force=true 让 host 跳过缓存重扫。返回 {ok, entries, weFound, error}。
+   * caller 用来隔离请求槽（见上方注释）；不给就落到 'default'。
+   */
+  function library(force, signal, caller) {
+    var key = slot(caller || 'default', 'library')
+    abort(key)
     var ctl = new AbortController()
-    inflight['library'] = ctl
+    inflight[key] = ctl
     if (signal) signal.addEventListener('abort', function () { try { ctl.abort() } catch (e) { /* noop */ } })
     return fetch(weUrl('/library.json') + (force ? '?force=1' : ''), { cache: 'no-store', signal: ctl.signal })
       .then(function (r) {
@@ -2339,11 +2356,12 @@ var WeSource = (function () {
       })
   }
 
-  /** 取桥状态（原生桥是否可用/在跑）。 */
-  function status(force, signal) {
-    abort('status')
+  /** 取桥状态（原生桥是否可用/在跑）。caller 同 library，用来隔离请求槽。 */
+  function status(force, signal, caller) {
+    var key = slot(caller || 'default', 'status')
+    abort(key)
     var ctl = new AbortController()
-    inflight['status'] = ctl
+    inflight[key] = ctl
     if (signal) signal.addEventListener('abort', function () { try { ctl.abort() } catch (e) { /* noop */ } })
     return fetch(weUrl('/status') + (force ? '?force=1' : ''), { cache: 'no-store', signal: ctl.signal })
       .then(function (r) {
@@ -2663,8 +2681,10 @@ function weRestore() {
   var id = STORE.state.weId
   if (!id) return
   // 走 WeSource 而不是自己再 fetch 一遍：库清单的取法只该有一份。
-  // 注意**不 abort 共享请求**：这条是启动时的独立读，与设置页那次无竞争关系。
-  WeSource.library(false)
+  // **必须带 caller='restore'**（见 WeSource 顶部注释）：否则设置页那次 library() 会把
+  // 这条恢复请求取消掉，导致"选中的 WE 背景恢复不出来"且不报错。
+  // 上面那句旧的"与设置页无竞争"是在请求槽按 kind 共享时写的，**当时是错的**。
+  WeSource.library(false, null, 'restore')
     .then(function (result) {
       if (!result.ok) return   // host 路由没就绪: 下次启动再说
       var hit = (result.entries || []).filter(function (e) { return e.id === id })[0]
@@ -2816,7 +2836,10 @@ function WeSection() {
   // 取数走 WeSource（见上方注释）：这里只管"拿到结果后怎么进 state"，不管怎么发请求。
   async function load(kind, force) {
     if (kind === 'library') patch({ loading: true, error: '' })
-    var result = kind === 'library' ? await WeSource.library(force) : await WeSource.status(force)
+    // caller='section'：与启动恢复（'restore'）隔离，互不取消。见 WeSource 顶部注释。
+    var result = kind === 'library'
+      ? await WeSource.library(force, null, 'section')
+      : await WeSource.status(force, null, 'section')
     if (result.aborted) return
     if (kind === 'library') {
       patch(result.ok
@@ -2833,8 +2856,8 @@ function WeSection() {
     WE_WATCHERS.push(update)
     return function () {
       active.current = false
-      // 取消在飞的请求改由 WeSource 统一管（原来这里自己遍历 requests ref，与 fetch 那侧两套簿记）
-      WeSource.abortAll()
+      // 组件卸载只取消**本组件**的请求（'section'），不要顺手取消启动恢复那条
+      WeSource.abortAll('section')
       var i = WE_WATCHERS.indexOf(update); if (i >= 0) WE_WATCHERS.splice(i, 1)
     }
   }, [])
