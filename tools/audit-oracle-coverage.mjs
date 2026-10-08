@@ -25,8 +25,7 @@ const manifest = JSON.parse(fs.readFileSync(path.join(BASE, 'manifest.json'), 'u
 // （它还是旧的"先裁剪、再缩放"顺序，真实 compareStable 早已改成"先归一尺度、再裁剪"）
 // ⇒ 那句 11/11 **根本没测到真实比对路径**。现在两边共用 tools/oracle-compare.mjs。
 import {
-  STABLE_KEEP_RATIO as KEEP_RATIO,
-  STABLE_X_BY_STATE as X_BY_STATE,
+  STABLE_RECT_BY_STATE as RECTS, REF_CSS_WIDTH, cssScale,
   PIXEL_TOLERANCE, MASK_RECTS,
   compareStableImages,
   paint,
@@ -46,43 +45,64 @@ const ok = (name, cond, extra = '') => {
 
 console.log('=== oracle 覆盖边界审计 ===')
 console.log('基准目录: ' + BASE)
-console.log('口径（从 oracle-compare.mjs import）：保留高度 ' + (KEEP_RATIO * 100) + '%，竖切 '
-  + JSON.stringify(X_BY_STATE) + '，每通道容差 ' + PIXEL_TOLERANCE)
-
-const W = 1654, H = 905
-const keptH = Math.floor(H * KEEP_RATIO)
+console.log('口径（从 oracle-compare.mjs import）：矩形全部是 **CSS 坐标**，换算锚点 REF_CSS_WIDTH='
+  + REF_CSS_WIDTH + '；每通道容差 ' + PIXEL_TOLERANCE)
+console.log('各状态比较矩形(CSS): ' + JSON.stringify(RECTS))
 
 for (const s of manifest.states) {
   const file = path.join(BASE, s.file)
   if (!fs.existsSync(file)) { console.log('\n[' + s.name + '] 缺图，跳过'); continue }
   const img = decodePng(fs.readFileSync(file))
-  const [rx0, rx1] = X_BY_STATE[s.name] || [0, 282]
+  const sc = cssScale(img)
+  const rect = RECTS[s.name]
+  if (!rect) { console.log('\n[' + s.name + '] 没有登记比较矩形，跳过'); continue }
+  // CSS → 截图像素（与实际裁剪同一套换算）
+  const px = {
+    x0: Math.round(rect.x0 * sc), x1: Math.round(rect.x1 * sc),
+    y0: Math.round(rect.y0 * sc), y1: Math.round(rect.y1 * sc),
+  }
+  const rx0 = px.x0, rx1 = px.x1
+  const H = img.height
+  const area = (px.x1 - px.x0) * (px.y1 - px.y0)
 
   console.log('\n— ' + s.name + ' —')
   console.log('  整图         : ' + img.width + '×' + img.height + ' = ' + (img.width * img.height) + ' 像素')
-  console.log('  参与比较     : x[' + rx0 + ',' + rx1 + '] × y[0,' + (keptH - 1) + '] = ' + ((rx1 - rx0) * keptH) + ' 像素'
-    + '（占整图 ' + (((rx1 - rx0) * keptH) / (img.width * img.height) * 100).toFixed(1) + '%）')
+  console.log('  比较矩形(CSS): ' + JSON.stringify(rect))
+  console.log('  参与比较(px) : x[' + px.x0 + ',' + px.x1 + '] × y[' + px.y0 + ',' + px.y1 + '] = ' + area + ' 像素'
+    + '（占整图 ' + (area / (img.width * img.height) * 100).toFixed(1) + '%）')
   console.log('  **排除**     :')
-  console.log('      · x[' + rx1 + ',' + img.width + '] 整高（' + (img.width - rx1) + 'px 宽）—— 会话区/右侧')
-  console.log('      · y[' + keptH + ',' + (H - 1) + '] 整宽（' + (H - keptH) + 'px 高）—— 宿主状态栏/装饰粒子')
-  if (rx0 > 0) console.log('      · x[0,' + rx0 + '] 整高 —— 设置页状态里的左侧栏')
+  console.log('      · x[' + px.x1 + ',' + img.width + '] 整高 —— 会话区/右侧')
+  console.log('      · y[' + px.y1 + ',' + (H - 1) + '] 整宽 —— 底部（宿主状态栏/装饰粒子）')
+  if (px.y0 > 0) console.log('      · y[0,' + px.y0 + '] 整宽 —— 顶部（宿主背景/对话框之上）')
+  if (px.x0 > 0) console.log('      · x[0,' + px.x0 + '] 整高 —— 左侧栏/面板之外')
   // 屏蔽框（MASK_RECTS）也是"看不见的区域"，必须一并列出来 —— 否则"能力缺口"清单不完整
-  const masked = MASK_RECTS[s.name] || []
-  for (const [mx0, my0, mx1, my1] of masked) {
-    console.log('      · **屏蔽框** x[' + mx0 + ',' + mx1 + '] y[' + my0 + ',' + my1 + ']（'
-      + ((mx1 - mx0) * (my1 - my0)) + ' 像素）—— 见 oracle-compare.mjs 的 MASK_RECTS 注释')
+  // ⚠️ MASK_RECTS 每项是 [x0, y0, x1, y1]（**x 在前**）。这里必须按这个顺序解构 ——
+  //    我一开始按 [x0,x1,y0,y1] 写，导致打印标签互换、inAnyMask 判错。
+  const maskedCss = MASK_RECTS[s.name] || []
+  const masked = maskedCss.map(([x0, y0, x1, y1]) => [
+    Math.round(x0 * sc), Math.round(y0 * sc), Math.round(x1 * sc), Math.round(y1 * sc)])   // [x0,y0,x1,y1] in px
+  for (let i = 0; i < maskedCss.length; i++) {
+    const [x0c, y0c, x1c, y1c] = maskedCss[i]
+    const [x0p, y0p, x1p, y1p] = masked[i]
+    console.log('      · **屏蔽框** CSS x[' + x0c + ',' + x1c + '] y[' + y0c + ',' + y1c + ']'
+      + ' => px x[' + x0p + ',' + x1p + '] y[' + y0p + ',' + y1p + ']'
+      + '（' + ((x1p - x0p) * (y1p - y0p)) + ' 像素）—— 见 oracle-compare.mjs 的 MASK_RECTS 注释')
   }
 
-  // ① 保留区内的小变化：必须抓到（这是"不放水"的核心证据）
-  const midX = Math.round((rx0 + rx1) / 2), midY = Math.round(keptH / 2)
+  // ① 比较区内的小变化：必须抓到（这是"不放水"的核心证据）
+  // 找一个不在任何屏蔽框里的中心点，避免"其实落在屏蔽区"的假失败
+  const inAnyMask = (x, y) => masked.some(([x0, y0, x1, y1]) => x >= x0 && x < x1 && y >= y0 && y < y1)
+  let midX = Math.round((px.x0 + px.x1) / 2), midY = Math.round((px.y0 + px.y1) / 2)
+  for (let k = 0; k < 200 && inAnyMask(midX, midY); k++) { midY += 20; if (midY > px.y1 - 12) { midY = px.y0 + 10; midX += 20 } }
   const small = paint(img, midX, midY, midX + 10, midY + 10, [255, 0, 255])
   const rSmall = wouldDetect(img, small, s.name)
-  ok('保留区内 10×10 小变化被抓到', rSmall.detected, rSmall.diff + ' 像素')
+  ok('比较区内 10×10 小变化被抓到（px ' + midX + ',' + midY + '）', rSmall.detected,
+    rSmall.detected ? rSmall.diff + ' 像素' : '**漏检**')
 
   // ①b 屏蔽框内植入变化 ⇒ **应抓不到**（如实记录这个缺口，别假装没有）
   // ⚠️ 补丁必须**完全落在框内**。第一版固定涂 60×40 并以框心为中心，遇到 01/02 那个
-  // 只有 30px 高的窄条（y610-640）时就溢出去了 —— 溢出部分被正常检出，测试反而报
-  // "意外抓到了"。那是**测试自己写错**，不是 oracle 的问题。现在按框尺寸自适应缩小。
+  // 只有 30px 高的窄条时就溢出去了 —— 溢出部分被正常检出，测试反而报"意外抓到了"。
+  // 那是**测试自己写错**，不是 oracle 的问题。现在按框尺寸自适应缩小。
   for (const [mx0, my0, mx1, my1] of masked) {
     const bw = mx1 - mx0, bh = my1 - my0
     const pw = Math.max(2, Math.min(60, Math.floor(bw * 0.5)))
@@ -91,21 +111,29 @@ for (const s of manifest.states) {
     const inMask = paint(img, cx - Math.floor(pw / 2), cy - Math.floor(ph / 2),
       cx - Math.floor(pw / 2) + pw, cy - Math.floor(ph / 2) + ph, [255, 0, 255])
     const rMask = wouldDetect(img, inMask, s.name)
-    ok('【能力缺口·预期抓不到】屏蔽框内 ' + pw + 'x' + ph + ' 变化（x' + mx0 + '-' + mx1 + ' y' + my0 + '-' + my1 + '）',
+    ok('【能力缺口·预期抓不到】屏蔽框内 ' + pw + 'x' + ph + ' 变化（px x' + mx0 + '-' + mx1 + ' y' + my0 + '-' + my1 + '）',
       rMask.detected === false, rMask.detected ? '意外抓到了 ' + rMask.diff : '如预期未检出')
   }
 
-  // ② 排除区①：右边界之外（会话区）—— 记录缺口
-  const outsideX = paint(img, rx1 + 40, midY, rx1 + 140, midY + 100, [255, 0, 255])
+  // ② 排除区①：比较区右边界之外 —— 记录缺口
+  const outsideX = paint(img, px.x1 + 20, midY, Math.min(img.width - 1, px.x1 + 120), midY + 100, [255, 0, 255])
   const rOutX = wouldDetect(img, outsideX, s.name)
   ok('【能力缺口·预期抓不到】右边界外 100×100 变化', rOutX.detected === false,
     rOutX.detected ? '意外抓到了 ' + rOutX.diff : '如预期未检出')
 
   // ③ 排除区②：底部带 —— 记录缺口
-  const outsideY = paint(img, midX, keptH + 20, midX + 100, Math.min(H - 1, keptH + 120), [255, 0, 255])
+  const outsideY = paint(img, midX, px.y1 + 20, midX + 100, Math.min(H - 1, px.y1 + 120), [255, 0, 255])
   const rOutY = wouldDetect(img, outsideY, s.name)
   ok('【能力缺口·预期抓不到】底带 100×100 变化', rOutY.detected === false,
     rOutY.detected ? '意外抓到了 ' + rOutY.diff : '如预期未检出')
+
+  // ②b 顶部之外（03 的 y0 是 74，其上是宿主背景）—— 同样记录缺口
+  if (px.y0 > 40) {
+    const outsideTop = paint(img, midX, Math.max(0, px.y0 - 60), midX + 100, px.y0 - 5, [255, 0, 255])
+    const rTop = wouldDetect(img, outsideTop, s.name)
+    ok('【能力缺口·预期抓不到】顶部之外 100×55 变化', rTop.detected === false,
+      rTop.detected ? '意外抓到了 ' + rTop.diff : '如预期未检出')
+  }
 }
 
 // ④ 跨 DPI 归一化的检出能力：真实变化在跨 DPI 比对下还抓得到吗？
@@ -137,9 +165,9 @@ console.log('\n— 跨 DPI 归一化的检出能力（走**真实** compareStabl
     rClean.detected ? '**误报** ' + rClean.diff + ' 像素（' + (rClean.ratio * 100).toFixed(2) + '%）' : 'diff=0')
 
   // 实验组：先涂补丁 → 再按同一套算法缩放 ⇒ 应仍抓得到
-  const keptH2 = Math.floor(img.height * KEEP_RATIO)
-  const [rx0, rx1] = X_BY_STATE[s0.name] || [0, 282]
-  const midX = Math.round((rx0 + rx1) / 2), midY = Math.round(keptH2 / 2)
+  const sc0 = cssScale(img)
+  const r0 = RECTS[s0.name]
+  const midX = Math.round(((r0.x0 + r0.x1) / 2) * sc0), midY = Math.round(((r0.y0 + r0.y1) / 2) * sc0)
   const findings = []
   for (const [label, w, h] of [['10×10', 10, 10], ['6×6', 6, 6], ['3×3', 3, 3], ['1×1', 1, 1]]) {
     const patched = paint(img, midX, midY, midX + w, midY + h, [255, 0, 255])

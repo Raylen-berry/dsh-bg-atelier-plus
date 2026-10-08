@@ -38,9 +38,10 @@ const OUT_ROOT = path.resolve(HERE, '..', 'baselines')
 
 const mode = process.argv[2]
 const dir = process.argv[3]
-if (!['capture', 'compare', 'list'].includes(mode) || (!dir && mode !== 'list')) {
+if (!['capture', 'compare', 'list', 'selftest'].includes(mode) || (!dir && mode !== 'list' && mode !== 'selftest')) {
   console.error('用法: node tools/visual-baseline.mjs capture|compare <目录名>')
   console.error('      node tools/visual-baseline.mjs list          # 列出已建基准')
+  console.error('      node tools/visual-baseline.mjs selftest      # 用**真实插件元素**验证检出能力（不需基准）')
   process.exit(2)
 }
 if (dir) fs.mkdirSync(path.join(OUT_ROOT, dir), { recursive: true })
@@ -158,7 +159,8 @@ if (mode === 'list') {
 }
 
 let exitCode = 0
-const baseDir = path.join(OUT_ROOT, dir)
+// selftest 不需要基准目录（它拿"当前截图 vs 涂改后的当前截图"自比）⇒ 别让 path.join 炸掉
+const baseDir = dir ? path.join(OUT_ROOT, dir) : null
 if (mode === 'compare' && !fs.existsSync(path.join(baseDir, 'manifest.json'))) {
   console.error('基准不完整：' + baseDir + ' 里没有 manifest.json（先跑 capture）')
   process.exit(2)
@@ -247,7 +249,8 @@ async function readState(expr) {
 // 结果两份实现漂移了（审核方指出：审计还是旧的"先裁后缩"顺序，11/11 没测到真实路径）。
 // 现在两边都 import 同一份，不再有第二份实现。
 import {
-  STABLE_KEEP_RATIO, STABLE_X_BY_STATE, PIXEL_TOLERANCE, compareStableFiles,
+  STABLE_RECT_BY_STATE, MASK_RECTS, REF_CSS_WIDTH, PIXEL_TOLERANCE, EXPECT_GEOMETRY,
+  compareStableFiles, compareStableImages, paint, cssScale,
   rotationRestoreNeed, judgeRotationRestore,
 } from './oracle-compare.mjs'
 
@@ -297,12 +300,26 @@ async function freezeRotation(log) {
   return { raw, before }
 }
 
-/** 把 wallpaper 钉到指定那张（只改 wallpaper，其余整份保留）。 */
-async function pinWallpaper(wallpaper, log) {
+/** 把 wallpaper 钉到指定那张（只改 wallpaper，其余整份保留）。
+ *
+ * ⚠️ 修一个"读失败却仍然写入"的缺陷（审核方在内存里复现过这条路径）：
+ *   `freezeRotation()` 首次 GET 失败会返回 null；但 compare/capture 之后仍会调本函数，
+ *   而本函数**自己又 GET 一次** —— 若这次成功，就会带着 `autoOn:false` 写进去。
+ *   于是出现：首次读失败 → 第二次读成功 → 钉图写入 autoOn=false →
+ *   还原阶段因"没有原值"返回 skipped → **exit=0**，用户的轮播却被我们关掉了且无人报错。
+ *   "没有原值"**并不保证**"没有写入"。
+ * 现在：必须**显式传入已确认有效的原始设置**（frozen.before）才允许写；
+ * 拿不到就拒绝写入并如实报告，由调用方决定怎么退出。
+ */
+async function pinWallpaper(wallpaper, log, frozenBefore) {
+  if (!frozenBefore || typeof frozenBefore !== 'object') {
+    console.error('     ✗ 钉图被拒绝：没有有效的原始设置可依据（避免"读到一半失败还去写盘"）。')
+    return false
+  }
   const nowRaw = await readState(`(async()=>{const r=await fetch('/bga/settings.json',{cache:'no-store'});return await r.text()})()`)
   let now = null
   try { now = JSON.parse(nowRaw) } catch { now = null }
-  if (!now || typeof now !== 'object') { if (log) console.log('     钉图: 读不到设置，跳过'); return }
+  if (!now || typeof now !== 'object') { if (log) console.log('     钉图: 读不到设置，跳过'); return false }
   const patched = JSON.stringify({ ...now, autoOn: false, wallpaper })
   const r = await readState(`(async()=>{
     const res = await fetch('/bga/settings.json', {
@@ -319,6 +336,7 @@ async function pinWallpaper(wallpaper, log) {
   try { await cdp.send('Page.reload', { ignoreCache: false }) } catch { /* 用 navigate 兜底 */ }
   await sleep(3500) // 等重载 + 底图解码
   if (log) console.log('     钉图后已刷新页面')
+  return true   // 明确的成功返回（调用方用 !await pinWallpaper(...) 判失败）
 }
 
 /**
@@ -462,6 +480,111 @@ async function resetToCleanHome(log) {
   return closed
 }
 
+/**
+ * 环境准备（截图前必须执行，捕获与比对两次都要）：让画面进入**确定性**状态。
+ *
+ * 两条干预，都只注入页面内样式（可逆：刷新即消失；不写盘、不改插件源码）：
+ *
+ * ① **宿主对话框强制不透明**。
+ *    宿主设置对话框背景是 `rgba(48,26,32,0.97)` —— 3% 半透明，于是对话框**背后**的会话内容
+ *    会以 3% 权重透进面板像素。我自己的命令输出不断往会话里加内容 ⇒ 面板像素漂几级。
+ *    证据（会话不变时连截两张 diff=0，跨"我跑过命令"再比就出现 Δ≤10 的 17000+ 像素差异）。
+ *    透出来的是**宿主会话内容**，不属于底图插件的视觉契约。
+ *
+ * ② **停掉插件自己的动画装饰层**。
+ *    实测文档里查到 41 个带 CSS 动画的元素：`bga-fly f1..f22`、`bga-star s1..s17`、
+ *    `bga-meteor`，其中 **30 个落在面板矩形内**（如 `bga-fly f1@542,705`）。
+ *    它们是**持续飘动的粒子/星光**（用户设置的 `effect: firefly`），每帧都在动 ⇒
+ *    任意两张截图都不可能一致。实测证据最直接：
+ *      · 停动画**之前**：连截两张 diff=**1608**、maxΔ=3
+ *      · 停动画**之后**：连截两张 diff=**0**、maxΔ=0
+ *    ⇒ 那点残留差异**全部**来自这层动画。
+ *
+ * **代价与边界（必须如实写）**：动画**本身**不再被像素回归覆盖 —— 因为它根本无法被像素比较
+ * （同一帧不可能重现）。被覆盖的是**静态渲染**：布局、配色、文字、按钮、面板结构。
+ * 动效的正确性应靠**功能验证**（开一次动效壁纸看是否在动），不是靠截图比对。
+ *
+ * 和"放宽容差"的区别：容差会把"整屏偏色"一起放过（审核方已证）；这里是**冻结一个连续变化的
+ * 装饰层**，静态部分的灵敏度一点没降（容差仍为 0）。
+ */
+async function prepareEnvironment(log) {
+  const r = await readState(`(()=>{
+    let st=document.getElementById('vb-env');
+    if(!st){ st=document.createElement('style'); st.id='vb-env'; document.head.appendChild(st) }
+    st.textContent = [
+      // ② 停掉插件的动画装饰层（bga-fly / bga-star / bga-meteor）——见上方说明
+      '[class*="bga"]{animation:none!important}',
+      '[class*="bga"] *{animation:none!important}',
+    ].join('\\n');
+
+    // ① 让宿主对话框真正不透明。
+    // ⚠️ 这里踩过一个坑：第一版写的是 CSS 选择器 '[role="dialog"]{background-color:...}'，
+    //    结果**毫无作用** —— [role="dialog"] 只是个**透明外壳**（computed bg 是
+    //    rgba(0,0,0,0)），真正的半透明背景挂在它的**子元素** .wCInkW_panel
+    //    上（rgba(48,26,32,0.97)）。我一度以为"已经强制不透明了"，实际面板仍然 3% 透光。
+    //    铁证：在对话框背后铺一层纯红，面板像素照样变了 137116 px（maxΔ=4）。
+    // 所以改成**遍历子树按实际计算的 alpha 判定**（不依赖宿主那串会变的哈希类名）：
+    //    凡是在对话框内、**不属于插件**（类名不含 bga）、且 background alpha 在 (0,1) 之间的
+    //    元素，都把它的 backgroundColor 抬成同 RGB 的不透明色。
+    // 为什么跳过 bga-*：插件自己的半透明表面（玻璃/卡片）要保留 —— 它们现在合成在
+    // 不透明的宿主底色上，本身已经是确定的；把插件也改不透明会白白丢掉那部分的覆盖。
+    const dlg = document.querySelector('[role="dialog"]');
+    let fixed = 0;
+    if (dlg) {
+      // ⚠️ 必须**连祖先一起走**：真正半透明的 .wCInkW_panel 是 [role="dialog"] 的
+      //    **父元素**（不是子元素）。第一版只遍历了子树 ⇒ opaqueFixed=0，白改一场。
+      const scope = [];
+      for (let e = dlg; e && e !== document.documentElement; e = e.parentElement) scope.push(e);
+      scope.push(...dlg.querySelectorAll('*'));
+      for (const e of scope) {
+        if (/bga/.test(String(e.className || ''))) continue;
+        const cs = getComputedStyle(e);
+        const m = String(cs.backgroundColor).match(/rgba?\\(([^)]+)\\)/);
+        if (!m) continue;
+        const p = m[1].split(',').map((x) => parseFloat(x));
+        const a = p.length > 3 ? p[3] : 1;
+        if (a > 0.01 && a < 0.99) {
+          e.style.setProperty('background-color', 'rgb(' + p[0] + ',' + p[1] + ',' + p[2] + ')', 'important');
+          fixed++;
+        }
+      }
+    }
+    return 'applied(opaqueFixed=' + fixed + ')';
+  })()`)
+  if (log) console.log('     环境: 停插件动画 + 宿主底色不透明 ' + r)
+  await sleep(200)
+}
+
+/**
+ * 核对插件元素的真实几何与 EXPECT_GEOMETRY 一致。
+ * 不一致 ⇒ 硬编码的裁剪区域已失去意义，必须**大声失败**，不能静默比错地方
+ * （这正是审核方第 1 条抓出来的问题：坐标错了却一路 diff=0）。
+ */
+async function assertGeometry(s, log) {
+  const want = EXPECT_GEOMETRY[s.name]
+  if (!want) return true
+  const got = await readState(`(()=>{const e=document.querySelector(${JSON.stringify(want.sel)});
+    if(!e) return JSON.stringify({absent:true});
+    const r=e.getBoundingClientRect();
+    return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right)})})()`)
+  let g = null
+  try { g = JSON.parse(got) } catch { g = null }
+  if (!g || g.absent) {
+    console.error('  ✗ 几何核对失败：找不到 ' + want.sel + '（实际：' + String(got).slice(0, 80) + '）')
+    return false
+  }
+  const TOL = 3
+  const bad = ['l', 't', 'r'].filter((k) => Math.abs(g[k] - want[k]) > TOL)
+  if (bad.length) {
+    console.error('  ✗ 几何核对失败：' + want.sel + ' 实测 ' + JSON.stringify(g)
+      + ' 与基准记录的 ' + JSON.stringify(want) + ' 不符（差在 ' + bad.join(',') + '，容差 ' + TOL + 'px）。')
+    console.error('    硬编码的裁剪区域基于旧布局 ⇒ 继续比会得到无意义的结果。请重录基准或修正 EXPECT_GEOMETRY。')
+    return false
+  }
+  if (log) console.log('     几何核对: ' + want.sel + ' ✓ ' + JSON.stringify(g))
+  return true
+}
+
 async function prepareState(s, log) {
   // 为什么必须做：上一次状态可能开着面板，不复位的话后面的状态会**继承**它 ——
   // 实测踩到过：三个状态全都带着同一个面板，基准之间只差 0.05%，等于没区分开。
@@ -493,7 +616,12 @@ async function prepareState(s, log) {
   // ⚠️ 返回值**必须检查**：原来这里直接忽略，于是等超时/底图加载失败时照样截图，
   // 把未完成的画面录成基准（审核方复现指出）。现在把结果交给调用方决定。
   const ready = await waitImagesReady(log, s.expectHero === true)
-  return { imagesReady: ready }
+  // 环境准备（见 prepareEnvironment 注释）：对话框不透明 + 停插件动画。
+  // **必须在截图前**，且捕获与比对两次都执行，两边才看到同一种确定性画面。
+  await prepareEnvironment(log)
+  // 几何核对：确认插件元素真的还在我们假设的位置（错了就大声失败，别静默比错地方）
+  const geomOk = await assertGeometry(s, log)
+  return { imagesReady: ready, geometryOk: geomOk }
 }
 
 /**
@@ -623,12 +751,19 @@ if (mode === 'capture') {
     // 录制时以"页面当下正在显示的那张"为准，钉住它，并把 wallpaper 记进 manifest ——
     // 之后 compare 就按这个值钉回去，与轮播是否跑过无关。
     const wallpaperNow = frozen && frozen.before ? frozen.before.wallpaper : null
-    if (wallpaperNow) await pinWallpaper(wallpaperNow, true)
+    if (wallpaperNow) { if (!await pinWallpaper(wallpaperNow, true, frozen ? frozen.before : null)) throw new Error('钉图被拒绝（无有效原始设置）') }
     await resetToCleanHome(true)  // 上一轮 run 可能留下开着面板
     const manifest = {
       dir, capturedAt: new Date().toISOString(), url: cdp.url,
       // 记下"比的是哪一块"：裁剪比例不藏在代码里，改比对口径必须重录基准
-    comparison: { stableKeepRatio: STABLE_KEEP_RATIO, stableXByState: STABLE_X_BY_STATE, note: '每状态只比它自己那块（视口上方 ' + (STABLE_KEEP_RATIO * 100) + '% 且按状态竖切）；底部实时计数、装饰粒子、会话正文都不参与' },
+    // 记下"比的是哪一块"：裁剪口径不藏在代码里，改口径必须重录基准
+    comparison: {
+      rectsCss: STABLE_RECT_BY_STATE, maskRectsCss: MASK_RECTS, cssScaleAnchor: REF_CSS_WIDTH,
+      pixelTolerance: PIXEL_TOLERANCE, expectGeometry: EXPECT_GEOMETRY,
+      note: '所有矩形都是 CSS 坐标，比较时乘 cssScale(截图宽/' + REF_CSS_WIDTH + ') 换算。'
+        + '只比插件自己画的那块；宿主会话/状态栏/装饰粒子、以及声明屏蔽的框都不参与。'
+        + '像素容差 ' + PIXEL_TOLERANCE + (PIXEL_TOLERANCE === 0 ? '（严格逐字节）' : '（在容差内一致）') + '。',
+    },
     // 钉住的底图（compare 时按它钉回去，保证比的是同一张）
     pinnedWallpaper: wallpaperNow,
     rotationFrozenFrom: autoBefore,
@@ -641,6 +776,11 @@ if (mode === 'capture') {
       console.error('  ✗ ' + s.name + ' 图片未就绪，拒绝录基准（避免把不完整画面固化）。检查网络/底图文件后重跑。')
       process.exitCode = 4
       throw new Error('图片未就绪：' + s.name)
+    }
+    if (prep && prep.geometryOk === false) {
+      console.error('  ✗ ' + s.name + ' 插件元素几何与期望不符，拒绝录基准（裁剪区域会失准）。')
+      process.exitCode = 4
+      throw new Error('几何不符：' + s.name)
     }
     const probeValue = await readState(s.probe)
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
@@ -663,8 +803,88 @@ if (mode === 'capture') {
       if (exitCode === 0) exitCode = 5
     }
   }
+} else if (mode === 'selftest') {
+  // ────────────────────────────────────────────────────────────────────────────
+  // 用**真实插件元素**验证"检出能力"（审核方第 1 条要求：不能只靠改坐标，还要证明
+  // 改对了 —— 用实际元素植入变化、确认 oracle 会失败）。
+  //
+  // 做法：打开 03 设置页 → 施加环境准备 → 截图 → 在页面里**查出真实元素的 rect**
+  //   → 按那个 rect 在截图上涂色 → 走**真实 compareStableImages** 比
+  //   → 断言"必须判有差异"。
+  // 不需要基准，随时可跑；不写任何文件。
+  //
+  // 为什么必须这么做：我之前只"改了坐标"，没有任何检查能证明新坐标真的覆盖到了插件元素。
+  // 实际发生的正是漏检（审核方把 ＋图单/动态壁纸 改色，oracle 报 diff=0）。
+  // ────────────────────────────────────────────────────────────────────────────
+  const s = STATES.find((x) => x.name === '03-settings-studio')
+  console.log('=== oracle 自检：用真实插件元素验证检出能力 ===')
+
+  // 元素探测：**在插件根 .bga-studio 内**按可见文本找（比硬编码 class 稳，也避免
+  // 误抓宿主左导航里同名的"底图工坊"）。返回 CSS rect。
+  const SCOPE = `(document.querySelector('.bga-studio')||document)`
+  const byText = (txt, maxKids = 1) => `(()=>{const R=${SCOPE};
+    return [...R.querySelectorAll('button,[role="tab"],em,span,div,h2,h3')].find(e=>
+      e.children.length<=${maxKids} && String(e.textContent||'').trim()===${JSON.stringify(txt)})})()`
+  const PROBES = [
+    ['动态壁纸标签', byText('动态壁纸')],
+    ['＋图单按钮', `(()=>{const R=${SCOPE};
+      return [...R.querySelectorAll('button')].find(e=>/图单/.test(String(e.textContent||''))&&String(e.textContent||'').trim().length<8)})()`],
+    ['底图工坊标题', byText('底图工坊', 0)],
+    ['当前选择标签', byText('当前选择', 0)],
+    ['全部壁纸标题', byText('全部壁纸', 0)],
+    ['搜索框', `(()=>{const R=${SCOPE}; return R.querySelector('input[type="search"]')})()`],
+  ]
+
+  let stPass = 0, stFail = 0
+  const stOk = (n, c, e = '') => { if (c) { stPass++; console.log('  ✅ ' + n + (e ? '  [' + e + ']' : '')) } else { stFail++; console.log('  ❌ ' + n + (e ? '  [' + e + ']' : '')) } }
+
+  await prepareState(s, true)
+  const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
+  const raw = decodePng(Buffer.from(shot.data, 'base64'))
+  const sc = cssScale(raw)
+  const rect = STABLE_RECT_BY_STATE[s.name]
+  const inRect = (r) => r.l >= rect.x0 - 2 && r.r <= rect.x1 + 2 && r.t >= rect.y0 - 2 && r.b <= rect.y1 + 2
+  const masked = (MASK_RECTS[s.name] || [])
+
+  for (const [label, finder] of PROBES) {
+    const got = await readState(`(()=>{const e=${finder}; if(!e) return JSON.stringify({absent:true});
+      const r=e.getBoundingClientRect();
+      return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right),b:Math.round(r.bottom)})})()`)
+    let g = null
+    try { g = JSON.parse(got) } catch { g = null }
+    if (!g || g.absent || g.r <= g.l) { console.log('  ⏭️  ' + label + '：页面里找不到（跳过）'); continue }
+    if (!inRect(g)) { console.log('  ⏭️  ' + label + '：CSS' + JSON.stringify(g) + ' 不在比较矩形内（跳过）'); continue }
+    // 落在屏蔽框内的元素无法验证（那正是"能力缺口"）—— 标注而不是当成失败。
+    // ⚠️ MASK_RECTS 每项是 [x0, y0, x1, y1]（x 在前）。第一版我按 [x0,x1,y0,y1] 解构，
+    //    于是"当前选择"标签（在预览屏蔽框内）被判定"不在框内"，断言方向反了、误报失败。
+    const inMask = masked.some(([mx0, my0, mx1, my1]) =>
+      g.l >= mx0 - 2 && g.r <= mx1 + 2 && g.t >= my0 - 2 && g.b <= my1 + 2)
+    // 涂该元素（CSS→px，向内缩 1px 避免涂到边界外）
+    const px0 = Math.round(g.l * sc) + 1, px1 = Math.round(g.r * sc) - 1
+    const py0 = Math.round(g.t * sc) + 1, py1 = Math.round(g.b * sc) - 1
+    const painted = paint(raw, px0, py0, Math.max(px0 + 1, px1), Math.max(py0 + 1, py1), [255, 0, 255])
+    const cmp = compareStableImages(raw, painted, s.name)
+    const detected = !cmp.same
+    stOk(label + ' 改色被抓到' + (inMask ? '（注：该元素在屏蔽框内，预期抓不到）' : ''),
+      inMask ? detected === false : detected,
+      'CSS' + JSON.stringify(g) + ' → px[' + px0 + ',' + py0 + ',' + px1 + ',' + py1 + '] diff=' + cmp.diff)
+  }
+
+  // 反向：比较矩形**之外**的插件元素不应被覆盖（说明矩形没白扩）
+  const ownStudio = await readState(`(()=>{const e=document.querySelector('.bga-studio');if(!e)return 'absent';
+    const r=e.getBoundingClientRect();return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right),b:Math.round(r.bottom)})})()`)
+  let os = null
+  try { os = JSON.parse(ownStudio) } catch { os = null }
+  if (os && !os.absent) {
+    stOk('面板 .bga-studio 的水平范围被比较矩形覆盖（CSS ' + os.l + '–' + os.r + ' vs 矩形 ' + rect.x0 + '–' + rect.x1 + '）',
+      os.l >= rect.x0 && os.r <= rect.x1)
+  }
+
+  console.log('\n自检：' + stPass + ' 通过 / ' + stFail + ' 失败')
+  if (stFail > 0) exitCode = 1
+  cdp.close()
+  process.exit(exitCode)
 } else {
-  const manifest = JSON.parse(fs.readFileSync(path.join(baseDir, 'manifest.json'), 'utf8'))
   // 比对时：冻结轮播 + **钉回基准里记的那张底图**。
   // 只关轮播是不够的：录制之后轮播可能已经换过图，那"现在这张"与基准那张就不是同一张 ——
   // 实测连踩三次（洁西卡金蜜 → 重返未来1999 → 百夫长），探针里能直接看到 url 不同。
@@ -678,7 +898,7 @@ if (mode === 'capture') {
   try {
     const frozen = await freezeRotation(true)
     autoBefore = frozen ? frozen.raw : null
-    if (manifest.pinnedWallpaper) await pinWallpaper(manifest.pinnedWallpaper, true)
+    if (manifest.pinnedWallpaper) { if (!await pinWallpaper(manifest.pinnedWallpaper, true, frozen ? frozen.before : null)) throw new Error('钉图被拒绝（无有效原始设置）') }
     else console.log('   ⚠️ 基准里没有 pinnedWallpaper（旧基准？）—— 只能冻结轮播，可能被换图干扰')
     // **必须**在开始逐个状态之前先复位。03 状态会主动打开设置面板且不会自己关，
     // 而 DSH 还会把"面板开着"这个状态跨刷新保留 —— 于是下一次 run 的 01 状态直接拍到
@@ -695,6 +915,11 @@ if (mode === 'capture') {
     if (prep && prep.imagesReady === false) {
       notReady++
       console.log('  ⚠️  ' + s.name + '  图片未就绪，本次跳过（不算回归，也不算通过）')
+      continue
+    }
+    if (prep && prep.geometryOk === false) {
+      notReady++
+      console.log('  ⚠️  ' + s.name + '  插件元素几何与期望不符，本次跳过（裁剪区域失准，结果无意义）')
       continue
     }
     const probeNow = await readState(state ? state.probe : 'null')

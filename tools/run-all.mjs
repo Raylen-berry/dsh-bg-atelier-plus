@@ -44,6 +44,9 @@ const SUITES = [
   // oracle 的还原判定：三态契约 + 退出码语义 + 源码层断言（capture 不许写死 exit(0)）。
   // 30 项；做过变异测试：把末尾改回 exit(0) 或让 not-needed 判 failed 都会让它失败。
   'tools/verify-oracle-restore.mjs',
+  // oracle 的**完整控制流**：把真函数装进沙箱跑（读失败→钉图必须被拒、无需还原≠失败）。
+  // 14 项；做过变异测试：撤掉守卫后本套件失败。
+  'tools/verify-oracle-flow.mjs',
   'tools/verify-settings.mjs',
   'tools/test-playlists.mjs',
   // 底图去重（贝利尔两对：同内容两个名字 → 硬链接）。离线自足：清单校验那几项在 CI 照跑，

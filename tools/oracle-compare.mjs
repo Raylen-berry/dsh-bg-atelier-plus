@@ -48,22 +48,63 @@ export const PIXEL_TOLERANCE = Number(process.env.VB_TOLERANCE || 0)
  *
  * 提交说明里必须写"**严格逐字节**"还是"**在容差内一致**" —— 脚本的结论文案已按此分档。 */
 
-/** 每个状态比哪一块（理由见 visual-baseline.mjs）。 */
-export const STABLE_X_BY_STATE = {
-  '01-static-wallpaper': [0, 282],
-  '02-fx-nodes': [0, 282],
-  // 右边界 **1085**（此前 1300 → 1280 都是错的）。
-  // 实测：设置面板 .bga-studio 的实际右边界是 **x=1081**（studioWidth=560）。
-  // 原来比到 1280/1300，那段其实落在宿主对话框的遮罩 DIV.wCInkW_mask 上 ——
-  // **不是插件画的东西**，而且不稳定（那条带实测 diff=22163、maxΔ=41），
-  // 会随宿主的遮罩/滚动条渲染而变，于是 03 反复报差异。
-  // 定位手法：document.elementFromPoint(1200, y) 在全高都返回 wCInkW_mask ⇒ 说明越界。
-  '03-settings-studio': [340, 1085],
-}
-const DEFAULT_X = [0, 282]
+/**
+ * 坐标系的**唯一约定**（这一条是被审核方抓出来的严重错误后补的）：
+ *
+ * ⚠️ **本文件里所有 x/y 数字一律是 CSS 像素**（`getBoundingClientRect()` 那套坐标），
+ *    比较前必须乘 devicePixelRatio 换算到截图像素。
+ *
+ * 原来的错误：我把 CSS 坐标写进表里，而 cropStable 用 `scale = img.width / REF_WIDTH`
+ * 换算 —— 而 REF_WIDTH=1654 恰好等于截图宽度 ⇒ scale=1.0 ⇒ **根本没换算**。
+ * 于是 CSS 的 1085（面板右边界）被当成截图像素的 1085 用，实际只裁到 CSS x≈930，
+ * **整个裁剪范围偏小 16.7%**；「＋图单」「动态壁纸」等按钮全在裁剪外，改色也报 diff=0。
+ * 我此前"其余按钮照常严格比较"的说法因此**不成立**，已撤回。
+ *
+ * 实测本机：innerWidth=1418 CSS、截图宽 1654 px ⇒ dpr = 1654/1418 ≈ 1.1664。
+ * 所以基准视口的 CSS 宽度是 **1418**，不是 1654。
+ */
+/** 基准视口的 **CSS** 宽度（截图宽 = 它 × dpr）。换算锚点用它，不用截图像素数。 */
+export const REF_CSS_WIDTH = Number(process.env.VB_REF_CSS_WIDTH || 1418)
+/** 基准视口的 **CSS** 高度（用于纵向比例）。 */
+export const REF_CSS_HEIGHT = Number(process.env.VB_REF_CSS_HEIGHT || 776)
 
-/** 基准视口宽，用来把竖切坐标按比例换算到别的尺寸。 */
-export const REF_WIDTH = 1654
+/**
+ * 每个状态比哪一块 —— **全部是 CSS 坐标**（矩形，不是只有 x）。
+ *
+ * 为什么从"只有 x 范围 + 固定保留比例"改成"完整矩形"：
+ *   03 状态的面板在对话框里，对话框 CSS rect = [309,24,1109,752]。
+ *   原来纵向用的是 `STABLE_KEEP_RATIO=0.80`（截图 y0–723 ⇒ CSS y0–620），于是
+ *     · **多比了**对话框之上的宿主背景（截图 y0–27 是 modal 遮罩盖在对话上，会变）
+ *     · **漏比了**插件面板的下半部分（面板可见到 CSS y752，原来只到 620）
+ *   矩形化之后两个毛病一起没有了。各状态矩形都由**实测 getBoundingClientRect** 得出。
+ */
+export const STABLE_RECT_BY_STATE = {
+  // 侧边栏：CSS x 0–242（x≥243 起是宿主会话列表右侧的"X天前"标签列，会随时间变）
+  // 纵向 0–620：再往下是宿主底部状态栏（"N 轮 M 步 · tok/s"）与装饰粒子，天然在变
+  '01-static-wallpaper': { x0: 0, x1: 242, y0: 0, y1: 620 },
+  '02-fx-nodes': { x0: 0, x1: 242, y0: 0, y1: 620 },
+  // 03：插件面板 .bga-studio 实测 CSS [521,78,1081,1419]（可滚动，超出视口），
+  // 对话框 [309,24,1109,752] 把它裁到 y≤752。取 x 515–1085（含面板边缘余量）、
+  // y 74–750（面板可见区，且不含对话框之上的宿主背景）。
+  '03-settings-studio': { x0: 515, x1: 1085, y0: 74, y1: 750 },
+}
+
+/** 兼容旧的只取 x 的用法（审计脚本曾用）。 */
+export const STABLE_X_BY_STATE = Object.fromEntries(
+  Object.entries(STABLE_RECT_BY_STATE).map(([k, v]) => [k, [v.x0, v.x1]]))
+const DEFAULT_RECT = { x0: 0, x1: 242, y0: 0, y1: 620 }
+
+/**
+ * **实测几何**：运行时要核对的元素位置（CSS）。与上表不符 ⇒ 说明面板挪了/没打开，
+ * 那时硬编码的裁剪区域就失去意义，必须**大声失败**而不是静默比错地方。
+ * 容差 ±3 CSS px 用于吸收亚像素/滚动条出现的抖动。
+ */
+export const EXPECT_GEOMETRY = {
+  '03-settings-studio': { sel: '.bga-studio', l: 521, t: 78, r: 1081 },
+}
+
+/** @deprecated 保留导出名兼容旧引用；换算锚点改用 REF_CSS_WIDTH（见坐标系约定）。 */
+export const REF_WIDTH = REF_CSS_WIDTH
 
 /**
  * 会话列表里**随时间变化的文字**——要屏蔽掉，但不能整块不要。
@@ -82,47 +123,51 @@ export const REF_WIDTH = 1654
  */
 export const MASK_RECTS = {
   // 会话列表项里的日期/时间文字（宿主），随日期变（实测 "1天"→"3天"）
-  '01-static-wallpaper': [[0, 610, 110, 640]],
-  '02-fx-nodes': [[0, 610, 110, 640]],
+  // **CSS 坐标**：x 0–94、y 523–549（截图值 ÷ dpr 1.1664 换算而来）
+  '01-static-wallpaper': [[0, 523, 94, 549]],
+  '02-fx-nodes': [[0, 523, 94, 549]],
   // 03 设置页：面板头部的**大图预览框**要屏蔽 —— 见 PREVIEW_BOX 注释。
-  // 它不是"宿主的东西"，而是"浏览器对 43MP 图的重采样跨刷新不确定"（实测 diff=11618、maxΔ=3，
-  // 而同会话内连截 4 张是 diff=0）。面板其余像素（布局/导航/文字/按钮）照常比较。
+  // .bga-hero 实测 CSS rect=[521,152,560,204]，这里取 x 515–1088、y 148–362（含余量）。
   '03-settings-studio': [[515, 148, 1088, 362]],
 }
 
 /**
- * 大图预览框的位置（`.bga-hero` 外框 + 余量），仅作说明与文档用（屏蔽已写进 MASK_RECTS）。
+ * 大图预览框的位置（**CSS 坐标**；`.bga-hero` 实测 rect=[521,152,560,204] + 余量）。
  *
- * 实测结论（审核方要求"先定位抖动、别急着下结论"，结论与我原先的猜测**不同**）：
+ * 实测观察（审核方要求"先定位抖动、别急着下结论"）：
  *   · `.bga-hero-image` 用的是 **`cur.url` 原图**（9744×4500 ≈ 43 MP），CSS `object-fit:cover`
- *     缩到 **558×202**，缩放倍率 **17.46×**；
- *   · **同一会话内连截 4 张** ⇒ 预览区 diff=0（稳定）；
+ *     缩到 **558×202 CSS**，缩放倍率 **17.46×**；
+ *   · **同一会话内连截 4 张** ⇒ 预览区 diff=0；
  *   · **刷新页面后再截** ⇒ diff=11618、maxΔ=3（小但非零）。
- *   ⇒ 不稳定来自"超大图跨刷新的重采样"，**不是**抗锯齿、**不是**内容变化、**不是**淡入未完成
- *     （我查过 opacity=1 且 0→15s 完全不变）。
- *   这一段对"绘制逻辑回归"没有信息量（换张超大图就变），所以屏蔽。
+ *   ⇒ 差异与"刷新"相关。**目前只能列为候选原因**（审核方指出：尚不足以排除其他绘制差异）。
+ *     要坐实需补一个用中等尺寸图的对照状态。
  *
- * 若要真正验证预览取景，应**另加一个用中等尺寸图的稳定状态**，而不是放宽容差 ——
+ * 若要真正验证预览取景，应**另加一个用中等尺寸图的稳定状态**做对照，而不是放宽容差 ——
  * 放宽容差会连"整屏偏色"一起放过（那个教训见 PIXEL_TOLERANCE 注释）。
  */
 export const PREVIEW_BOX = { x0: 515, y0: 148, x1: 1088, y1: 362 }
 
-/** 只保留稳定区（竖切 + 按 STABLE_KEEP_RATIO 裁底部 + 屏蔽宿主随时间变的文字框）。 */
+/** CSS 坐标 → 截图像素的比例（截图宽 / 基准 **CSS** 宽）。 */
+export function cssScale(img) { return img.width / REF_CSS_WIDTH }
+
+/** 只保留稳定区（按状态矩形裁剪 + 屏蔽随时间变的框）。
+ *  表里数字是 **CSS 坐标**，这里统一乘 cssScale() 换算到截图像素。 */
 export function cropStable(img, stateName) {
-  const keep = Math.max(1, Math.floor(img.height * STABLE_KEEP_RATIO))
-  const range = STABLE_X_BY_STATE[stateName] || DEFAULT_X
-  const scale = img.width / REF_WIDTH
-  const x0 = Math.max(0, Math.min(img.width - 1, Math.round(range[0] * scale)))
-  const x1 = Math.max(x0 + 1, Math.min(img.width, Math.round(range[1] * scale)))
-  const w = x1 - x0
-  const out = Buffer.alloc(w * keep * 4)
-  for (let y = 0; y < keep; y++) {
-    img.data.copy(out, y * w * 4, (y * img.width + x0) * 4, (y * img.width + x0) * 4 + w * 4)
+  const scale = cssScale(img)          // ← 关键：锚点是 CSS 宽度(1418)，不是截图宽度
+  const r = STABLE_RECT_BY_STATE[stateName] || DEFAULT_RECT
+  const x0 = Math.max(0, Math.min(img.width - 1, Math.round(r.x0 * scale)))
+  const x1 = Math.max(x0 + 1, Math.min(img.width, Math.round(r.x1 * scale)))
+  const y0 = Math.max(0, Math.min(img.height - 1, Math.round(r.y0 * scale)))
+  const y1 = Math.max(y0 + 1, Math.min(img.height, Math.round(r.y1 * scale)))
+  const w = x1 - x0, h = y1 - y0
+  const out = Buffer.alloc(w * h * 4)
+  for (let y = 0; y < h; y++) {
+    img.data.copy(out, y * w * 4, ((y + y0) * img.width + x0) * 4, ((y + y0) * img.width + x0) * 4 + w * 4)
   }
-  // 屏蔽（在**裁剪后**的坐标系里，按同样比例换算）；涂中性灰，双方一致 ⇒ 该处永不产生差异
+  // 屏蔽（换算到**裁剪后**的局部坐标）；涂中性灰，双方一致 ⇒ 该处永不产生差异
   for (const [mx0, my0, mx1, my1] of (MASK_RECTS[stateName] || [])) {
     const a = Math.max(0, Math.round(mx0 * scale) - x0), b = Math.max(0, Math.round(mx1 * scale) - x0)
-    const c = Math.max(0, Math.round(my0 * scale)), d = Math.min(keep, Math.round(my1 * scale))
+    const c = Math.max(0, Math.round(my0 * scale) - y0), d = Math.min(h, Math.round(my1 * scale) - y0)
     for (let y = c; y < d; y++) {
       for (let x = a; x < b && x < w; x++) {
         const o = (y * w + x) * 4
@@ -130,7 +175,7 @@ export function cropStable(img, stateName) {
       }
     }
   }
-  return { width: w, height: keep, channels: 4, data: out }
+  return { width: w, height: h, channels: 4, data: out }
 }
 
 /** 读 PNG → 裁稳定区。 */
