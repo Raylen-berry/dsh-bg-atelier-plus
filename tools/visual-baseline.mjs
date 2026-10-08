@@ -73,6 +73,9 @@ export const STATES = [
     name: '03-settings-studio',
     note: '底图工坊设置页（自绘 UI；重构最容易被带偏的地方）',
     settleMs: 6000,  // 设置页里的底图预览要解码一张几 MB 的图 + 套 framing；2500 实测不够，会拍到半成品
+    // 这个状态**期望**面板头部有底图预览（.bga-hero-image）。审核方指出：不区分"首页"与
+    // "设置页"的话，预览图"还没插进 DOM"（absent）会被当成"本来就没有"而提前放行。
+    expectHero: true,
     // 打开路径：侧边栏"设置" → 左导航"底图工坊"。用 DOM 直点，不依赖 :has-text（本工具链不支持）。
     // 实测：走完之后 .bga-studio 存在且是 560×1341 —— 这才是真正覆盖到插件 UI 的状态。
     open: `(()=>{const b=[...document.querySelectorAll('button,[role="button"]')].find(x=>String(x.textContent||'').trim()==='设置');if(b)b.click();return 'clicked-settings'})()`,
@@ -88,12 +91,27 @@ export const STATES = [
 ]
 
 // ---------------------------------------------------------------- CDP 客户端
+/** DSH GUI 的地址（要对着它做视觉回归，不是随便哪个标签页）。 */
+const GUI_HOST = process.env.VB_GUI_HOST || '127.0.0.1:19387'
+
 async function cdpSession(port) {
   let list
   try { list = await (await fetch('http://127.0.0.1:' + port + '/json/list')).json() }
   catch { throw new Error('CDP 端口 ' + port + ' 没响应。先让 agent 跑 browser_open{use:"plugin"}；或用 VB_CDP_PORT 指到别的实例') }
-  const page = list.find((t) => t.type === 'page')
-  if (!page) throw new Error('CDP 里没有 page target')
+
+  // ⚠️ **不能随便挑一个 page**。原来写的是 `list.find(t => t.type === 'page')` —— 拿的是
+  // "第一个/当前激活的"标签页。而浏览器是共用的：实测它当时停在 chatgpt.com 与
+  // deepseekdocs.com 上，于是脚本对着**别的网站**执行探针，预检报 ok:404、
+  // 表现成"页面 fetch 通道不可用"，与真实原因（跑错页面）完全不符。
+  // 现在**按 URL 找 DSH GUI**；找不到就明确报出来，不猜。
+  const pages = list.filter((t) => t.type === 'page')
+  const mine = pages.filter((t) => String(t.url || '').includes(GUI_HOST))
+  if (mine.length === 0) {
+    throw new Error('CDP 里没有 DSH GUI 的标签页（期望 URL 含 "' + GUI_HOST + '"，实际有：'
+      + pages.map((t) => String(t.url || '').slice(0, 60)).join(' | ')
+      + '）。先跑 browser_open{gui:true} 把 GUI 打开。可用 VB_GUI_HOST 改期望地址。')
+  }
+  const page = mine[0]
   const ws = new WebSocket(page.webSocketDebuggerUrl)
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = (e) => rej(new Error('CDP 连接失败: ' + (e.message || e))) })
   let id = 0
@@ -229,7 +247,7 @@ async function readState(expr) {
 // 结果两份实现漂移了（审核方指出：审计还是旧的"先裁后缩"顺序，11/11 没测到真实路径）。
 // 现在两边都 import 同一份，不再有第二份实现。
 import {
-  STABLE_KEEP_RATIO, STABLE_X_BY_STATE, compareStableFiles,
+  STABLE_KEEP_RATIO, STABLE_X_BY_STATE, PIXEL_TOLERANCE, compareStableFiles,
 } from './oracle-compare.mjs'
 
 // 本文件内部沿用旧名字，避免大改调用点
@@ -338,19 +356,67 @@ async function restoreRotation(before, log) {
   })()`)
   if (log) console.log('     轮播还原·写盘: ' + r)
 
-  // 刷新让客户端内存同步；随后回读确认磁盘也仍是 true（防止刷新过程中又被写回 false）
+  // 刷新让客户端内存同步；随后**同时**确认磁盘与客户端内存。
+  //
+  // ⚠️ 修两个会被误判成"还原成功"的缺口（审核方复核指出）：
+  //   ① 原来 `try { reload } catch {}` **把刷新失败吞掉**，然后只读磁盘 ⇒ 磁盘是 true
+  //      就返回成功，而页面内存可能仍是 false，下一次保存又把磁盘改回去。
+  //      现在刷新失败**向上传递**（reloadErr 记录并在最后如实报出）。
+  //   ② 原来只检查磁盘，**没确认客户端内存**。现在额外探客户端实际状态：
+  //      用底图插件暴露的 STORE（如果拿得到）或退而求其次——检查页面上"轮播"开关的
+  //      实际勾选状态；两者都拿不到时至少把"未能确认内存"如实写进结果。
   await sleep(300)
-  try { await cdp.send('Page.reload', { ignoreCache: false }) } catch { /* 用 navigate 兜底 */ }
+  let reloadErr = null
+  try { await cdp.send('Page.reload', { ignoreCache: false }) } catch (e) { reloadErr = e }
   await sleep(3500)
+  if (reloadErr) {
+    console.error('     ❌ 刷新页面失败（' + String(reloadErr.message || reloadErr).slice(0, 80) + '）'
+      + ' —— 客户端内存可能仍是 autoOn=false，下次保存会把磁盘改回去。还原**未确认**。')
+  }
+
+  // 磁盘
   const verifyRaw = await readState(`(async()=>{const x=await fetch('/bga/settings.json',{cache:'no-store'});return await x.text()})()`).catch(() => null)
   let v = null
   try { v = JSON.parse(verifyRaw) } catch { v = null }
-  const restored = !!(v && v.autoOn === true)
-  if (log) console.log('     轮播还原·回读: autoOn=' + (v ? v.autoOn : '读不到') + (restored ? ' ✅' : ' ❌ 仍未还原'))
+  const diskOk = !!(v && v.autoOn === true)
+
+  // 客户端内存：读插件自己挂的**只读观测点** window.__bgaStateProbe()。
+  // 为什么必须有这一条：磁盘与客户端内存是两份；客户端在任何变更时会把**内存整份写回**，
+  // 所以"磁盘是 true"根本不能证明"内存是 true"。实测踩到：oracle 跑完后 autoOn=False。
+  // 观测点由插件在 client.js 末尾挂出（只读快照，含轮播定时器是否在跑 = 内存态的直接证据）。
+  const memProbe = await readState(`(()=>{
+    try {
+      if (typeof window.__bgaStateProbe === 'function') {
+        const s = window.__bgaStateProbe();
+        return JSON.stringify({ src:'probe', autoOn: s.autoOn === true, autoPending: s.autoPending === true, autoMin: s.autoMin });
+      }
+      // 退路：设置页里的"自动切换"开关（input[type=checkbox] 勾选态）
+      const d=document.querySelector('[role="dialog"]');
+      const scope=d||document;
+      const boxes=[...scope.querySelectorAll('input[type=checkbox]')];
+      for(const b of boxes){
+        const txt=(b.closest('label')||b.parentElement||{}).textContent||'';
+        if(/自动|轮播|定时|切换/.test(String(txt))) return JSON.stringify({ src:'switch', autoOn: b.checked===true });
+      }
+      return JSON.stringify({ src:'unavailable' });
+    } catch(e){ return JSON.stringify({ src:'error', msg:String(e.message).slice(0,60) }) }
+  })()`).catch(() => null)
+  let mem = null
+  try { mem = JSON.parse(memProbe) } catch { mem = null }
+  const memKnown = !!(mem && mem.src !== 'unavailable' && mem.src !== 'error')
+  const memOk = memKnown ? mem.autoOn === true : null
+
+  if (log) {
+    console.log('     轮播还原·磁盘: autoOn=' + (v ? v.autoOn : '读不到') + (diskOk ? ' ✅' : ' ❌'))
+    console.log('     轮播还原·内存: ' + (memKnown ? ('autoOn=' + mem.autoOn + (memOk ? ' ✅' : ' ❌') + '（来自 ' + mem.src + '）')
+      : '未能确认（无可用探针）—— 不计为成功'))
+  }
+  // **要求磁盘与内存都确认**：内存确认不了就不算成功（宁可报失败让人看见）
+  const restored = diskOk && !reloadErr && memOk === true
   if (!restored) {
-    // 不静默放过：还原失败意味着"用户的轮播被我们关掉了"，必须让人看见
-    console.error('     ⚠️ 轮播未能还原（autoOn 仍不是 true）—— 请手动检查 ' +
-      '$DSH_HOME/dsh-bg-atelier-plus/settings.json 的 autoOn，或重新跑一次本脚本')
+    console.error('     ⚠️ 轮播未能确认还原：磁盘=' + (diskOk ? 'true ✅' : '仍未 true ❌')
+      + '、内存=' + (memKnown ? String(memOk) : '未能确认') + (reloadErr ? '、刷新失败' : '')
+      + '。请检查 $DSH_HOME/dsh-bg-atelier-plus/settings.json 的 autoOn，或重跑本脚本。')
   }
   return restored
 }
@@ -405,7 +471,7 @@ async function prepareState(s, log) {
   //
   // ⚠️ 返回值**必须检查**：原来这里直接忽略，于是等超时/底图加载失败时照样截图，
   // 把未完成的画面录成基准（审核方复现指出）。现在把结果交给调用方决定。
-  const ready = await waitImagesReady(log)
+  const ready = await waitImagesReady(log, s.expectHero === true)
   return { imagesReady: ready }
 }
 
@@ -425,7 +491,7 @@ async function prepareState(s, log) {
  *
  * 返回 true/false，**调用方必须检查** —— 原来调用方直接忽略返回值继续截图（见下）。
  */
-async function waitImagesReady(log, waitMs = 30000) {
+async function waitImagesReady(log, expectHero = false, waitMs = 30000) {
   const t0 = Date.now()
   for (;;) {
     const r = await readState(`(async()=>{
@@ -491,8 +557,15 @@ async function waitImagesReady(log, waitMs = 30000) {
       // 滚动视口就不加载的缩略图；而面板刚打开那一瞬间，有 2 张恰好被判定为可见、
       // 正在加载 —— 但它们的加载与"画面是否稳定"无关（它们在面板下方/边缘，截图里
       // 也几乎看不出来）。原来等它们 ⇒ 每次都在这一步超时 30s、03 被误判"未就绪"。
-      // 关键图就绪 + 没有坏图，才叫"这一帧可以截"。
-      const criticalReady = v.bg === 'ready' && (v.heroState === 'ready' || v.heroState === 'absent')
+      // ⚠️ `absent` 不能无条件接受（审核方复核指出）：
+      //   原来写成 `heroState === 'ready' || heroState === 'absent'`，于是"预览图还没被插进
+      //   DOM"（absent）与"这个状态本来就没有预览图"被当成同一件事 —— 设置页明明应该在
+      //   面板头部显示当前底图的预览，如果它 missing 了，那是**没渲染完**，不是"无需等待"。
+      //   修法：由调用方告诉本函数"这个状态是否期望有预览图"（expectHero）。
+      const heroOk = expectHero
+        ? v.heroState === 'ready'                    // 期望有 ⇒ 必须真就绪
+        : (v.heroState === 'ready' || v.heroState === 'absent')  // 不期望 ⇒ absent 是正常的
+      const criticalReady = v.bg === 'ready' && heroOk
       if (criticalReady && v.broken === 0) {
         if (log) console.log('     图片就绪: 底图 ready，预览图 ' + v.heroState
           + (v.pending ? '（另有 ' + v.pending + ' 张懒加载缩略图仍在加载，不影响本帧）' : '')
@@ -560,7 +633,12 @@ if (mode === 'capture') {
   console.log('\n基准已建立：' + manifest.states.length + ' 个状态 → ' + baseDir)
   console.log('重构后跑： node tools/visual-baseline.mjs compare ' + dir)
   } finally {
-    await restoreRotation(autoBefore, true)
+    // 同 compare：还原失败要影响退出码（原来返回值被忽略）
+    const restored = await restoreRotation(autoBefore, true)
+    if (restored !== true) {
+      console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
+      if (exitCode === 0) exitCode = 5
+    }
   }
 } else {
   const manifest = JSON.parse(fs.readFileSync(path.join(baseDir, 'manifest.json'), 'utf8'))
@@ -622,8 +700,14 @@ if (mode === 'capture') {
     + (notReady ? ' / ' + notReady + ' 未就绪跳过' : ''))
   // 「未就绪」也**不算通过** —— 不能让"图没加载完"悄悄变成绿灯（审核方指出的缺陷）
   const okAll = diff === 0 && missing === 0 && probeDiffs.length === 0 && notReady === 0
+  // ⚠️ 结论文案**必须写明容差**：容差 >0 时"一致"只在容差内成立，不能说成"完全一致"。
+  // 有容差时它挡不住"整屏每通道偏色几级"（审核方复核证明整个保留区 +5 仍报 same=true），
+  // 所以结论按容差分档措辞。
+  const tolNote = PIXEL_TOLERANCE > 0
+    ? '（在每通道 ±' + PIXEL_TOLERANCE + ' 级容差内一致；容差内的大面积低幅变化**不会被发现**）'
+    : '（严格逐字节，无容差）'
   console.log(okAll
-    ? '✓ 视觉无回归'
+    ? '✓ 视觉一致' + tolNote
     : (notReady && diff === 0
       ? '✗ 有状态未就绪（图未加载完）—— 重跑一次通常就好；持续出现请查底图文件与网络'
       : '✗ 有差异 —— 逐张看 *.after.png'))
@@ -631,7 +715,14 @@ if (mode === 'capture') {
   // 退出码放到 finally 之后统一设置（原来在 try 里直接 exit 会让还原被跳过）。
   exitCode = okAll ? 0 : 1
   } finally {
-    await restoreRotation(autoBefore, true)
+    // **还原失败必须影响退出码**（审核方复核指出：原来返回值被忽略，
+    // "比较全过 + 还原失败"会 exit=0，等于把"用户的轮播被我们关掉了"报成成功）。
+    // 用独立退出码 5，与"有视觉差异(1)""未就绪(1)""页面通道挂(3)""拒绝录基准(4)"区分开。
+    const restored = await restoreRotation(autoBefore, true)
+    if (restored !== true) {
+      console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
+      if (exitCode === 0) exitCode = 5
+    }
   }
   cdp.close()
   process.exit(exitCode)

@@ -3176,6 +3176,33 @@ function apply(ctx) {
     // 会让宿主把整层 override 判废 ⇒ 底图被不透明外壳盖住，这条缝专门用来拦那种改动。
     tokenKeys: function () { return Object.keys(buildTokens(STORE.state)) },
   }
+
+  // 只读观测点（给实机脚本用，例如 tools/visual-baseline.mjs 验证"设置已还原到内存"）。
+  //
+  // 为什么需要它：host 侧的 settings.json 与**客户端内存里的 STORE.state 是两份**。
+  // 脚本改了磁盘、但客户端内存可能仍是旧值；而客户端在任何变更时会把**内存**整份写回，
+  // 于是"磁盘看起来还原了"会在下一次写回时被打回。实测踩到：oracle 跑完后
+  // autoOn=False（我写进磁盘的 true 被内存里的 false 覆盖）。
+  // 只凭磁盘检查无法发现这件事 ⇒ 必须能看到内存值。
+  //
+  // 只暴露**读取**（不能改、也不含内部引用）：返回一个快照 + 定时器是否在跑。
+  // 与 exports.internals 是同一套路（本插件已有的测试缝），但那条缝只在模块层面，
+  // 实机脚本拿不到，所以这里额外挂一个 window 上的只读窄接口。
+  try {
+    if (typeof window !== 'undefined' && window) {
+      window.__bgaStateProbe = function () {
+        var s = STORE.state || {}
+        return {
+          autoOn: s.autoOn === true,
+          autoMin: s.autoMin,
+          autoPending: autoTimer !== 0,     // 轮播定时器此刻是否在跑（内存状态的直接证据）
+          wallpaper: s.wallpaper ? { file: s.wallpaper.file, cat: s.wallpaper.cat } : null,
+          weId: s.weId == null ? null : String(s.weId),
+          fieldCount: Object.keys(s).length,
+        }
+      }
+    }
+  } catch (e) { /* 观测点失败不影响插件本身 */ }
   return module.exports
   }
 })
