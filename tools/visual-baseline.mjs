@@ -248,6 +248,7 @@ async function readState(expr) {
 // 现在两边都 import 同一份，不再有第二份实现。
 import {
   STABLE_KEEP_RATIO, STABLE_X_BY_STATE, PIXEL_TOLERANCE, compareStableFiles,
+  rotationRestoreNeed, judgeRotationRestore,
 } from './oracle-compare.mjs'
 
 // 本文件内部沿用旧名字，避免大改调用点
@@ -320,13 +321,31 @@ async function pinWallpaper(wallpaper, log) {
   if (log) console.log('     钉图后已刷新页面')
 }
 
-/** 还原轮播设置：把捕获前读到的**整份** JSON 原样写回。 */
+/**
+ * 还原轮播设置。**返回三态字符串，不是布尔** —— 这一点被审核方指出了漏洞：
+ *
+ *   返回 'restored'   已还原（或**本来就不需要还原**，例如用户原本就关着轮播）
+ *   返回 'skipped'    没有可还原的原值（本来就没冻结成功）—— 无需报错
+ *   返回 'failed'     确实需要还原但没成功 —— **调用方必须据此置失败退出码**
+ *
+ * 为什么要三态：原来只返回 true/undefined，调用方写 `if (restored !== true)` ⇒
+ * "用户原本就关着轮播"（无需还原、返回 undefined）被**误报成还原失败**，
+ * 结果一次正常的运行以 exit=5 结束（审核方模拟"轮播原本关闭 + 视觉比较通过"复现）。
+ * "无需还原"与"还原失败"是两件事，必须在返回值里分开。
+ */
 async function restoreRotation(before, log) {
-  if (!before) { if (log) console.log('     轮播: 没有可还原的原值'); return }
+  // 判断逻辑走 oracle-compare.mjs 的**纯函数**（这样能离线单测，见该文件注释）
+  const need = rotationRestoreNeed(before)
+  if (need === 'skip') {
+    if (log) console.log('     轮播: 没有可还原的原值（当初就没冻结成功）—— 无需还原，不算失败')
+    return 'skipped'
+  }
+  if (need === 'not-needed') {
+    if (log) console.log('     轮播: 原本就是关的，无需还原（不算失败）')
+    return 'restored'
+  }
   let want = null
-  try { want = JSON.parse(before) } catch { /* 原值坏了就不写 */ }
-  if (!want || typeof want !== 'object') { if (log) console.log('     轮播: 原值不可解析，不写回'); return }
-  if (want.autoOn !== true) { if (log) console.log('     轮播: 原本就是关的，无需还原'); return }
+  try { want = JSON.parse(before) } catch { /* 已由 need 判定过，这里必然可解析 */ }
   // 还原时**把当前 wallpaper 一起带回原值**：冻结期间轮播可能已经换过图，
   // 磁盘上的 wallpaper 字段可能已经不是原来那张。整份回填会把 wallpaper 也还原成
   // 采集前那张 —— 但那和"当前页面上正在显示的那张"又可能不一致。
@@ -411,14 +430,16 @@ async function restoreRotation(before, log) {
     console.log('     轮播还原·内存: ' + (memKnown ? ('autoOn=' + mem.autoOn + (memOk ? ' ✅' : ' ❌') + '（来自 ' + mem.src + '）')
       : '未能确认（无可用探针）—— 不计为成功'))
   }
-  // **要求磁盘与内存都确认**：内存确认不了就不算成功（宁可报失败让人看见）
-  const restored = diskOk && !reloadErr && memOk === true
-  if (!restored) {
+  // 判定也走纯函数（可离线单测）
+  const outcome = judgeRotationRestore(need, {
+    diskOk, memKnown, memOk, reloadFailed: !!reloadErr,
+  })
+  if (outcome === 'failed') {
     console.error('     ⚠️ 轮播未能确认还原：磁盘=' + (diskOk ? 'true ✅' : '仍未 true ❌')
       + '、内存=' + (memKnown ? String(memOk) : '未能确认') + (reloadErr ? '、刷新失败' : '')
       + '。请检查 $DSH_HOME/dsh-bg-atelier-plus/settings.json 的 autoOn，或重跑本脚本。')
   }
-  return restored
+  return outcome
 }
 
 /**
@@ -633,9 +654,11 @@ if (mode === 'capture') {
   console.log('\n基准已建立：' + manifest.states.length + ' 个状态 → ' + baseDir)
   console.log('重构后跑： node tools/visual-baseline.mjs compare ' + dir)
   } finally {
-    // 同 compare：还原失败要影响退出码（原来返回值被忽略）
-    const restored = await restoreRotation(autoBefore, true)
-    if (restored !== true) {
+    // **只有 'failed' 才算失败**（三态契约见 restoreRotation 头注释）：
+    // 'restored' = 已还原或本来就不需要还原；'skipped' = 当初没冻结成功、无可还原。
+    // 原来写 `!== true` 会把"用户原本就关着轮播"误报成失败（审核方复现）。
+    const outcome = await restoreRotation(autoBefore, true)
+    if (outcome === 'failed') {
       console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
       if (exitCode === 0) exitCode = 5
     }
@@ -718,8 +741,10 @@ if (mode === 'capture') {
     // **还原失败必须影响退出码**（审核方复核指出：原来返回值被忽略，
     // "比较全过 + 还原失败"会 exit=0，等于把"用户的轮播被我们关掉了"报成成功）。
     // 用独立退出码 5，与"有视觉差异(1)""未就绪(1)""页面通道挂(3)""拒绝录基准(4)"区分开。
-    const restored = await restoreRotation(autoBefore, true)
-    if (restored !== true) {
+    // **只有 'failed' 才算失败** —— 'restored'（含"用户原本就关着轮播"）与 'skipped'
+    // 都不是失败（三态契约见 restoreRotation 头注释）。
+    const outcome = await restoreRotation(autoBefore, true)
+    if (outcome === 'failed') {
       console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
       if (exitCode === 0) exitCode = 5
     }
@@ -729,4 +754,8 @@ if (mode === 'capture') {
 }
 
 cdp.close()
-process.exit(0)
+// ⚠️ 这里原来写死 `process.exit(0)` —— 而 capture 分支的 finally 会把 exitCode 置成 5
+// （还原失败），于是出现"内部分支知道失败了(exitCode=5)、进程却仍退出 0"。
+// 审核方模拟"录制成功 + 还原失败"复现了这个不一致。
+// 统一用 exitCode（capture 成功时它本来就是 0，没有副作用）。
+process.exit(exitCode)

@@ -27,7 +27,7 @@ const manifest = JSON.parse(fs.readFileSync(path.join(BASE, 'manifest.json'), 'u
 import {
   STABLE_KEEP_RATIO as KEEP_RATIO,
   STABLE_X_BY_STATE as X_BY_STATE,
-  PIXEL_TOLERANCE,
+  PIXEL_TOLERANCE, MASK_RECTS,
   compareStableImages,
   paint,
 } from './oracle-compare.mjs'
@@ -66,12 +66,34 @@ for (const s of manifest.states) {
   console.log('      · x[' + rx1 + ',' + img.width + '] 整高（' + (img.width - rx1) + 'px 宽）—— 会话区/右侧')
   console.log('      · y[' + keptH + ',' + (H - 1) + '] 整宽（' + (H - keptH) + 'px 高）—— 宿主状态栏/装饰粒子')
   if (rx0 > 0) console.log('      · x[0,' + rx0 + '] 整高 —— 设置页状态里的左侧栏')
+  // 屏蔽框（MASK_RECTS）也是"看不见的区域"，必须一并列出来 —— 否则"能力缺口"清单不完整
+  const masked = MASK_RECTS[s.name] || []
+  for (const [mx0, my0, mx1, my1] of masked) {
+    console.log('      · **屏蔽框** x[' + mx0 + ',' + mx1 + '] y[' + my0 + ',' + my1 + ']（'
+      + ((mx1 - mx0) * (my1 - my0)) + ' 像素）—— 见 oracle-compare.mjs 的 MASK_RECTS 注释')
+  }
 
   // ① 保留区内的小变化：必须抓到（这是"不放水"的核心证据）
   const midX = Math.round((rx0 + rx1) / 2), midY = Math.round(keptH / 2)
   const small = paint(img, midX, midY, midX + 10, midY + 10, [255, 0, 255])
   const rSmall = wouldDetect(img, small, s.name)
   ok('保留区内 10×10 小变化被抓到', rSmall.detected, rSmall.diff + ' 像素')
+
+  // ①b 屏蔽框内植入变化 ⇒ **应抓不到**（如实记录这个缺口，别假装没有）
+  // ⚠️ 补丁必须**完全落在框内**。第一版固定涂 60×40 并以框心为中心，遇到 01/02 那个
+  // 只有 30px 高的窄条（y610-640）时就溢出去了 —— 溢出部分被正常检出，测试反而报
+  // "意外抓到了"。那是**测试自己写错**，不是 oracle 的问题。现在按框尺寸自适应缩小。
+  for (const [mx0, my0, mx1, my1] of masked) {
+    const bw = mx1 - mx0, bh = my1 - my0
+    const pw = Math.max(2, Math.min(60, Math.floor(bw * 0.5)))
+    const ph = Math.max(2, Math.min(40, Math.floor(bh * 0.5)))
+    const cx = mx0 + Math.floor(bw / 2), cy = my0 + Math.floor(bh / 2)
+    const inMask = paint(img, cx - Math.floor(pw / 2), cy - Math.floor(ph / 2),
+      cx - Math.floor(pw / 2) + pw, cy - Math.floor(ph / 2) + ph, [255, 0, 255])
+    const rMask = wouldDetect(img, inMask, s.name)
+    ok('【能力缺口·预期抓不到】屏蔽框内 ' + pw + 'x' + ph + ' 变化（x' + mx0 + '-' + mx1 + ' y' + my0 + '-' + my1 + '）',
+      rMask.detected === false, rMask.detected ? '意外抓到了 ' + rMask.diff : '如预期未检出')
+  }
 
   // ② 排除区①：右边界之外（会话区）—— 记录缺口
   const outsideX = paint(img, rx1 + 40, midY, rx1 + 140, midY + 100, [255, 0, 255])

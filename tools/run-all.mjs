@@ -41,6 +41,9 @@ const SUITES = [
   // WeSource 异步语义：六场景（乱序/切源/销毁/失败重试/连发/冷热启动）+ 两条 abort 竞态。
   // 做过**变异测试**：删掉 then 分支的 aborted 保护后本套件会失败 —— 证明它测的是真代码。
   'tools/verify-we-source-async.mjs',
+  // oracle 的还原判定：三态契约 + 退出码语义 + 源码层断言（capture 不许写死 exit(0)）。
+  // 30 项；做过变异测试：把末尾改回 exit(0) 或让 not-needed 判 failed 都会让它失败。
+  'tools/verify-oracle-restore.mjs',
   'tools/verify-settings.mjs',
   'tools/test-playlists.mjs',
   // 底图去重（贝利尔两对：同内容两个名字 → 硬链接）。离线自足：清单校验那几项在 CI 照跑，

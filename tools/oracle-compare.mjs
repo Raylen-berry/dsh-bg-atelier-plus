@@ -52,14 +52,62 @@ export const PIXEL_TOLERANCE = Number(process.env.VB_TOLERANCE || 0)
 export const STABLE_X_BY_STATE = {
   '01-static-wallpaper': [0, 282],
   '02-fx-nodes': [0, 282],
-  '03-settings-studio': [340, 1280],
+  // 右边界 **1085**（此前 1300 → 1280 都是错的）。
+  // 实测：设置面板 .bga-studio 的实际右边界是 **x=1081**（studioWidth=560）。
+  // 原来比到 1280/1300，那段其实落在宿主对话框的遮罩 DIV.wCInkW_mask 上 ——
+  // **不是插件画的东西**，而且不稳定（那条带实测 diff=22163、maxΔ=41），
+  // 会随宿主的遮罩/滚动条渲染而变，于是 03 反复报差异。
+  // 定位手法：document.elementFromPoint(1200, y) 在全高都返回 wCInkW_mask ⇒ 说明越界。
+  '03-settings-studio': [340, 1085],
 }
 const DEFAULT_X = [0, 282]
 
 /** 基准视口宽，用来把竖切坐标按比例换算到别的尺寸。 */
 export const REF_WIDTH = 1654
 
-/** 只保留稳定区（竖切 + 按 STABLE_KEEP_RATIO 裁底部）。 */
+/**
+ * 会话列表里**随时间变化的文字**——要屏蔽掉，但不能整块不要。
+ *
+ * 踩过两次同一个坑（两次都是"跨天之后 oracle 天天报红，且与改动无关"）：
+ *   · 第一次：x283–300 那列是列表右侧的"X天前"标签 ⇒ 收右边界到 282 解决。
+ *   · 第二次（隔了两天再跑）：列表项里还有**日期文字本身**（"1天"→"3天"），
+ *     位置在 x24–97、y616–631 —— 那**在裁剪区内**，收边界解决不了。
+ * 会话列表是宿主画的，它的相对时间必然随时间变 ⇒ 这些像素**不该参与**视觉回归。
+ * 但整块排除会连带丢掉底图插件的 orb 与主题染色（它们就在同一列区域）。
+ * 所以按**坐标框**屏蔽（不是整块不要）：只把那几行文字所在的窄条涂成中性色，
+ * 两侧与底部的插件像素照常比较。
+ *
+ * 增加新框的判据：若某次差异全部落在一个与插件无关的固定小矩形里、且跨天/跨时段复现，
+ * 就在这里加一条，并写清"是什么元素、为什么与插件无关"。
+ */
+export const MASK_RECTS = {
+  // 会话列表项里的日期/时间文字（宿主），随日期变（实测 "1天"→"3天"）
+  '01-static-wallpaper': [[0, 610, 110, 640]],
+  '02-fx-nodes': [[0, 610, 110, 640]],
+  // 03 设置页：面板头部的**大图预览框**要屏蔽 —— 见 PREVIEW_BOX 注释。
+  // 它不是"宿主的东西"，而是"浏览器对 43MP 图的重采样跨刷新不确定"（实测 diff=11618、maxΔ=3，
+  // 而同会话内连截 4 张是 diff=0）。面板其余像素（布局/导航/文字/按钮）照常比较。
+  '03-settings-studio': [[515, 148, 1088, 362]],
+}
+
+/**
+ * 大图预览框的位置（`.bga-hero` 外框 + 余量），仅作说明与文档用（屏蔽已写进 MASK_RECTS）。
+ *
+ * 实测结论（审核方要求"先定位抖动、别急着下结论"，结论与我原先的猜测**不同**）：
+ *   · `.bga-hero-image` 用的是 **`cur.url` 原图**（9744×4500 ≈ 43 MP），CSS `object-fit:cover`
+ *     缩到 **558×202**，缩放倍率 **17.46×**；
+ *   · **同一会话内连截 4 张** ⇒ 预览区 diff=0（稳定）；
+ *   · **刷新页面后再截** ⇒ diff=11618、maxΔ=3（小但非零）。
+ *   ⇒ 不稳定来自"超大图跨刷新的重采样"，**不是**抗锯齿、**不是**内容变化、**不是**淡入未完成
+ *     （我查过 opacity=1 且 0→15s 完全不变）。
+ *   这一段对"绘制逻辑回归"没有信息量（换张超大图就变），所以屏蔽。
+ *
+ * 若要真正验证预览取景，应**另加一个用中等尺寸图的稳定状态**，而不是放宽容差 ——
+ * 放宽容差会连"整屏偏色"一起放过（那个教训见 PIXEL_TOLERANCE 注释）。
+ */
+export const PREVIEW_BOX = { x0: 515, y0: 148, x1: 1088, y1: 362 }
+
+/** 只保留稳定区（竖切 + 按 STABLE_KEEP_RATIO 裁底部 + 屏蔽宿主随时间变的文字框）。 */
 export function cropStable(img, stateName) {
   const keep = Math.max(1, Math.floor(img.height * STABLE_KEEP_RATIO))
   const range = STABLE_X_BY_STATE[stateName] || DEFAULT_X
@@ -70,6 +118,17 @@ export function cropStable(img, stateName) {
   const out = Buffer.alloc(w * keep * 4)
   for (let y = 0; y < keep; y++) {
     img.data.copy(out, y * w * 4, (y * img.width + x0) * 4, (y * img.width + x0) * 4 + w * 4)
+  }
+  // 屏蔽（在**裁剪后**的坐标系里，按同样比例换算）；涂中性灰，双方一致 ⇒ 该处永不产生差异
+  for (const [mx0, my0, mx1, my1] of (MASK_RECTS[stateName] || [])) {
+    const a = Math.max(0, Math.round(mx0 * scale) - x0), b = Math.max(0, Math.round(mx1 * scale) - x0)
+    const c = Math.max(0, Math.round(my0 * scale)), d = Math.min(keep, Math.round(my1 * scale))
+    for (let y = c; y < d; y++) {
+      for (let x = a; x < b && x < w; x++) {
+        const o = (y * w + x) * 4
+        out[o] = 128; out[o + 1] = 128; out[o + 2] = 128; out[o + 3] = 255
+      }
+    }
   }
   return { width: w, height: keep, channels: 4, data: out }
 }
@@ -130,4 +189,45 @@ export function paint(img, x0, y0, x1, y1, rgb) {
     }
   }
   return out
+}
+
+// ---------------------------------------------------------------- 纯决策函数（可离线单测）
+//
+// 这两个原本写在 visual-baseline.mjs 里，而那个文件是**可执行脚本**（顶层有 await，
+// import 会直接跑起来并 exit）⇒ 没法单测。审核方要求"把这两个场景补进离线回归测试"，
+// 所以把判断逻辑抽到这里（纯函数、无副作用），由 visual-baseline 调用、由离线测试覆盖。
+
+/**
+ * 从"冻结前读到的原始设置 JSON 文本"判断**是否需要还原**。
+ *   'skip'      —— 无可还原的原值（当初就没冻结成功）
+ *   'not-needed' —— 用户原本就关着轮播，我们从未改动它 ⇒ 无需还原、**也不算失败**
+ *   'need'      —— 确实需要还原
+ *
+ * 为什么要区分后两者：原来只返回布尔，调用方写 `!== true` ⇒ "用户原本就关着"被误报成
+ * **还原失败**，一次正常运行的退出码变成 5（审核方模拟复现）。
+ */
+export function rotationRestoreNeed(beforeRaw) {
+  if (!beforeRaw) return 'skip'
+  let want = null
+  try { want = JSON.parse(beforeRaw) } catch { want = null }
+  // ⚠️ 必须排除数组：`typeof [] === 'object'`，但数组不是合法设置对象。
+  // 这个漏洞是**离线套件测出来的**（[1,2] 应判 skip 却走到 not-needed）——
+  // 正是"把判断逻辑抽成纯函数才测得到"的价值。插件自己的 load() 也是这么判的
+  // （它写 `Array.isArray(saved)` 显式排除）。
+  if (!want || typeof want !== 'object' || Array.isArray(want)) return 'skip'
+  if (want.autoOn !== true) return 'not-needed'
+  return 'need'
+}
+
+/**
+ * 还原结果判定：把"是否需要还原"与"磁盘/内存的实测状态"合成三态结论。
+ *   'restored' —— 已还原，或本来就不需要还原（都算成功）
+ *   'skipped'  —— 无可还原（当初没冻结成功）—— 不算失败
+ *   'failed'   —— 需要还原但没成功（磁盘或内存不符、或刷新失败）—— **调用方须置失败码**
+ */
+export function judgeRotationRestore(need, { diskOk, memKnown, memOk, reloadFailed } = {}) {
+  if (need === 'skip') return 'skipped'
+  if (need === 'not-needed') return 'restored'
+  const ok = diskOk === true && reloadFailed !== true && memOk === true && memKnown !== false
+  return ok ? 'restored' : 'failed'
 }
