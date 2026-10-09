@@ -77,16 +77,22 @@ export const REF_CSS_HEIGHT = Number(process.env.VB_REF_CSS_HEIGHT || 776)
  *     · **多比了**对话框之上的宿主背景（截图 y0–27 是 modal 遮罩盖在对话上，会变）
  *     · **漏比了**插件面板的下半部分（面板可见到 CSS y752，原来只到 620）
  *   矩形化之后两个毛病一起没有了。各状态矩形都由**实测 getBoundingClientRect** 得出。
+ *
+ * ⚠️ **这些只是兜底默认值，不是比对口径的真相来源。**
+ * 真相来自运行时的 `measureLiveGeom()`（visual-baseline.mjs）—— 从实测锚点推导矩形。
+ * 教训（用户第八轮："要可迁移别写死内容，一换就读取不了"）：把绝对坐标写死后，
+ * 换个浏览器（Edge→Chrome）窗口 CSS 宽 1418→1426、对话框右移 4px ⇒ 整套失准。
+ * 下面的数字保留是为了：① 文档（当初怎么定的）；② 锚点测不到时**明确拒绝**而不是静默用它。
  */
 export const STABLE_RECT_BY_STATE = {
-  // 侧边栏：CSS x 0–242（x≥243 起是宿主会话列表右侧的"X天前"标签列，会随时间变）
+  // 侧边栏：CSS x 0–242（x≥243 起是宿主会话列表的"X天前"日期文字，会随时间变）
   // 纵向 0–620：再往下是宿主底部状态栏（"N 轮 M 步 · tok/s"）与装饰粒子，天然在变
   '01-static-wallpaper': { x0: 0, x1: 242, y0: 0, y1: 620 },
   '02-fx-nodes': { x0: 0, x1: 242, y0: 0, y1: 620 },
-  // 03：插件面板 .bga-studio 实测 CSS [521,78,1081,1419]（可滚动，超出视口），
-  // 对话框 [309,24,1109,752] 把它裁到 y≤752。取 x 515–1085（含面板边缘余量）、
-  // y 74–750（面板可见区，且不含对话框之上的宿主背景）。
-  '03-settings-studio': { x0: 515, x1: 1085, y0: 74, y1: 750 },
+  // 03：面板 .bga-studio 实测 CSS [521,78,1081,1419]（可滚动，超出视口），
+  // 对话框 [309,24,1109,752] 把它裁到 y≤752 ⇒ 取 x 515–1085、y 74–745。
+  // y 下沿留 7px：实测 127 个差异像素全落在对话框裁剪底边那两行（宿主取整碎行，非插件内容）。
+  '03-settings-studio': { x0: 515, x1: 1085, y0: 74, y1: 745 },
 }
 
 /** 兼容旧的只取 x 的用法（审计脚本曾用）。 */
@@ -95,12 +101,15 @@ export const STABLE_X_BY_STATE = Object.fromEntries(
 const DEFAULT_RECT = { x0: 0, x1: 242, y0: 0, y1: 620 }
 
 /**
- * **实测几何**：运行时要核对的元素位置（CSS）。与上表不符 ⇒ 说明面板挪了/没打开，
- * 那时硬编码的裁剪区域就失去意义，必须**大声失败**而不是静默比错地方。
- * 容差 ±3 CSS px 用于吸收亚像素/滚动条出现的抖动。
+ * **运行时几何核对**：只断言**与窗口尺寸无关的量**——元素自己的宽高（插件的固有布局）。
+ * ⚠️ 原来这里断言的是绝对位置 l/t/r，于是换个浏览器窗口一偏 4px 就把整个 oracle 判死；
+ *    位置本来就该由 measureLiveGeom() 实测跟随，不是契约。
+ *    宽度变了才说明布局真的坏了。容差 ±3 CSS px 吸收亚像素/滚动条抖动。
  */
 export const EXPECT_GEOMETRY = {
-  '03-settings-studio': { sel: '.bga-studio', l: 521, t: 78, r: 1081 },
+  // 只约定**与窗口无关**的量：面板自己的宽度（插件固有布局，实测 560 CSS px）。
+  // 不再约定 l/t/r —— 位置随窗口尺寸变，由 measureLiveGeom() 每次实测跟随。
+  '03-settings-studio': { sel: '.bga-studio', w: 560 },
 }
 
 /** @deprecated 保留导出名兼容旧引用；换算锚点改用 REF_CSS_WIDTH（见坐标系约定）。 */
@@ -147,40 +156,76 @@ export const MASK_RECTS = {
  */
 export const PREVIEW_BOX = { x0: 515, y0: 148, x1: 1088, y1: 362 }
 
-/** CSS 坐标 → 截图像素的比例（截图宽 / 基准 **CSS** 宽）。 */
-export function cssScale(img) { return img.width / REF_CSS_WIDTH }
+/**
+ * CSS 坐标 → 截图像素的比例。
+ *
+ * ⚠️ cssWidth **必须由调用方实测传入**（页面的 innerWidth），别只吃 REF_CSS_WIDTH。
+ * 教训（审核方第八轮 / 用户指出"要可迁移别写死"）：我把 1418 写死后，
+ * 换浏览器（Edge→Chrome）窗口变成 CSS 1426 / 截图 1664，绝对坐标整套失准。
+ * REF_CSS_WIDTH 只作为"没传时"的兜底默认，不是真相来源。
+ */
+export function cssScale(img, cssWidth = REF_CSS_WIDTH) {
+  const w = Number(cssWidth) > 0 ? Number(cssWidth) : REF_CSS_WIDTH
+  return img.width / w
+}
 
-/** 只保留稳定区（按状态矩形裁剪 + 屏蔽随时间变的框）。
- *  表里数字是 **CSS 坐标**，这里统一乘 cssScale() 换算到截图像素。 */
-export function cropStable(img, stateName) {
-  const scale = cssScale(img)          // ← 关键：锚点是 CSS 宽度(1418)，不是截图宽度
-  const r = STABLE_RECT_BY_STATE[stateName] || DEFAULT_RECT
-  const x0 = Math.max(0, Math.min(img.width - 1, Math.round(r.x0 * scale)))
-  const x1 = Math.max(x0 + 1, Math.min(img.width, Math.round(r.x1 * scale)))
-  const y0 = Math.max(0, Math.min(img.height - 1, Math.round(r.y0 * scale)))
-  const y1 = Math.max(y0 + 1, Math.min(img.height, Math.round(r.y1 * scale)))
-  const w = x1 - x0, h = y1 - y0
-  const out = Buffer.alloc(w * h * 4)
-  for (let y = 0; y < h; y++) {
-    img.data.copy(out, y * w * 4, ((y + y0) * img.width + x0) * 4, ((y + y0) * img.width + x0) * 4 + w * 4)
+/** 取本次比对用的几何：调用方实测的 geom 优先，表里常量兜底。 */
+function resolveGeom(stateName, geom) {
+  return {
+    rect: (geom && geom.rect) || STABLE_RECT_BY_STATE[stateName] || DEFAULT_RECT,
+    // masks 用 "!== undefined" 判断：实测"这个状态没有需要屏蔽的框"是合法结果，
+    // 不能被 `||` 误当成"没传"而回落到表里的常量框。
+    masks: geom && geom.masks !== undefined ? geom.masks : (MASK_RECTS[stateName] || []),
+    cssWidth: geom && geom.cssWidth ? geom.cssWidth : REF_CSS_WIDTH,
   }
-  // 屏蔽（换算到**裁剪后**的局部坐标）；涂中性灰，双方一致 ⇒ 该处永不产生差异
-  for (const [mx0, my0, mx1, my1] of (MASK_RECTS[stateName] || [])) {
-    const a = Math.max(0, Math.round(mx0 * scale) - x0), b = Math.max(0, Math.round(mx1 * scale) - x0)
-    const c = Math.max(0, Math.round(my0 * scale) - y0), d = Math.min(h, Math.round(my1 * scale) - y0)
+}
+
+/** CSS 矩形 → 该图的设备像素框（含 clamp）。 */
+function deviceBox(img, rect, cssWidth) {
+  const s = cssScale(img, cssWidth)
+  const x0 = Math.max(0, Math.min(img.width - 1, Math.round(rect.x0 * s)))
+  const x1 = Math.max(x0 + 1, Math.min(img.width, Math.round(rect.x1 * s)))
+  const y0 = Math.max(0, Math.min(img.height - 1, Math.round(rect.y0 * s)))
+  const y1 = Math.max(y0 + 1, Math.min(img.height, Math.round(rect.y1 * s)))
+  return { x0, y0, w: x1 - x0, h: y1 - y0 }
+}
+
+/** 按设备像素框取数据，并把 masks（CSS 坐标）涂成中性灰 —— 双方一致 ⇒ 该处永不产生差异。 */
+function extract(img, box, masks, cssWidth) {
+  const s = cssScale(img, cssWidth)
+  const out = Buffer.alloc(box.w * box.h * 4)
+  for (let y = 0; y < box.h; y++) {
+    img.data.copy(out, y * box.w * 4, ((y + box.y0) * img.width + box.x0) * 4,
+      ((y + box.y0) * img.width + box.x0) * 4 + box.w * 4)
+  }
+  for (const [mx0, my0, mx1, my1] of masks) {
+    const a = Math.max(0, Math.round(mx0 * s) - box.x0), b = Math.min(box.w, Math.round(mx1 * s) - box.x0)
+    const c = Math.max(0, Math.round(my0 * s) - box.y0), d = Math.min(box.h, Math.round(my1 * s) - box.y0)
     for (let y = c; y < d; y++) {
-      for (let x = a; x < b && x < w; x++) {
-        const o = (y * w + x) * 4
+      for (let x = a; x < b; x++) {
+        const o = (y * box.w + x) * 4
         out[o] = 128; out[o + 1] = 128; out[o + 2] = 128; out[o + 3] = 255
       }
     }
   }
-  return { width: w, height: h, channels: 4, data: out }
+  return { width: box.w, height: box.h, channels: 4, data: out }
+}
+
+/**
+ * 只保留稳定区（按状态矩形裁剪 + 屏蔽随时间变的框）。
+ *
+ * `geom`（可选，**优先于表里的常量**）：{ rect:{x0,x1,y0,y1}, masks:[[x0,y0,x1,y1]…], cssWidth }
+ * —— 由调用方在**运行时从实测锚点导出**（见 visual-baseline.mjs 的 measureLiveGeom）。
+ * 表里的常量只是兜底/文档；真正比对用实测值，这样**换窗口尺寸/换浏览器仍然成立**。
+ */
+export function cropStable(img, stateName, geom) {
+  const g = resolveGeom(stateName, geom)
+  return extract(img, deviceBox(img, g.rect, g.cssWidth), g.masks, g.cssWidth)
 }
 
 /** 读 PNG → 裁稳定区。 */
-export function stableFrom(file, stateName) {
-  return cropStable(decodePng(fs.readFileSync(file)), stateName)
+export function stableFrom(file, stateName, geom) {
+  return cropStable(decodePng(fs.readFileSync(file)), stateName, geom)
 }
 
 /**
@@ -195,33 +240,41 @@ export function stableFrom(file, stateName) {
  *
  * 接受**内存里的图像对象**（不是文件），这样调用方可以先改像素再比 —— 审计脚本要植入变化。
  */
-export function compareStableImages(imgA, imgB, stateName) {
+export function compareStableImages(imgA, imgB, stateName, geomA, geomB) {
   const opts = { tolerance: PIXEL_TOLERANCE, maxDiffRatio: 0, allowScale: false }
-  if (imgA.width === imgB.width && imgA.height === imgB.height) {
-    const cmp = comparePngEither(
-      encodePng(cropStable(imgA, stateName)), encodePng(cropStable(imgB, stateName)), opts)
-    return { ...cmp, resampled: false, tolerance: PIXEL_TOLERANCE }
+  const gA = resolveGeom(stateName, geomA)
+  const gB = resolveGeom(stateName, geomB)
+  const scA = cssScale(imgA, gA.cssWidth)
+  const scB = cssScale(imgB, gB.cssWidth)
+  let A = imgA, B = imgB, resampled = false
+  if (Math.abs(scA - scB) > 1e-6) {
+    // 归一到**同一个"每 CSS 像素的设备像素数"**，再各自裁剪。
+    // 顺序不能反：先裁后缩会让两条路径的采样相位不同 ⇒ 实测误报 70.81%（见上方注释）。
+    const S = Math.max(scA, scB)
+    A = resizePixels(imgA, Math.max(1, Math.round(gA.cssWidth * S)), Math.max(1, Math.round(imgA.height * S / scA)))
+    B = resizePixels(imgB, Math.max(1, Math.round(gB.cssWidth * S)), Math.max(1, Math.round(imgB.height * S / scB)))
+    resampled = true
   }
-  const W = Math.max(imgA.width, imgB.width)
-  const H = Math.max(imgA.height, imgB.height)
-  const upA = resizePixels(imgA, W, H)
-  const upB = resizePixels(imgB, W, H)
-  const cmp = comparePngEither(
-    encodePng(cropStable(upA, stateName)), encodePng(cropStable(upB, stateName)), opts)
+  // 各自按**自己的实测锚点**取框。窗口尺寸不同会让两个框差 ≤2px ⇒ 取交集比，
+  // 放弃的只是右/下边缘一两条线（在结果里如实报 dropped，不藏着）。
+  const boxA = deviceBox(A, gA.rect, gA.cssWidth)
+  const boxB = deviceBox(B, gB.rect, gB.cssWidth)
+  const w = Math.min(boxA.w, boxB.w), h = Math.min(boxA.h, boxB.h)
+  const cropA = extract(A, { x0: boxA.x0, y0: boxA.y0, w, h }, gA.masks, gA.cssWidth)
+  const cropB = extract(B, { x0: boxB.x0, y0: boxB.y0, w, h }, gB.masks, gB.cssWidth)
+  const cmp = comparePngEither(encodePng(cropA), encodePng(cropB), opts)
   return {
-    ...cmp, resampled: true, tolerance: PIXEL_TOLERANCE,
-    normalizedTo: { width: W, height: H },
-    sizedFrom: {
-      a: { width: imgA.width, height: imgA.height },
-      b: { width: imgB.width, height: imgB.height },
-    },
+    ...cmp, resampled, tolerance: PIXEL_TOLERANCE,
+    compared: { width: w, height: h },
+    dropped: { a: { w: boxA.w - w, h: boxA.h - h }, b: { w: boxB.w - w, h: boxB.h - h } },
+    sizedFrom: { a: { width: imgA.width, height: imgA.height }, b: { width: imgB.width, height: imgB.height } },
   }
 }
 
-/** 便捷：直接吃两个文件路径。 */
-export function compareStableFiles(baseFile, nowFile, stateName) {
+/** 便捷：直接吃两个文件路径。geomA/geomB 分别是**各自那一次运行**实测出的几何。 */
+export function compareStableFiles(baseFile, nowFile, stateName, geomA, geomB) {
   return compareStableImages(
-    decodePng(fs.readFileSync(baseFile)), decodePng(fs.readFileSync(nowFile)), stateName)
+    decodePng(fs.readFileSync(baseFile)), decodePng(fs.readFileSync(nowFile)), stateName, geomA, geomB)
 }
 
 /** 在图上涂一块纯色（审计用来"植入一个已知变化"）。 */

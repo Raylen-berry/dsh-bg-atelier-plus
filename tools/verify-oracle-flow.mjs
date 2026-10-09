@@ -54,7 +54,7 @@ function sliceFrom(src, sig) {
  * getEmptyObjectReads：让前 N 次 GET 返回 `{}`（宿主 readSettings 读失败的样子，
  * HTTP 仍是 200）—— 专门复现审核方第六轮指出的两条丢设置路径。
  */
-function loadFns({ getFailuresBeforeSuccess = 0, emptyObjectAt = [], initialAutoOn = true } = {}) {
+function loadFns({ getFailuresBeforeSuccess = 0, emptyObjectAt = [], initialAutoOn = true, renderedOverride = null } = {}) {
   const writes = []            // 记录所有 PUT
   const reads = { n: 0 }
   const settings = { autoOn: initialAutoOn, autoMin: 5, wallpaper: { file: 'x.png', cat: 'c' }, accent: '#fff' }
@@ -95,10 +95,26 @@ return { freezeRotation, pinWallpaper, restoreRotation };
     //    `catch { return {} }`）。这是审核方第六轮抓出来的真路径 —— 所以桩也要能模拟它。
     //    按第 N 次 GET 计（1 起），便于精确命中"freeze 的那次"或"pin 内部的那次"。
     __emptyObjectAt: Array.isArray(emptyObjectAt) ? emptyObjectAt.slice() : [],
+    __renderedOverride: renderedOverride,
     log: () => {},
   }
   // readState：模拟页面里执行 fetch('/bga/settings.json')；GET 可按需失败若干次
   sandbox.readState = async (expr) => {
+    // ⚠️ pinWallpaper 现在会多问一次客户端确认（__bgaStateProbe + **实际渲染的背景 URL**）。
+    //    桩必须跟上被测函数的新依赖 —— 否则确认拿不到合法回答、钉图判失败、A2 假性失败。
+    //    rendered 里要给出不含钉图文件名的 URL 时，就正是在测"钉图未渲染"这条守卫。
+    if (/__bgaStateProbe/.test(expr)) {
+      const wf = sandbox.__settings.wallpaper ? sandbox.__settings.wallpaper.file : null
+      const renderOverride = sandbox.__renderedOverride
+      const rendered = renderOverride != null ? renderOverride
+        : ('url("http://x/bga/wallpapers/' + (wf ? encodeURIComponent(wf) : '') + '")')
+      return JSON.stringify({
+        probe: 'ok',
+        autoOn: sandbox.__settings.autoOn === true,
+        file: wf,
+        rendered,
+      })
+    }
     const isPut = /method:\s*'PUT'/.test(expr)
     if (isPut) {
       const m = expr.match(/body:\s*"((?:[^"\\]|\\.)*)"/)
@@ -106,7 +122,10 @@ return { freezeRotation, pinWallpaper, restoreRotation };
       if (m) { try { body = JSON.parse(JSON.parse('"' + m[1] + '"')) } catch { body = null } }
       writes.push(body)
       if (body) Object.assign(settings, body)
-      return JSON.stringify({ ok: true })
+      // ⚠️ 返回的是**页面里那段 JS 的返回值**（'pinned(...) + autoOn=false' 字符串），
+      //    不是 HTTP 对象 —— 真函数现在按这个前缀判断 PUT 是否确认成功。
+      //    （第一版这里返回 {"ok":true}，导致 A2 假性失败。）
+      return 'pinned(w) + autoOn=false'
     }
     if (/cache:'no-store'/.test(expr) || /cache: 'no-store'/.test(expr)) {
       reads.n++
@@ -180,6 +199,22 @@ console.log('\n— A4. 原本关着 + 钉图自己的 GET 返回 {}：不得把�
     writes.length ? 'PUT 了 ' + writes.length + ' 次：' + JSON.stringify(writes[0]) : '无')
   ok('★ 设置对象原封不动（4 个字段都还在）', Object.keys(settings).length === 4,
     Object.keys(settings).join(','))
+}
+
+console.log('\n— A5. 设置说钉上了、**画面却还没渲染那张**（真机踩过的 93% 假回归根因）—')
+{
+  // 场景：PUT 成功、刷新成功、__bgaStateProbe 的 wallpaper 也对，
+  // 但 body::before 的 backgroundImage 还是上一张 ⇒ 若就此 return true，
+  // 基准会录在错误的图上，之后每次 compare 都报 ~93%（真机就是这么坏的）。
+  const other = encodeURIComponent('别的图.png')
+  const { fns, writes, settings } = loadFns({
+    initialAutoOn: true,
+    renderedOverride: 'url("http://x/bga/wallpapers/' + other + '")',
+  })
+  const frozen = await fns.freezeRotation(false)
+  const pinned = await fns.pinWallpaper(settings.wallpaper, false, frozen.before)
+  ok('★ 设置确实写入了（PUT 发生）', writes.length >= 1, 'PUT ' + writes.length + ' 次')
+  ok('★ 但渲染未确认 ⇒ pinWallpaper 返回 false（不许继续）', pinned === false, String(pinned))
 }
 
 console.log('\n— B. 轮播原本关闭：整条链不应产生"失败" —')

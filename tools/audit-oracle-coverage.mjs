@@ -31,10 +31,21 @@ import {
   paint,
 } from './oracle-compare.mjs'
 
-/** 按**真实** oracle 口径比两张图（走 compareStableImages），返回是否判"有差异"。 */
-function wouldDetect(baseImg, changedImg, stateName) {
-  const r = compareStableImages(baseImg, changedImg, stateName)
+/** 按**真实** oracle 口径比两张图（走 compareStableImages），返回是否判"有差异"。
+ *  ⚠️ 必须把"那一次实测的几何"一起传进去 —— 不传就退化成写死常量，
+ *  审计的就不再是真实口径（用户第八轮："要可迁移别写死内容"）。 */
+function wouldDetect(baseImg, changedImg, stateName, geom) {
+  const r = compareStableImages(baseImg, changedImg, stateName, geom, geom)
   return { detected: !r.same, diff: r.diff, ratio: r.ratio }
+}
+
+// 几何从基准 manifest 里**每个状态录制时实测的那份**取；没有就明确提示走了兜底常量
+const GEOMS = {}
+for (const st of manifest.states || []) if (st.geom) GEOMS[st.name] = st.geom
+const USING_FALLBACK = Object.keys(GEOMS).length === 0
+if (USING_FALLBACK) {
+  console.log('  ⚠️ 基准 manifest 里没有 state.geom（旧基准）⇒ 本次审计用兜底常量，'
+    + '结论可能不代表真实口径。请用当前版本重录基准。')
 }
 
 let pass = 0, fail = 0
@@ -53,8 +64,10 @@ for (const s of manifest.states) {
   const file = path.join(BASE, s.file)
   if (!fs.existsSync(file)) { console.log('\n[' + s.name + '] 缺图，跳过'); continue }
   const img = decodePng(fs.readFileSync(file))
-  const sc = cssScale(img)
-  const rect = RECTS[s.name]
+  const g = GEOMS[s.name] || null
+  const cssWidth = g && g.cssWidth ? g.cssWidth : REF_CSS_WIDTH
+  const sc = cssScale(img, cssWidth)
+  const rect = (g && g.rect) || RECTS[s.name]
   if (!rect) { console.log('\n[' + s.name + '] 没有登记比较矩形，跳过'); continue }
   // CSS → 截图像素（与实际裁剪同一套换算）
   const px = {
@@ -78,7 +91,7 @@ for (const s of manifest.states) {
   // 屏蔽框（MASK_RECTS）也是"看不见的区域"，必须一并列出来 —— 否则"能力缺口"清单不完整
   // ⚠️ MASK_RECTS 每项是 [x0, y0, x1, y1]（**x 在前**）。这里必须按这个顺序解构 ——
   //    我一开始按 [x0,x1,y0,y1] 写，导致打印标签互换、inAnyMask 判错。
-  const maskedCss = MASK_RECTS[s.name] || []
+  const maskedCss = (g && g.masks !== undefined ? g.masks : (MASK_RECTS[s.name] || []))
   const masked = maskedCss.map(([x0, y0, x1, y1]) => [
     Math.round(x0 * sc), Math.round(y0 * sc), Math.round(x1 * sc), Math.round(y1 * sc)])   // [x0,y0,x1,y1] in px
   for (let i = 0; i < maskedCss.length; i++) {
@@ -95,7 +108,7 @@ for (const s of manifest.states) {
   let midX = Math.round((px.x0 + px.x1) / 2), midY = Math.round((px.y0 + px.y1) / 2)
   for (let k = 0; k < 200 && inAnyMask(midX, midY); k++) { midY += 20; if (midY > px.y1 - 12) { midY = px.y0 + 10; midX += 20 } }
   const small = paint(img, midX, midY, midX + 10, midY + 10, [255, 0, 255])
-  const rSmall = wouldDetect(img, small, s.name)
+  const rSmall = wouldDetect(img, small, s.name, g)
   ok('比较区内 10×10 小变化被抓到（px ' + midX + ',' + midY + '）', rSmall.detected,
     rSmall.detected ? rSmall.diff + ' 像素' : '**漏检**')
 
@@ -110,27 +123,27 @@ for (const s of manifest.states) {
     const cx = mx0 + Math.floor(bw / 2), cy = my0 + Math.floor(bh / 2)
     const inMask = paint(img, cx - Math.floor(pw / 2), cy - Math.floor(ph / 2),
       cx - Math.floor(pw / 2) + pw, cy - Math.floor(ph / 2) + ph, [255, 0, 255])
-    const rMask = wouldDetect(img, inMask, s.name)
+    const rMask = wouldDetect(img, inMask, s.name, g)
     ok('【能力缺口·预期抓不到】屏蔽框内 ' + pw + 'x' + ph + ' 变化（px x' + mx0 + '-' + mx1 + ' y' + my0 + '-' + my1 + '）',
       rMask.detected === false, rMask.detected ? '意外抓到了 ' + rMask.diff : '如预期未检出')
   }
 
   // ② 排除区①：比较区右边界之外 —— 记录缺口
   const outsideX = paint(img, px.x1 + 20, midY, Math.min(img.width - 1, px.x1 + 120), midY + 100, [255, 0, 255])
-  const rOutX = wouldDetect(img, outsideX, s.name)
+  const rOutX = wouldDetect(img, outsideX, s.name, g)
   ok('【能力缺口·预期抓不到】右边界外 100×100 变化', rOutX.detected === false,
     rOutX.detected ? '意外抓到了 ' + rOutX.diff : '如预期未检出')
 
   // ③ 排除区②：底部带 —— 记录缺口
   const outsideY = paint(img, midX, px.y1 + 20, midX + 100, Math.min(H - 1, px.y1 + 120), [255, 0, 255])
-  const rOutY = wouldDetect(img, outsideY, s.name)
+  const rOutY = wouldDetect(img, outsideY, s.name, g)
   ok('【能力缺口·预期抓不到】底带 100×100 变化', rOutY.detected === false,
     rOutY.detected ? '意外抓到了 ' + rOutY.diff : '如预期未检出')
 
   // ②b 顶部之外（03 的 y0 是 74，其上是宿主背景）—— 同样记录缺口
   if (px.y0 > 40) {
     const outsideTop = paint(img, midX, Math.max(0, px.y0 - 60), midX + 100, px.y0 - 5, [255, 0, 255])
-    const rTop = wouldDetect(img, outsideTop, s.name)
+    const rTop = wouldDetect(img, outsideTop, s.name, g)
     ok('【能力缺口·预期抓不到】顶部之外 100×55 变化', rTop.detected === false,
       rTop.detected ? '意外抓到了 ' + rTop.diff : '如预期未检出')
   }
@@ -160,18 +173,18 @@ console.log('\n— 跨 DPI 归一化的检出能力（走**真实** compareStabl
   const upscale = (p) => resizePixels(p, Math.round(p.width * factor), Math.round(p.height * factor))
 
   // 参照组：同一张图、只是倍率不同 ⇒ **必须**判"无差异"（否则就是跨 DPI 误报）
-  const rClean = wouldDetect(img, upscale(img), s0.name)
+  const rClean = wouldDetect(img, upscale(img), s0.name, GEOMS[s0.name])
   ok('同一内容仅换倍率 ⇒ 判无差异（不再误报 70.81%）', rClean.detected === false,
     rClean.detected ? '**误报** ' + rClean.diff + ' 像素（' + (rClean.ratio * 100).toFixed(2) + '%）' : 'diff=0')
 
   // 实验组：先涂补丁 → 再按同一套算法缩放 ⇒ 应仍抓得到
-  const sc0 = cssScale(img)
+  const sc0 = cssScale(img, GEOMS[s0.name] && GEOMS[s0.name].cssWidth ? GEOMS[s0.name].cssWidth : REF_CSS_WIDTH)
   const r0 = RECTS[s0.name]
   const midX = Math.round(((r0.x0 + r0.x1) / 2) * sc0), midY = Math.round(((r0.y0 + r0.y1) / 2) * sc0)
   const findings = []
   for (const [label, w, h] of [['10×10', 10, 10], ['6×6', 6, 6], ['3×3', 3, 3], ['1×1', 1, 1]]) {
     const patched = paint(img, midX, midY, midX + w, midY + h, [255, 0, 255])
-    const r = wouldDetect(img, upscale(patched), s0.name)
+    const r = wouldDetect(img, upscale(patched), s0.name, GEOMS[s0.name])
     findings.push({ label, detected: r.detected, diff: r.diff })
   }
 

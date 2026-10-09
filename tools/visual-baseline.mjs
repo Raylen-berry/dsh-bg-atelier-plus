@@ -255,8 +255,8 @@ import {
 } from './oracle-compare.mjs'
 
 // 本文件内部沿用旧名字，避免大改调用点
-function compareStable(baseFile, nowFile, stateName) {
-  return compareStableFiles(baseFile, nowFile, stateName)
+function compareStable(baseFile, nowFile, stateName, geomBase, geomNow) {
+  return compareStableFiles(baseFile, nowFile, stateName, geomBase, geomNow)
 }
 /** 关掉 dsh-browser-live 的观察窗（它实时镜像页面，是不确定性的主源）。 */
 async function closeObserver(log) {
@@ -336,16 +336,82 @@ async function pinWallpaper(wallpaper, log, frozenBefore) {
       body: ${JSON.stringify(patched)},
     });
     return res.ok ? 'pinned(' + ${JSON.stringify(wallpaper && wallpaper.name)} + ') + autoOn=false' : 'PUT failed ' + res.status;
-  })()`)
+  })()`).catch((e) => 'PUT threw: ' + String(e && e.message || e).slice(0, 60))
   if (log) console.log('     钉图: ' + r)
+  // ⚠️ 修缺陷三（审核方第七轮）：上一版这里**只打印** PUT 失败、刷新异常被 catch 吞掉、
+  //   最后无条件 return true ⇒ 模拟 PUT 503 或刷新失败时，截图时客户端 autoOn 仍是 true，
+  //   capture/compare 却 exit=0。现在三步都要确认成功才返回 true：
+  //   ① PUT 确实 ok；② 刷新没抛错；③ 刷新后**客户端内存里真的钉上了**（读 __bgaStateProbe）。
+  if (typeof r !== 'string' || !r.startsWith('pinned(')) {
+    console.error('     ✗ 钉图写入未确认：' + String(r))
+    return false
+  }
   // **写完必须刷新页面**：设置是 host 侧文件，而客户端只在启动时 STORE.load() 一次
   // （见 client.js 末尾）。只写不刷新的话，磁盘上是新值、画面还是旧图 ——
   // 实测踩到：manifest 记的是"玛尔莎"、基准图里却是"牙仙1"，一路 93% 假回归。
   await sleep(400)
-  try { await cdp.send('Page.reload', { ignoreCache: false }) } catch { /* 用 navigate 兜底 */ }
+  try { await cdp.send('Page.reload', { ignoreCache: false }) } catch (e) {
+    console.error('     ✗ 钉图后刷新失败：' + String(e && e.message || e).slice(0, 80) + ' —— 客户端内存可能仍是旧状态')
+    return false
+  }
   await sleep(3500) // 等重载 + 底图解码
-  if (log) console.log('     钉图后已刷新页面')
-  return true   // 明确的成功返回（调用方用 !await pinWallpaper(...) 判失败）
+  // ③ 确认客户端真的把这张图**钉上画面了** —— 不只是设置值。
+  // ⚠️ 上一版这里只读 __bgaStateProbe()（= 客户端的**设置**状态），验浅了：
+  //   真机实测出现过「设置里已钉上小瑞安侬3、探针也说 file 对，但 body::before 的
+  //   backgroundImage 还是重返未来1999」—— 于是基准是在**另一张图**上录的，
+  //   之后每次 compare 都报 93%。审核方要的"客户端钉图状态"必须验到**实际渲染**。
+  //   所以这里同时检查画面背景 URL 里确实是那张图（URL 是 encodeURIComponent 后的文件名）。
+  const confirm = await readState(`(()=>{
+    try {
+      const bi = String(getComputedStyle(document.body, '::before').backgroundImage || '')
+        + '|' + String(getComputedStyle(document.documentElement, '::before').backgroundImage || '');
+      const s = (typeof window.__bgaStateProbe === 'function') ? window.__bgaStateProbe() : null;
+      return JSON.stringify({
+        probe: s ? 'ok' : 'absent',
+        autoOn: s ? s.autoOn === true : null,
+        file: s && s.wallpaper ? s.wallpaper.file : null,
+        rendered: bi.slice(0, 500),
+      });
+    } catch(e){ return JSON.stringify({probe:'error', msg:String(e.message).slice(0,50)}) }
+  })()`).catch(() => null)
+  let cf = null
+  try { cf = JSON.parse(confirm) } catch { cf = null }
+  if (!cf || cf.probe !== 'ok') {
+    console.error('     ✗ 钉图后无法确认客户端状态（探针 ' + (cf ? cf.probe : '读不到') + '）—— 不假定成功')
+    return false
+  }
+  if (cf.autoOn !== false || cf.file !== (wallpaper && wallpaper.file)) {
+    console.error('     ✗ 钉图未生效：客户端内存 autoOn=' + cf.autoOn + '、壁纸=' + String(cf.file)
+      + '（期望 autoOn=false、' + String(wallpaper && wallpaper.file) + '）')
+    return false
+  }
+  const want = String(wallpaper && wallpaper.file || '')
+  // 渲染确认：从背景的 URL 里**解析出壁纸文件名再精确比对**。
+  // ⚠️ 不要写成 `rendered.indexOf(want)` 这种子串匹配 —— 实测 A5 场景里
+  //    want='x.png'，而 URL 是 http://x/... 就含 'x' ⇒ 松匹配会**假通过**。
+  //    页面里 URL 是 encodeURIComponent 过的，所以取 /bga/wallpapers/ 之后那段并解码。
+  const names = []
+  const src = String(cf.rendered || '')
+  let from = 0
+  for (;;) {
+    const i = src.indexOf('/bga/wallpapers/', from)
+    if (i < 0) break
+    from = i + 1
+    let j = src.length
+    for (const sep of ['"', ')', ',', ' ', "'"]) { const k = src.indexOf(sep, i + 16); if (k >= 0 && k < j) j = k }
+    const raw = src.slice(i + 16, j)
+    let dec = raw
+    try { dec = decodeURIComponent(raw) } catch { /* 保持原样 */ }
+    names.push(dec)
+  }
+  const hit = want !== '' && names.some((n) => n === want || n.replace(/^.*\//, '') === want)
+  if (!hit) {
+    console.error('     ✗ 钉图未渲染：设置是「' + want + '」但画面背景是 '
+      + (names.length ? names.join(' / ').slice(0, 120) : '（没解析出壁纸 URL）') + ' —— 不能继续')
+    return false
+  }
+  if (log) console.log('     钉图确认: autoOn=false、设置已钉上、**画面背景确实是这张** ✓')
+  return true
 }
 
 /**
@@ -546,30 +612,124 @@ async function prepareEnvironment(log) {
   })()`)
   if (log) console.log('     环境: 停插件动画 + 对话框垫固定底 ' + r)
   await sleep(200)
+  // 把"垫底到底有没有生效"**回传**（不再只打印）。为什么必须回传：垫底没生效时，
+  // 宿主 3% 透光会把会话内容透进面板 —— 表现是**静默的 0.57% 假回归**（实测），
+  // 比"大声失败"坏得多。调用方据此把这一次判为"画面不可信"。
+  const m = /backdrop=(\d+)/.exec(String(r))
+  return { applied: true, backdrop: m ? Number(m[1]) : 0 }
 }
 
 /**
- * 环境清理（与 prepareEnvironment 成对）。**必须在 finally 里独立调用**：
- * 还原轮播的路径有提前返回（"原本就关着"时直接 return），把清理挂在还原后面
- * ⇒ 那条路径上样式/垫底会**残留在页面里**（审核方沙箱复现：selftest 与"原本关着"的
- * compare 都残留）。所以清理不能依赖还原函数有没有走到底。
+ * 环境清理（与 prepareEnvironment 成对）。返回布尔：true=清理成功（或页面已消失、无需清理）。
+ *
+ * ⚠️ 修两处（审核方第七轮）：
+ *   ① 上一版 `.catch(() => null)` 把**清理自身的异常吞掉**、还打印"样式随刷新消失"这种
+ *      安慰话 —— 模拟清理超时后仍 exit=0。现在清理失败如实返回 false，由调用方置退出码。
+ *   ② 上一版把清理挂在还原**之后**（同一个 finally 里顺序执行）⇒ 还原抛异常时清理根本不执行
+ *      （审核方让还原读取抛错，实测清理 0 次、两个注入物都残留）。现在调用方用**独立的
+ *      try/finally**：还原怎么炸都不影响清理。
  */
 async function cleanupEnvironment(log) {
-  const r = await readState(`(()=>{
-    const out={style:false,backdrop:false};
-    const st=document.getElementById('vb-env');
-    if(st){ st.remove(); out.style=true }
-    const bd=document.getElementById('vb-backdrop');
-    if(bd){ bd.remove(); out.backdrop=true }
-    return JSON.stringify(out);
-  })()`).catch(() => null)
-  if (log) console.log('     环境清理: ' + (r || '页面已不可用（样式随刷新消失）'))
+  let r = null
+  let threw = null
+  try {
+    r = await readState(`(()=>{
+      const out={style:false,backdrop:false};
+      const st=document.getElementById('vb-env');
+      if(st){ st.remove(); out.style=true }
+      const bd=document.getElementById('vb-backdrop');
+      if(bd){ bd.remove(); out.backdrop=true }
+      return JSON.stringify(out);
+    })()`)
+  } catch (e) { threw = e }
+  if (threw) {
+    // 页面本身已经不可用（比如已经关了）⇒ 没有残留可言，算清理成功；
+    // 但**执行了却抛错**（超时/表达式错）⇒ 清理未确认，返回 false。
+    const dead = /没响应|连接失败|not found|closed|no page|target/i.test(String(threw.message || threw))
+    if (dead) { if (log) console.log('     环境清理: 页面已关闭，无残留'); return true }
+    console.error('     ✗ 环境清理执行失败（' + String(threw.message || threw).slice(0, 70)
+      + '）—— 注入的样式/垫底可能残留，请刷新页面')
+    return false
+  }
+  if (log) console.log('     环境清理: ' + (r || '读不到结果'))
+  return true
 }
 
 /**
- * 核对插件元素的真实几何与 EXPECT_GEOMETRY 一致。
- * 不一致 ⇒ 硬编码的裁剪区域已失去意义，必须**大声失败**，不能静默比错地方
- * （这正是审核方第 1 条抓出来的问题：坐标错了却一路 diff=0）。
+ * 在**运行时**从实测锚点导出这一次比对的几何（CSS 矩形 + 屏蔽框 + CSS 视口宽）。
+ *
+ * ⚠️ 为什么必须有这个（用户第八轮指出"要可迁移别写死内容，一换就读取不了"）：
+ *   原先把 REF_CSS_WIDTH=1418 和 03 的绝对矩形写死，换浏览器（Edge→Chrome）后窗口变成
+ *   CSS 1426 / 截图 1664，对话框整体右移 4px ⇒ 整套坐标失准、几何核对直接拒绝工作。
+ *   常量只能当兜底；真相来自**每次都量的锚点元素**。规则：
+ *   · cssWidth = 实测 innerWidth（不再假设 1418）
+ *   · 03 的矩形 = .bga-studio 的实测矩形（左右各留 6/4px 余量、上留 4px），
+ *     下沿取 min(面板底, 对话框底) − 7（那 7px 是宿主裁剪边的取整碎行，实测 127px/Δ2 全在那）
+ *   · 03 的屏蔽框 = .bga-hero 的实测矩形 +2px（43MP 预览图跨刷新重采样不稳）
+ *   · 01/02 的右边界 = 会话列表里"X天前"这类**日期文字的左边界** − 1（它们随时间变）；
+ *     下沿 = innerHeight − 156（再往下是宿主状态栏的实时计数），都相对实测视口推导
+ *   锚点拿不到 ⇒ 返回 null，由调用方**大声失败**，绝不回落到写死常量去比错地方。
+ */
+async function measureLiveGeom(stateName, log) {
+  const raw = await readState(`(()=>{
+    const R=(e)=>{ if(!e) return null; const b=e.getBoundingClientRect();
+      return {l:Math.round(b.left),t:Math.round(b.top),r:Math.round(b.right),b:Math.round(b.bottom)} };
+    const dateEls=[...document.querySelectorAll('*')].filter(e=>e.children.length===0
+      && /^[0-9]+\\s*(秒|分钟|小时|天|周)前$/.test(String(e.textContent||'').trim()));
+    return JSON.stringify({
+      w: Math.round(innerWidth), h: Math.round(innerHeight),
+      dlg: R(document.querySelector('[role="dialog"]')),
+      studio: R(document.querySelector('.bga-studio')),
+      hero: R(document.querySelector('.bga-hero')),
+      sidebar: R(document.querySelector('[class*="sidebar" i]')),
+      dateLefts: dateEls.map(e=>Math.round(e.getBoundingClientRect().left)).sort((a,b)=>a-b).slice(0,30),
+    });
+  })()`)
+  let a = null
+  try { a = JSON.parse(raw) } catch { a = null }
+  if (!a || !a.w) {
+    console.error('  ✗ 实测几何失败（拿不到 innerWidth）：' + String(raw).slice(0, 80))
+    return null
+  }
+  const cssWidth = a.w
+  if (stateName === '03-settings-studio') {
+    if (!a.studio || !a.dlg) {
+      console.error('  ✗ 实测几何缺锚点（studio=' + JSON.stringify(a.studio) + ' dlg=' + JSON.stringify(a.dlg)
+        + '）—— 面板或对话框没打开，不比对。')
+      return null
+    }
+    const rect = {
+      x0: a.studio.l - 6, x1: a.studio.r + 4,
+      y0: a.studio.t - 4, y1: Math.min(a.studio.b, a.dlg.b) - 7,
+    }
+    const masks = a.hero
+      ? [[a.hero.l - 2, a.hero.t - 2, a.hero.r + 2, a.hero.b + 2]]
+      : []
+    if (!a.hero && log) console.log('     ⚠️ 没找到 .bga-hero —— 预览框这次不被屏蔽（可能报假差异）')
+    return { cssWidth, rect, masks, anchors: a }
+  }
+  // 01/02：左侧栏区域，全部相对实测视口/锚点推导
+  const firstDateLeft = Array.isArray(a.dateLefts) && a.dateLefts.length ? a.dateLefts[0] : null
+  const rightBySidebar = a.sidebar ? a.sidebar.r - 8 : null
+  const x1 = Math.min(
+    firstDateLeft != null ? firstDateLeft - 1 : Infinity,
+    rightBySidebar != null ? rightBySidebar : Infinity,
+  )
+  if (!Number.isFinite(x1)) {
+    console.error('  ✗ 实测几何推不出右边界（既没有日期文字也没有侧栏锚点）—— 不比对。')
+    return null
+  }
+  return {
+    cssWidth,
+    rect: { x0: 0, x1: Math.max(40, Math.round(x1)), y0: 0, y1: Math.max(60, a.h - 156) },
+    masks: [],   // 日期文字已被右边界排除，不需要再遮
+    anchors: a,
+  }
+}
+
+/**
+ * 核对这一次实测出的几何是否合理（不再比对绝对位置，而是比对**插件自己的尺寸**）。
+ * 面板宽度是插件的固有布局，与窗口尺寸无关 ⇒ 它变了才是真回归/布局坏了。
  */
 async function assertGeometry(s, log) {
   const want = EXPECT_GEOMETRY[s.name]
@@ -577,22 +737,20 @@ async function assertGeometry(s, log) {
   const got = await readState(`(()=>{const e=document.querySelector(${JSON.stringify(want.sel)});
     if(!e) return JSON.stringify({absent:true});
     const r=e.getBoundingClientRect();
-    return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right)})})()`)
+    return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right),
+      w:Math.round(r.width),h:Math.round(r.height)})})()`)
   let g = null
   try { g = JSON.parse(got) } catch { g = null }
   if (!g || g.absent) {
     console.error('  ✗ 几何核对失败：找不到 ' + want.sel + '（实际：' + String(got).slice(0, 80) + '）')
     return false
   }
-  const TOL = 3
-  const bad = ['l', 't', 'r'].filter((k) => Math.abs(g[k] - want[k]) > TOL)
-  if (bad.length) {
-    console.error('  ✗ 几何核对失败：' + want.sel + ' 实测 ' + JSON.stringify(g)
-      + ' 与基准记录的 ' + JSON.stringify(want) + ' 不符（差在 ' + bad.join(',') + '，容差 ' + TOL + 'px）。')
-    console.error('    硬编码的裁剪区域基于旧布局 ⇒ 继续比会得到无意义的结果。请重录基准或修正 EXPECT_GEOMETRY。')
+  // 只断言**与窗口无关的量**：元素自己的宽高。位置随窗口变，不再当契约。
+  if (want.w != null && Math.abs(g.w - want.w) > 3) {
+    console.error('  ✗ 几何核对失败：' + want.sel + ' 实测宽 ' + g.w + '，期望 ' + want.w + '（±3）—— 插件布局变了')
     return false
   }
-  if (log) console.log('     几何核对: ' + want.sel + ' ✓ ' + JSON.stringify(g))
+  if (log) console.log('     几何核对: ' + want.sel + ' ✓ 实测宽 ' + g.w + '（不比对绝对位置，可迁移）')
   return true
 }
 
@@ -627,12 +785,31 @@ async function prepareState(s, log) {
   // ⚠️ 返回值**必须检查**：原来这里直接忽略，于是等超时/底图加载失败时照样截图，
   // 把未完成的画面录成基准（审核方复现指出）。现在把结果交给调用方决定。
   const ready = await waitImagesReady(log, s.expectHero === true)
-  // 环境准备（见 prepareEnvironment 注释）：对话框不透明 + 停插件动画。
+  // 环境准备（见 prepareEnvironment 注释）：对话框背后垫固定底 + 停插件动画。
   // **必须在截图前**，且捕获与比对两次都执行，两边才看到同一种确定性画面。
-  await prepareEnvironment(log)
-  // 几何核对：确认插件元素真的还在我们假设的位置（错了就大声失败，别静默比错地方）
+  const env = await prepareEnvironment(log)
+  // ⚠️ 开着对话框的状态（03）**必须**拿到垫底，否则宿主 3% 透光会把会话内容透进面板，
+  //   表现成**静默的 0.57% 假回归**（实测）—— 比大声失败坏得多，所以这里判为不可信。
+  const needsBackdrop = s.expectHero === true
+  const backdropOk = !needsBackdrop || env.backdrop === 1
+  if (!backdropOk) {
+    console.error('  ✗ 对话框垫底未生效（backdrop=' + env.backdrop + '）—— 面板像素会被背后会话内容污染，'
+      + '这次画面不可信，不参与比对。')
+  }
+  // 几何：**运行时从实测锚点推导**（见 measureLiveGeom 注释，可迁移、不写死）
+  const geom = await measureLiveGeom(s.name, log)
+  // 环境核对：确认插件元素还在（宽度契约）。失败 ⇒ 后续裁剪无意义。
   const geomOk = await assertGeometry(s, log)
-  return { imagesReady: ready, geometryOk: geomOk }
+  if (!geom) {
+    console.error('  ✗ ' + s.name + '：实测几何拿不到 ⇒ 本次不比对（绝不回落到写死常量去比错地方）。')
+  }
+  return {
+    imagesReady: ready,
+    geometryOk: geomOk && !!geom,
+    backdropOk,
+    envApplied: env.applied,
+    geom,
+  }
 }
 
 /**
@@ -755,24 +932,52 @@ if (mode === 'capture') {
   //   审核方复现指出过这一点；现在把它们移进来，并让 autoBefore 先声明再赋值。
   let autoBefore = null
   let restored = false
+  // ⚠️ 外层 try/catch（审核方第七轮入口测试暴露）：主动拒绝时我 `throw` 出去，而顶层没有
+  //   任何 catch ⇒ Node 以**未捕获异常**退出（码 1），把已经设好的 exitCode=4 冲掉了。
+  //   现在：主动拒绝（已置 exitCode）按原码退出；只有没置过码的意外异常才算 1。
+  try {
   try {
     // 冻结轮播 + 钉住当前这张图（结束后还原；异常也要还原，所以放 try/finally）
     const frozen = await freezeRotation(true)
-    autoBefore = frozen ? frozen.raw : null
+    // ⚠️ 修缺陷二（审核方第七轮）：上一版 frozen=null（读不到可信原值）时只是
+    //   wallpaperNow=null ⇒ 钉图被**整段跳过**，capture 照样录基准 —— 实测录下的
+    //   manifest 里 pinnedWallpaper 与 rotationFrozenFrom 都是 null、轮播仍开着，
+    //   而基准图却是在"随时可能换图"的状态下截的（不可信）。
+    //   现在：拿不到可信原值 = **拒绝录基准**（退出码 4），不是跳过钉图继续录。
+    if (!frozen) {
+      console.error('  ✗ 读不到可信的原始设置（宿主读失败会返回 {} 且报 200）—— 拒绝录基准。')
+      console.error('    没有可信原值就无从钉图/还原，录出来的基准也不可信（轮播可能中途换图）。')
+      exitCode = 4
+      throw new Error('无有效原始设置')
+    }
+    autoBefore = frozen.raw
     // 录制时以"页面当下正在显示的那张"为准，钉住它，并把 wallpaper 记进 manifest ——
     // 之后 compare 就按这个值钉回去，与轮播是否跑过无关。
-    const wallpaperNow = frozen && frozen.before ? frozen.before.wallpaper : null
-    if (wallpaperNow) { if (!await pinWallpaper(wallpaperNow, true, frozen ? frozen.before : null)) throw new Error('钉图被拒绝（无有效原始设置）') }
+    const wallpaperNow = frozen.before.wallpaper || null
+    if (!wallpaperNow) {
+      console.error('  ✗ 原始设置里没有 wallpaper —— 拒绝录基准（无法钉图 ⇒ 录到的画面可能被轮播换掉）')
+      exitCode = 4
+      throw new Error('原设置无 wallpaper')
+    }
+    if (!await pinWallpaper(wallpaperNow, true, frozen.before)) {
+      exitCode = 4
+      throw new Error('钉图未确认（写入/刷新/客户端状态任一没确认成功）—— 拒绝录基准')
+    }
     await resetToCleanHome(true)  // 上一轮 run 可能留下开着面板
     const manifest = {
       dir, capturedAt: new Date().toISOString(), url: cdp.url,
-      // 记下"比的是哪一块"：裁剪比例不藏在代码里，改比对口径必须重录基准
-    // 记下"比的是哪一块"：裁剪口径不藏在代码里，改口径必须重录基准
+      // 记下"比的是哪一块"：口径不藏在代码里，改口径必须重录基准
     comparison: {
-      rectsCss: STABLE_RECT_BY_STATE, maskRectsCss: MASK_RECTS, cssScaleAnchor: REF_CSS_WIDTH,
-      pixelTolerance: PIXEL_TOLERANCE, expectGeometry: EXPECT_GEOMETRY,
-      note: '所有矩形都是 CSS 坐标，比较时乘 cssScale(截图宽/' + REF_CSS_WIDTH + ') 换算。'
-        + '只比插件自己画的那块；宿主会话/状态栏/装饰粒子、以及声明屏蔽的框都不参与。'
+      // ⚠️ 口径是**运行时实测推导**的，不是常量表（见 measureLiveGeom 注释）。
+      //    每个状态实际用的几何记在 states[].geom；下面这些常量只是兜底与文档。
+      geometrySource: 'measureLiveGeom() 运行时从锚点实测'
+        + '（.bga-studio / 对话框 / .bga-hero / 会话日期文字 / innerWidth）',
+      fallbackRectsCss: STABLE_RECT_BY_STATE, fallbackMaskRectsCss: MASK_RECTS,
+      fallbackCssWidthAnchor: REF_CSS_WIDTH,
+      pixelTolerance: PIXEL_TOLERANCE, geometryContract: EXPECT_GEOMETRY,
+      note: '各状态矩形是 CSS 坐标，比较时乘 (截图宽 / 该次实测 innerWidth) 换算；'
+        + '基准与当前**各用自己录制/运行时实测的几何**裁剪 ⇒ 换窗口尺寸/换浏览器仍能对齐同一块。'
+        + '只比插件自己画的那块；宿主会话/状态栏、以及实测推导出的屏蔽框都不参与。'
         + '像素容差 ' + PIXEL_TOLERANCE + (PIXEL_TOLERANCE === 0 ? '（严格逐字节）' : '（在容差内一致）') + '。',
     },
     // 钉住的底图（compare 时按它钉回去，保证比的是同一张）
@@ -785,19 +990,30 @@ if (mode === 'capture') {
     const prep = await prepareState(s, true)
     if (prep && prep.imagesReady === false) {
       console.error('  ✗ ' + s.name + ' 图片未就绪，拒绝录基准（避免把不完整画面固化）。检查网络/底图文件后重跑。')
-      process.exitCode = 4
+      exitCode = 4
       throw new Error('图片未就绪：' + s.name)
     }
     if (prep && prep.geometryOk === false) {
       console.error('  ✗ ' + s.name + ' 插件元素几何与期望不符，拒绝录基准（裁剪区域会失准）。')
-      process.exitCode = 4
+      exitCode = 4
       throw new Error('几何不符：' + s.name)
+    }
+    // 同 compare：垫底没生效 ⇒ 录出来的基准会被宿主透光污染 ⇒ 拒绝录（而不是录一张不可信的）
+    if (prep && prep.backdropOk === false) {
+      console.error('  ✗ ' + s.name + ' 对话框垫底未生效，拒绝录基准（基准会被宿主透光污染）。')
+      exitCode = 4
+      throw new Error('垫底未生效：' + s.name)
     }
     const probeValue = await readState(s.probe)
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
     const file = path.join(baseDir, s.name + '.png')
     fs.writeFileSync(file, Buffer.from(shot.data, 'base64'))
-    manifest.states.push({ name: s.name, note: s.note, probe: probeValue, file: path.basename(file), bytes: fs.statSync(file).size })
+    manifest.states.push({
+      name: s.name, note: s.note, probe: probeValue, file: path.basename(file), bytes: fs.statSync(file).size,
+      // ⚠️ 记下**这一次实测出的几何**：compare 时基准那张图必须用"它自己录制时的几何"裁剪，
+      // 当前这张用"现在实测的几何"裁剪 —— 两边各自换算才能对齐（可迁移的关键）。
+      geom: prep ? prep.geom : null,
+    })
     console.log('  ✅ ' + s.name + '  ' + fs.statSync(file).size + ' 字节')
     console.log('     探针: ' + String(probeValue).slice(0, 160))
   }
@@ -805,17 +1021,33 @@ if (mode === 'capture') {
   console.log('\n基准已建立：' + manifest.states.length + ' 个状态 → ' + baseDir)
   console.log('重构后跑： node tools/visual-baseline.mjs compare ' + dir)
   } finally {
-    // **只有 'failed' 才算失败**（三态契约见 restoreRotation 头注释）：
-    // 'restored' = 已还原或本来就不需要还原；'skipped' = 当初没冻结成功、无可还原。
-    // 原来写 `!== true` 会把"用户原本就关着轮播"误报成失败（审核方复现）。
-    const outcome = await restoreRotation(autoBefore, true)
-    if (outcome === 'failed') {
-      console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
+    // ⚠️ 修缺陷一（审核方第七轮）：上一版把"还原"与"清理"写在**同一个 finally 里顺序执行**
+    //   ⇒ 还原一抛异常，后面的清理根本不执行（审核方让还原读取抛错，实测清理 0 次、
+    //   两个注入物都残留）。现在拆成嵌套 try/finally：**还原怎么炸都不影响清理**。
+    try {
+      // **只有 'failed' 才算失败**（三态契约见 restoreRotation 头注释）：
+      // 'restored' = 已还原或本来就不需要还原；'skipped' = 当初没冻结成功、无可还原。
+      // 原来写 `!== true` 会把"用户原本就关着轮播"误报成失败（审核方复现）。
+      const outcome = await restoreRotation(autoBefore, true)
+      if (outcome === 'failed') {
+        console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
+        if (exitCode === 0) exitCode = 5
+      }
+    } catch (e) {
+      console.error('  ✗ 轮播还原过程抛错：' + String(e && e.message || e).slice(0, 90) + ' —— 按失败处理（5）')
       if (exitCode === 0) exitCode = 5
+    } finally {
+      // 清理在最内层 finally：无论还原成功/失败/抛错都会执行
+      const cleaned = await cleanupEnvironment(true)
+      if (!cleaned && exitCode === 0) exitCode = 6
     }
-    // 环境清理必须**独立于还原**调用：还原有提前返回的路径（"无需还原"时直接 return），
-    // 挂在它后面的清理会跳过 ⇒ 样式/垫底残留（审核方沙箱复现）。
-    await cleanupEnvironment(true)
+  }
+  } catch (e) {
+    // 主动拒绝（已置 exitCode）按原码退出；没置过码的意外异常才算 1
+    if (exitCode === 0) {
+      exitCode = 1
+      console.error('  ✗ 未预期异常：' + String(e && e.message || e).slice(0, 120))
+    }
   }
 } else if (mode === 'selftest') {
   // ────────────────────────────────────────────────────────────────────────────
@@ -869,10 +1101,12 @@ if (mode === 'capture') {
 
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
     const raw = decodePng(Buffer.from(shot.data, 'base64'))
-    const sc = cssScale(raw)
-    const rect = STABLE_RECT_BY_STATE[s.name]
+    const sc = cssScale(raw, prep && prep.geom ? prep.geom.cssWidth : REF_CSS_WIDTH)
+    // 用**实测导出的几何**（不是写死常量）—— 否则 selftest 在别的窗口尺寸下会验到错的块
+    const rect = (prep && prep.geom && prep.geom.rect) || STABLE_RECT_BY_STATE[s.name]
+    const liveGeom = prep && prep.geom
     const inRect = (r) => r.l >= rect.x0 - 2 && r.r <= rect.x1 + 2 && r.t >= rect.y0 - 2 && r.b <= rect.y1 + 2
-    const masked = (MASK_RECTS[s.name] || [])
+    const masked = (liveGeom && liveGeom.masks) || MASK_RECTS[s.name] || []
 
     for (const [label, finder] of PROBES) {
       const got = await readState(`(()=>{const e=${finder}; if(!e) return JSON.stringify({absent:true});
@@ -894,7 +1128,7 @@ if (mode === 'capture') {
       const px0 = Math.round(g.l * sc) + 1, px1 = Math.round(g.r * sc) - 1
       const py0 = Math.round(g.t * sc) + 1, py1 = Math.round(g.b * sc) - 1
       const painted = paint(raw, px0, py0, Math.max(px0 + 1, px1), Math.max(py0 + 1, py1), [255, 0, 255])
-      const cmp = compareStableImages(raw, painted, s.name)
+      const cmp = compareStableImages(raw, painted, s.name, liveGeom, liveGeom)
       const detected = !cmp.same
       stOk(label + ' 改色被抓到' + (inMask ? '（注：该元素在屏蔽框内，预期抓不到）' : ''),
         inMask ? detected === false : detected,
@@ -913,8 +1147,9 @@ if (mode === 'capture') {
         os.l >= rect.x0 && os.r <= rect.x1)
     }
   } finally {
-    // selftest 也会注入环境样式 —— 必须成对清理（审核方：残留）
-    await cleanupEnvironment(true)
+    // selftest 也会注入环境样式 —— 必须成对清理；清理失败要影响退出码（6）
+    const cleaned = await cleanupEnvironment(true)
+    if (!cleaned && stFail === 0) exitCode = 6
   }
 
   console.log('\n自检：' + stPass + ' 通过 / ' + stFail + ' 失败')
@@ -937,11 +1172,27 @@ if (mode === 'capture') {
   let autoBefore = null
   let same = 0, diff = 0, missing = 0, notReady = 0
   const probeDiffs = []
+  // 外层 try/catch：同 capture —— 主动拒绝要按已置的 exitCode 退出，不能被未捕获异常冲成 1
+  try {
   try {
     const frozen = await freezeRotation(true)
-    autoBefore = frozen ? frozen.raw : null
-    if (manifest.pinnedWallpaper) { if (!await pinWallpaper(manifest.pinnedWallpaper, true, frozen ? frozen.before : null)) throw new Error('钉图被拒绝（无有效原始设置）') }
-    else console.log('   ⚠️ 基准里没有 pinnedWallpaper（旧基准？）—— 只能冻结轮播，可能被换图干扰')
+    // 同 capture：读不到可信原值 ⇒ **本次比对不算数**（轮播可能还在跑，画面不可信）。
+    if (!frozen) {
+      console.error('  ✗ 读不到可信的原始设置（宿主读失败会返回 {} 且报 200）—— 本次比对不算数。')
+      exitCode = 4
+      throw new Error('无有效原始设置')
+    }
+    autoBefore = frozen.raw
+    if (manifest.pinnedWallpaper) {
+      if (!await pinWallpaper(manifest.pinnedWallpaper, true, frozen.before)) {
+        exitCode = 4
+        throw new Error('钉图未确认（写入/刷新/客户端状态任一没确认成功）—— 本次比对不算数')
+      }
+    } else {
+      // 旧基准没记 pinnedWallpaper：至少要求 autoOn 已被冻结（frozen.before 可信），
+      // 否则画面随时会被轮播换掉 ⇒ 比对无意义。
+      console.log('   ⚠️ 基准里没有 pinnedWallpaper（旧基准）—— 已冻结轮播但无法钉回原图，结果可能受换图干扰')
+    }
     // **必须**在开始逐个状态之前先复位。03 状态会主动打开设置面板且不会自己关，
     // 而 DSH 还会把"面板开着"这个状态跨刷新保留 —— 于是下一次 run 的 01 状态直接拍到
     // 面板开着的样子，与"干净首页"的基准差 93%。看起来像严重回归，其实只是状态没复位。
@@ -964,13 +1215,22 @@ if (mode === 'capture') {
       console.log('  ⚠️  ' + s.name + '  插件元素几何与期望不符，本次跳过（裁剪区域失准，结果无意义）')
       continue
     }
+    // 垫底没生效 ⇒ 面板像素会被背后会话内容污染 ⇒ **本次不算数**（不能让它冒充 0.5% 的"回归"）
+    if (prep && prep.backdropOk === false) {
+      notReady++
+      console.log('  ⚠️  ' + s.name + '  对话框垫底未生效，本次跳过（画面会被宿主透光污染，结果无意义）')
+      continue
+    }
     const probeNow = await readState(state ? state.probe : 'null')
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
     const nowFile = path.join(baseDir, s.name + '.after.png')
     fs.writeFileSync(nowFile, Buffer.from(shot.data, 'base64'))
     // 裁稳定区 →（尺寸不同时）跨 DPI 归一 → 逐像素比。
     // 注意：裁的是**解码后**的像素，不是文件；encodePng 只用于写差异图。
-    const cmp = compareStable(baseFile, nowFile, s.name)
+    // 两边的几何**各自实测**：基准用录下来那份，当前用这一次量出来的那份
+    // ⇒ 窗口尺寸/浏览器换了也能对上同一块内容（可迁移），而不是拿旧坐标裁新图。
+    const geomBase = s.geom || null
+    const cmp = compareStable(baseFile, nowFile, s.name, geomBase, prep ? prep.geom : null)
 
     const probeSame = String(probeNow) === String(s.probe)
     if (!probeSame) probeDiffs.push({ name: s.name, before: s.probe, after: probeNow })
@@ -1005,18 +1265,31 @@ if (mode === 'capture') {
   // 退出码放到 finally 之后统一设置（原来在 try 里直接 exit 会让还原被跳过）。
   exitCode = okAll ? 0 : 1
   } finally {
-    // **还原失败必须影响退出码**（审核方复核指出：原来返回值被忽略，
-    // "比较全过 + 还原失败"会 exit=0，等于把"用户的轮播被我们关掉了"报成成功）。
-    // 用独立退出码 5，与"有视觉差异(1)""未就绪(1)""页面通道挂(3)""拒绝录基准(4)"区分开。
-    // **只有 'failed' 才算失败** —— 'restored'（含"用户原本就关着轮播"）与 'skipped'
-    // 都不是失败（三态契约见 restoreRotation 头注释）。
-    const outcome = await restoreRotation(autoBefore, true)
-    if (outcome === 'failed') {
-      console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
+    // 同 capture：还原与清理拆成嵌套 try/finally，**还原抛错也要清理**（审核方第七轮）。
+    try {
+      // **还原失败必须影响退出码**（审核方复核指出：原来返回值被忽略，
+      // "比较全过 + 还原失败"会 exit=0，等于把"用户的轮播被我们关掉了"报成成功）。
+      // 用独立退出码 5，与"有视觉差异(1)""未就绪(1)""页面通道挂(3)""拒绝录基准/钉图(4)"区分开。
+      // **只有 'failed' 才算失败** —— 'restored'（含"用户原本就关着轮播"）与 'skipped'
+      // 都不是失败（三态契约见 restoreRotation 头注释）。
+      const outcome = await restoreRotation(autoBefore, true)
+      if (outcome === 'failed') {
+        console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
+        if (exitCode === 0) exitCode = 5
+      }
+    } catch (e) {
+      console.error('  ✗ 轮播还原过程抛错：' + String(e && e.message || e).slice(0, 90) + ' —— 按失败处理（5）')
       if (exitCode === 0) exitCode = 5
+    } finally {
+      const cleaned = await cleanupEnvironment(true)
+      if (!cleaned && exitCode === 0) exitCode = 6
     }
-    // 环境清理独立于还原（同 capture 的 finally；还原提前返回的路径也要清）
-    await cleanupEnvironment(true)
+  }
+  } catch (e) {
+    if (exitCode === 0) {
+      exitCode = 1
+      console.error('  ✗ 未预期异常：' + String(e && e.message || e).slice(0, 120))
+    }
   }
   cdp.close()
   process.exit(exitCode)
