@@ -250,7 +250,7 @@ async function readState(expr) {
 // 现在两边都 import 同一份，不再有第二份实现。
 import {
   STABLE_RECT_BY_STATE, MASK_RECTS, REF_CSS_WIDTH, PIXEL_TOLERANCE, EXPECT_GEOMETRY,
-  compareStableFiles, compareStableImages, paint, cssScale,
+  compareStableFiles, compareStableImages, paint, cssScale, deriveGeom,
   rotationRestoreNeed, judgeRotationRestore, isValidSettings,
 } from './oracle-compare.mjs'
 
@@ -674,57 +674,69 @@ async function measureLiveGeom(stateName, log) {
   const raw = await readState(`(()=>{
     const R=(e)=>{ if(!e) return null; const b=e.getBoundingClientRect();
       return {l:Math.round(b.left),t:Math.round(b.top),r:Math.round(b.right),b:Math.round(b.bottom)} };
-    const dateEls=[...document.querySelectorAll('*')].filter(e=>e.children.length===0
-      && /^[0-9]+\\s*(秒|分钟|小时|天|周)前$/.test(String(e.textContent||'').trim()));
+    // 会话列表里**随时间变**的那一列。⚠️ 别只按"X天前"找 —— 实测宿主的标签文本是
+    // "6分钟"（**没有"前"字**），要求"前"会漏掉整列，右边界回落到"侧栏右-8"，
+    // 于是把 x234-261 的时间列圈进比较区，"6分钟"→"7分钟" 就报 397 像素假回归（真机踩过）。
+    // 所以：① 数字+单位，"前"可有可无；② 再兜一层"类名后缀含 time/date/ago 且含数字"。
+    const TIME_RE=/^[0-9]+\\s*(秒|分钟|小时|天|周|月)前?$/;
+    const vol=[];
+    document.querySelectorAll('*').forEach(e=>{
+      if(e.children.length>0) return;
+      const t=String(e.textContent||'').trim();
+      if(!t||t.length>14) return;
+      const cls=String((typeof e.className==='string'?e.className:'')||'').toLowerCase();
+      const suffix=(cls.split(/[_\\s]/).pop()||'');
+      const byClass=/(^|_|-)(time|date|ago|elapsed)$/.test(suffix)&&/[0-9]/.test(t);
+      if(TIME_RE.test(t)||byClass){
+        const b=e.getBoundingClientRect();
+        if(b.width>0&&b.left>=0&&b.right<=innerWidth) vol.push({l:Math.round(b.left),r:Math.round(b.right),t:t});
+      }
+    });
     return JSON.stringify({
       w: Math.round(innerWidth), h: Math.round(innerHeight),
       dlg: R(document.querySelector('[role="dialog"]')),
       studio: R(document.querySelector('.bga-studio')),
       hero: R(document.querySelector('.bga-hero')),
       sidebar: R(document.querySelector('[class*="sidebar" i]')),
-      dateLefts: dateEls.map(e=>Math.round(e.getBoundingClientRect().left)).sort((a,b)=>a-b).slice(0,30),
+      volatile: vol.slice(0, 60),
+      // 插件**自己**在左侧栏里画出来的可见元素（orb / dock 特效等）。
+      // 有它才叫比到插件；此前 01/02 的矩形是整列宿主装饰，插件的 orb（实测 y724–751）
+      // 完全落在矩形之外 ⇒ 那两张状态实际上没比插件任何像素（真机查出来的）。
+      plugin: (()=>{
+        const out=[];
+        document.querySelectorAll('[class*="bga"]').forEach(e=>{
+          const b=e.getBoundingClientRect(); const cs=getComputedStyle(e);
+          if(b.width<2||b.height<2) return;
+          if(cs.display==='none'||cs.visibility==='hidden'||+cs.opacity===0) return;
+          if(b.left>innerWidth*0.35) return;              // 只取左区的
+          out.push({l:Math.round(b.left),t:Math.round(b.top),r:Math.round(b.right),b:Math.round(b.bottom)});
+        });
+        return out.slice(0, 40);
+      })(),
     });
   })()`)
   let a = null
   try { a = JSON.parse(raw) } catch { a = null }
-  if (!a || !a.w) {
-    console.error('  ✗ 实测几何失败（拿不到 innerWidth）：' + String(raw).slice(0, 80))
+  // 规则本身是**纯函数** deriveGeom()（在 oracle-compare.mjs，可离线单测）；
+  // 这里只负责把锚点量回来。
+  const g = deriveGeom(stateName, a)
+  if (!g) {
+    console.error('  ✗ ' + stateName + '：实测几何推不出来（锚点缺失：'
+      + 'studio=' + JSON.stringify(a && a.studio) + ' dlg=' + JSON.stringify(a && a.dlg)
+      + ' sidebar=' + JSON.stringify(a && a.sidebar) + '）—— 本次不比对，'
+      + '绝不回落到写死常量去裁错地方。')
     return null
   }
-  const cssWidth = a.w
-  if (stateName === '03-settings-studio') {
-    if (!a.studio || !a.dlg) {
-      console.error('  ✗ 实测几何缺锚点（studio=' + JSON.stringify(a.studio) + ' dlg=' + JSON.stringify(a.dlg)
-        + '）—— 面板或对话框没打开，不比对。')
-      return null
-    }
-    const rect = {
-      x0: a.studio.l - 6, x1: a.studio.r + 4,
-      y0: a.studio.t - 4, y1: Math.min(a.studio.b, a.dlg.b) - 7,
-    }
-    const masks = a.hero
-      ? [[a.hero.l - 2, a.hero.t - 2, a.hero.r + 2, a.hero.b + 2]]
-      : []
-    if (!a.hero && log) console.log('     ⚠️ 没找到 .bga-hero —— 预览框这次不被屏蔽（可能报假差异）')
-    return { cssWidth, rect, masks, anchors: a }
+  g.volatileCount = (a.volatile || []).length
+  if (stateName !== '03-settings-studio' && g.volatileCount === 0) {
+    console.log('     ⚠️ 这页没探测到随时间变的时间/日期标签 ⇒ 右边界取"侧栏右−8"；'
+      + '若之后这类标签被圈进比较区会报假回归（实测踩过："6分钟"→"7分钟" 差 397 像素）')
   }
-  // 01/02：左侧栏区域，全部相对实测视口/锚点推导
-  const firstDateLeft = Array.isArray(a.dateLefts) && a.dateLefts.length ? a.dateLefts[0] : null
-  const rightBySidebar = a.sidebar ? a.sidebar.r - 8 : null
-  const x1 = Math.min(
-    firstDateLeft != null ? firstDateLeft - 1 : Infinity,
-    rightBySidebar != null ? rightBySidebar : Infinity,
-  )
-  if (!Number.isFinite(x1)) {
-    console.error('  ✗ 实测几何推不出右边界（既没有日期文字也没有侧栏锚点）—— 不比对。')
-    return null
+  if (log) {
+    console.log('     实测几何: css宽=' + g.cssWidth + ' 矩形=' + JSON.stringify(g.rect)
+      + ' 屏蔽框=' + g.masks.length + ' 时间标签=' + g.volatileCount + ' 个')
   }
-  return {
-    cssWidth,
-    rect: { x0: 0, x1: Math.max(40, Math.round(x1)), y0: 0, y1: Math.max(60, a.h - 156) },
-    masks: [],   // 日期文字已被右边界排除，不需要再遮
-    anchors: a,
-  }
+  return g
 }
 
 /**

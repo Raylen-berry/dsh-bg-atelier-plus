@@ -10,7 +10,7 @@
 // 本套件用两张**合成图**证明这一点：可迁移 + 灵敏度没丢。
 //
 // 用法：node tools/verify-oracle-geometry.mjs
-import { compareStableImages, cropStable, cssScale } from './oracle-compare.mjs'
+import { compareStableImages, cropStable, cssScale, deriveGeom } from './oracle-compare.mjs'
 
 let pass = 0, fail = 0
 const ok = (name, cond, extra = '') => {
@@ -105,6 +105,46 @@ console.log('\n— ⑤ cssScale 用实测 CSS 宽（不是写死的截图宽）�
   // 传 0 / 非法值 ⇒ 回落到兜底常量，不能算出 Infinity 把裁剪彻底搞坏
   const s = cssScale({ width: 1654 }, 0)
   ok('cssWidth 传 0 时回落兜底（不产生 Infinity）', Number.isFinite(s) && s > 0, String(s))
+}
+
+console.log('\n— ⑥ deriveGeom：侧栏必须**以插件自己的元素为锚**，且排除随时间变的那一列 —')
+{
+  // 真机查出来的覆盖缺陷：01/02 原来写"y 0..innerHeight-156"（纯粹按视口切），
+  // 而插件自己的 orb 实测在 CSS y724–751 ⇒ **完全在区域之外**，那两张状态比的全是宿主装饰。
+  // 同时会话行的"进行中"旋转指示器（宿主 SVG 动画，CSS x21–35 y361–375）被圈进来，
+  // 每轮报 ~130px、maxΔ 高达 99 的假差异。
+  const anchors = {
+    w: 1426, h: 807,
+    sidebar: { l: 0, t: 0, r: 280, b: 807 },
+    volatile: [{ l: 234, r: 261, t: '6分钟' }, { l: 229, r: 233, t: '' }],
+    plugin: [{ l: 12, t: 724, r: 40, b: 751 }],          // .bga-orb 实测位置
+  }
+  const g = deriveGeom('01-static-wallpaper', anchors)
+  ok('★ 右边界取时间标签左沿−1（228），不是侧栏右−8（272）',
+    g && g.rect.x1 === 228, g ? 'x1=' + g.rect.x1 : 'null')
+  ok('★ 纵向覆盖到插件的 orb（y724–751 落在区域内）',
+    g && g.rect.y0 <= 724 && g.rect.y1 >= 751, g ? 'y' + g.rect.y0 + '–' + g.rect.y1 : 'null')
+  ok('★ 不再按视口高度写死（旧规则 y1 会是 651 < 724）',
+    g && g.rect.y1 > 651, g ? 'y1=' + g.rect.y1 : 'null')
+  ok('★ 会话行的旋转指示器（y361–375）落在区域之外',
+    g && g.rect.y0 > 375, g ? 'y0=' + g.rect.y0 : 'null')
+
+  // 没有 volatile 时确实退到侧栏右−8（反证：上面那条不是巧合）
+  const gNo = deriveGeom('01-static-wallpaper', { ...anchors, volatile: [] })
+  ok('反证：探测不到时间标签时才退到侧栏右−8=272', gNo.rect.x1 === 272, 'x1=' + gNo.rect.x1)
+
+  // 锚点缺失 ⇒ null（大声失败，不回落常量）
+  ok('插件元素测不到 ⇒ null（不比宿主装饰冒充覆盖）',
+    deriveGeom('01-static-wallpaper', { ...anchors, plugin: [] }) === null)
+  ok('侧栏锚点也没有 ⇒ null', deriveGeom('01-static-wallpaper', { w: 1426, h: 807, plugin: [] }) === null)
+  ok('03 缺 studio/dlg ⇒ null', deriveGeom('03-settings-studio', { w: 1426, h: 807 }) === null)
+  const g3 = deriveGeom('03-settings-studio', {
+    w: 1426, h: 807, studio: { l: 525, t: 78, r: 1085, b: 1419 }, dlg: { l: 313, t: 24, r: 1113, b: 783 },
+    hero: { l: 545, t: 148, r: 1059, b: 360 },
+  })
+  ok('03 下沿 = min(面板底,对话框底)−7 = 776', g3.rect.y1 === 776, 'y1=' + g3.rect.y1)
+  ok('03 屏蔽框 = hero ±2', JSON.stringify(g3.masks) === JSON.stringify([[543, 146, 1061, 362]]),
+    JSON.stringify(g3.masks))
 }
 
 console.log('\n几何回归：' + pass + ' 通过 / ' + fail + ' 失败')

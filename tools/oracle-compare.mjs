@@ -169,6 +169,59 @@ export function cssScale(img, cssWidth = REF_CSS_WIDTH) {
   return img.width / w
 }
 
+/**
+ * **纯函数**：从实测锚点推导这一次的比较几何（可离线单测，不依赖页面）。
+ *
+ * 规则（与真机踩过的坑一一对应）：
+ *  · cssWidth = 实测 innerWidth（**不是**写死的 REF_CSS_WIDTH）
+ *  · 03：矩形由面板实测矩形推导（左 −6、右 +4、上 −4），
+ *        下沿 = min(面板底, 对话框底) − 7（宿主裁剪边的取整碎行，实测 127px/Δ2 全在那两行）
+ *        屏蔽框 = .bga-hero 实测矩形 ±2（43MP 预览图跨刷新重采样不稳）
+ *  · 01/02：右边界 = **随时间变那一列**（时间/日期标签）的最左 − 1，且不超过侧栏右 − 8；
+ *        下沿 = innerHeight − 156（再往下是宿主状态栏实时计数）
+ *    ⚠️ volatile 标签的文本实测是 "6分钟"（**没有"前"字**）。调用方按"X天前"匹配会漏掉整列，
+ *        于是回落到"侧栏右 − 8"，把时间列圈进比较区 ⇒ "6分钟"→"7分钟" 报 397 像素假回归。
+ *  · 锚点缺失 ⇒ 返回 null，由调用方**大声失败**，绝不静默回落到常量去比错地方。
+ */
+export function deriveGeom(stateName, a) {
+  if (!a || !(a.w > 0)) return null
+  const cssWidth = a.w
+  if (stateName === '03-settings-studio') {
+    if (!a.studio || !a.dlg) return null
+    return {
+      cssWidth,
+      rect: {
+        x0: a.studio.l - 6, x1: a.studio.r + 4,
+        y0: a.studio.t - 4, y1: Math.min(a.studio.b, a.dlg.b) - 7,
+      },
+      masks: a.hero ? [[a.hero.l - 2, a.hero.t - 2, a.hero.r + 2, a.hero.b + 2]] : [],
+    }
+  }
+  const vol = Array.isArray(a.volatile) ? a.volatile : []
+  const volLeft = vol.length ? Math.min(...vol.map((v) => v.l)) : null
+  const bySidebar = a.sidebar ? a.sidebar.r - 8 : null
+  const x1 = Math.min(volLeft != null ? volLeft - 1 : Infinity, bySidebar != null ? bySidebar : Infinity)
+  if (!Number.isFinite(x1)) return null
+  // 纵向：**以插件自己画出来的元素为锚**（orb / dock 特效），上下各留 24px 让周围被染色/
+  // 透出壁纸的区域也参与。
+  // ⚠️ 以前这里写成"0 到 innerHeight-156"，纯粹按视口高度切 —— 结果插件的 orb（实测
+  //   CSS y724–751）落在区域**之外**，01/02 比的全是宿主装饰，插件一个像素都没比到。
+  //   而且会话行的"进行中"旋转指示器（宿主 SVG 动画）会被圈进来，每轮报 ~130px 假差异。
+  const plug = Array.isArray(a.plugin) ? a.plugin : []
+  if (!plug.length) return null
+  const pTop = Math.min(...plug.map((p) => p.t))
+  const pBot = Math.max(...plug.map((p) => p.b))
+  const y0 = Math.max(0, pTop - 24)
+  const y1 = Math.min(Math.max(a.h - 8, pBot + 2), pBot + 24)
+  if (y1 - y0 < 8) return null
+  return {
+    cssWidth,
+    rect: { x0: 0, x1: Math.max(40, Math.round(x1)), y0: Math.round(y0), y1: Math.round(y1) },
+    masks: [],
+    pluginAnchored: true,
+  }
+}
+
 /** 取本次比对用的几何：调用方实测的 geom 优先，表里常量兜底。 */
 function resolveGeom(stateName, geom) {
   return {

@@ -164,17 +164,20 @@ function makeServer(cfg) {
           if (cfg.throwAt && cfg.throwAt.includes(idx)) throw new Error('Simulated GET failure')
           return val(JSON.stringify(state.settings))
         }
-        if (/dateLefts/.test(e)) {
-          // ⚠️ 入口新增 measureLiveGeom()：它一次读回 innerWidth + 各锚点矩形。
+        if (/volatile/.test(e)) {
+          // ⚠️ 入口新增 measureLiveGeom()：一次读回 innerWidth + 各锚点 + **随时间变的那一列**。
           //    桩必须给出**结构完整**的锚点，否则 geom=null ⇒ 几何核对判不可信 ⇒ 全场景 exit=4
           //    （第一版就是这里没补，S1/S6/S7 一起假失败）。
+          //    volatile 的形状是 [{l,r,t}] —— 宿主的时间标签实测是 "6分钟"（**没有"前"字**）。
           return val(JSON.stringify({
             w: cfg.cssWidth || 1426, h: 807,
             dlg: { l: 313, t: 24, r: 1113, b: 783 },
             studio: { l: 525, t: 78, r: 1085, b: 1419 },
             hero: { l: 545, t: 148, r: 1059, b: 360 },
             sidebar: { l: 0, t: 0, r: 280, b: 807 },
-            dateLefts: [243],
+            volatile: [{ l: 234, r: 261, t: '6分钟' }],
+            // 侧栏纵向以**插件自己的元素**为锚（实测 .bga-orb 在 y724–751）
+            plugin: [{ l: 12, t: 724, r: 40, b: 751 }],
           }))
         }
         if (/pending:pending\.length/.test(e)) {

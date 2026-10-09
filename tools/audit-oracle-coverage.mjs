@@ -56,9 +56,10 @@ const ok = (name, cond, extra = '') => {
 
 console.log('=== oracle 覆盖边界审计 ===')
 console.log('基准目录: ' + BASE)
-console.log('口径（从 oracle-compare.mjs import）：矩形全部是 **CSS 坐标**，换算锚点 REF_CSS_WIDTH='
-  + REF_CSS_WIDTH + '；每通道容差 ' + PIXEL_TOLERANCE)
-console.log('各状态比较矩形(CSS): ' + JSON.stringify(RECTS))
+console.log('口径：矩形全部是 **CSS 坐标**；每通道容差 ' + PIXEL_TOLERANCE)
+console.log('兜底常量(仅参考): ' + JSON.stringify(RECTS))
+console.log('实际用(基准实测): ' + JSON.stringify(
+  Object.fromEntries(Object.entries(GEOMS).map(([k, v]) => [k, v.rect]))))
 
 for (const s of manifest.states) {
   const file = path.join(BASE, s.file)
@@ -178,8 +179,12 @@ console.log('\n— 跨 DPI 归一化的检出能力（走**真实** compareStabl
     rClean.detected ? '**误报** ' + rClean.diff + ' 像素（' + (rClean.ratio * 100).toFixed(2) + '%）' : 'diff=0')
 
   // 实验组：先涂补丁 → 再按同一套算法缩放 ⇒ 应仍抓得到
-  const sc0 = cssScale(img, GEOMS[s0.name] && GEOMS[s0.name].cssWidth ? GEOMS[s0.name].cssWidth : REF_CSS_WIDTH)
-  const r0 = RECTS[s0.name]
+  // ⚠️ 中心点必须按**真实几何**（manifest 里记录的 geom）算，不能用兜底常量 RECTS。
+  //    踩过：01 的矩形改成"以插件 orb 为锚"（y700–775）后，这里还按常量 y0–620 取中点，
+  //    补丁涂到比较区**之外** ⇒ 四个尺寸全报"漏掉"，看着像 oracle 失灵、其实是审计自己漂移。
+  const g0 = GEOMS[s0.name] || null
+  const sc0 = cssScale(img, g0 && g0.cssWidth ? g0.cssWidth : REF_CSS_WIDTH)
+  const r0 = (g0 && g0.rect) || RECTS[s0.name]
   const midX = Math.round(((r0.x0 + r0.x1) / 2) * sc0), midY = Math.round(((r0.y0 + r0.y1) / 2) * sc0)
   const findings = []
   for (const [label, w, h] of [['10×10', 10, 10], ['6×6', 6, 6], ['3×3', 3, 3], ['1×1', 1, 1]]) {
