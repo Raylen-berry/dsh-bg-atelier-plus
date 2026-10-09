@@ -251,7 +251,7 @@ async function readState(expr) {
 import {
   STABLE_RECT_BY_STATE, MASK_RECTS, REF_CSS_WIDTH, PIXEL_TOLERANCE, EXPECT_GEOMETRY,
   compareStableFiles, compareStableImages, paint, cssScale,
-  rotationRestoreNeed, judgeRotationRestore,
+  rotationRestoreNeed, judgeRotationRestore, isValidSettings,
 } from './oracle-compare.mjs'
 
 // 本文件内部沿用旧名字，避免大改调用点
@@ -288,8 +288,13 @@ async function freezeRotation(log) {
   })()`)
   let before = null
   try { before = JSON.parse(raw) } catch { /* 读不到就不动 */ }
-  if (!before || typeof before !== 'object') {
-    if (log) console.log('     轮播: 读不到设置，跳过冻结（不做任何写入）')
+  // ⚠️ 必须用 isValidSettings（判"含已知设置键"），不能只查"是对象"：
+  // 宿主的 readSettings 在**磁盘读取失败时返回 `{}` 且 GET 仍报 200**（host index.js：
+  // `catch { return {} }`）。`{}` 恰好是对象 ⇒ 旧检查放行 ⇒ 审核方复现过：
+  // 首次读失败被当合法原值 ⇒ 钉图写入 autoOn=false ⇒ 还原判"无需还原" ⇒ exit=0，
+  // 用户的轮播被留在关。数组同理（typeof [] === 'object'）。
+  if (!isValidSettings(before)) {
+    if (log) console.log('     轮播: 读到的不是合法设置（宿主读失败会返回 {} 且报 200）—— 视同读失败，不做任何写入')
     return null
   }
   // **关键是钉住 wallpaper，不只是关轮播**：
@@ -312,14 +317,18 @@ async function freezeRotation(log) {
  * 拿不到就拒绝写入并如实报告，由调用方决定怎么退出。
  */
 async function pinWallpaper(wallpaper, log, frozenBefore) {
-  if (!frozenBefore || typeof frozenBefore !== 'object') {
-    console.error('     ✗ 钉图被拒绝：没有有效的原始设置可依据（避免"读到一半失败还去写盘"）。')
+  if (!isValidSettings(frozenBefore)) {
+    console.error('     ✗ 钉图被拒绝：没有有效的原始设置可依据（{} 不算有效——宿主读失败长这样）。')
     return false
   }
   const nowRaw = await readState(`(async()=>{const r=await fetch('/bga/settings.json',{cache:'no-store'});return await r.text()})()`)
   let now = null
   try { now = JSON.parse(nowRaw) } catch { now = null }
-  if (!now || typeof now !== 'object') { if (log) console.log('     钉图: 读不到设置，跳过'); return false }
+  // 同一条判据：now 不合法 ⇒ **拒绝写**（写下去就是把用户设置清成 2 字段）
+  if (!isValidSettings(now)) {
+    console.error('     ✗ 钉图被拒绝：当前设置读失败/不合法（写下去会覆盖成残缺文件），本次不写。')
+    return false
+  }
   const patched = JSON.stringify({ ...now, autoOn: false, wallpaper })
   const r = await readState(`(async()=>{
     const res = await fetch('/bga/settings.json', {
@@ -483,13 +492,13 @@ async function resetToCleanHome(log) {
 /**
  * 环境准备（截图前必须执行，捕获与比对两次都要）：让画面进入**确定性**状态。
  *
- * 两条干预，都只注入页面内样式（可逆：刷新即消失；不写盘、不改插件源码）：
+ * 两条干预（都**可逆**，由 cleanupEnvironment 成对移除；刷新也清；不写盘、不改插件源码）：
  *
- * ① **宿主对话框强制不透明**。
- *    宿主设置对话框背景是 `rgba(48,26,32,0.97)` —— 3% 半透明，于是对话框**背后**的会话内容
- *    会以 3% 权重透进面板像素。我自己的命令输出不断往会话里加内容 ⇒ 面板像素漂几级。
- *    证据（会话不变时连截两张 diff=0，跨"我跑过命令"再比就出现 Δ≤10 的 17000+ 像素差异）。
- *    透出来的是**宿主会话内容**，不属于底图插件的视觉契约。
+ * ① **在对话框背后垫一块固定颜色**（洋红）。
+ *    宿主设置对话框背景是 3% 半透明（rgba(...,0.97)），**背后**的会话内容以 3% 权重透进
+ *    面板像素；我自己的命令输出不断往会话里加内容 ⇒ 面板像素漂几级（实测 Δ≤10、17000+ 像素）。
+ *    垫固定底之后，面板合成 = 0.97*面板 + 0.03*洋红 —— 确定。**谁的样式都不改**（对比上一版
+ *    "把半透明抬成不透明"的教训，见 prepareEnvironment 函数体内注释）。
  *
  * ② **停掉插件自己的动画装饰层**。
  *    实测文档里查到 41 个带 CSS 动画的元素：`bga-fly f1..f22`、`bga-star s1..s17`、
@@ -517,42 +526,44 @@ async function prepareEnvironment(log) {
       '[class*="bga"] *{animation:none!important}',
     ].join('\\n');
 
-    // ① 让宿主对话框真正不透明。
-    // ⚠️ 这里踩过一个坑：第一版写的是 CSS 选择器 '[role="dialog"]{background-color:...}'，
-    //    结果**毫无作用** —— [role="dialog"] 只是个**透明外壳**（computed bg 是
-    //    rgba(0,0,0,0)），真正的半透明背景挂在它的**子元素** .wCInkW_panel
-    //    上（rgba(48,26,32,0.97)）。我一度以为"已经强制不透明了"，实际面板仍然 3% 透光。
-    //    铁证：在对话框背后铺一层纯红，面板像素照样变了 137116 px（maxΔ=4）。
-    // 所以改成**遍历子树按实际计算的 alpha 判定**（不依赖宿主那串会变的哈希类名）：
-    //    凡是在对话框内、**不属于插件**（类名不含 bga）、且 background alpha 在 (0,1) 之间的
-    //    元素，都把它的 backgroundColor 抬成同 RGB 的不透明色。
-    // 为什么跳过 bga-*：插件自己的半透明表面（玻璃/卡片）要保留 —— 它们现在合成在
-    // 不透明的宿主底色上，本身已经是确定的；把插件也改不透明会白白丢掉那部分的覆盖。
+    // ① 在对话框背后垫一块固定颜色（洋红）。
+    // ⚠️ 为什么用"垫底"而不是上一版的"把半透明改成不透明"（审核方第六轮指出后者是错的）：
+    //    上一版的判定是"类名不含 bga 就当宿主样式"——**不成立**：插件自己就会在宿主选择器上
+    //    写底色（client.js settingsSurfaceCss 写 [role="dialog"][class*="panel"] 与
+    //    [role="dialog"]>[class*="settings" i] 的 background-color）。于是那次 alpha 抬升
+    //    把插件写的 0.97 与 0.50 的背景**一并改成了同一个不透明色**——"静态灵敏度没降"
+    //    的说法不成立。垫底则**谁的样式都不改**：
+    //      · 面板 alpha/颜色任何变化仍然被检出（垫底色与面板色差异大 ⇒ alpha 变化信号最强）；
+    //      · 同机制的有效性已实测：背后铺红 ⇒ 面板像素变 137116 px（证明透光通道是活的）。
     const dlg = document.querySelector('[role="dialog"]');
-    let fixed = 0;
-    if (dlg) {
-      // ⚠️ 必须**连祖先一起走**：真正半透明的 .wCInkW_panel 是 [role="dialog"] 的
-      //    **父元素**（不是子元素）。第一版只遍历了子树 ⇒ opaqueFixed=0，白改一场。
-      const scope = [];
-      for (let e = dlg; e && e !== document.documentElement; e = e.parentElement) scope.push(e);
-      scope.push(...dlg.querySelectorAll('*'));
-      for (const e of scope) {
-        if (/bga/.test(String(e.className || ''))) continue;
-        const cs = getComputedStyle(e);
-        const m = String(cs.backgroundColor).match(/rgba?\\(([^)]+)\\)/);
-        if (!m) continue;
-        const p = m[1].split(',').map((x) => parseFloat(x));
-        const a = p.length > 3 ? p[3] : 1;
-        if (a > 0.01 && a < 0.99) {
-          e.style.setProperty('background-color', 'rgb(' + p[0] + ',' + p[1] + ',' + p[2] + ')', 'important');
-          fixed++;
-        }
-      }
+    let backdrop = 0;
+    if (dlg && !document.getElementById('vb-backdrop')) {
+      const bd = document.createElement('div'); bd.id = 'vb-backdrop';
+      bd.style.cssText = 'position:fixed;inset:0;z-index:1;pointer-events:none;background:rgb(255,0,255)';
+      document.body.appendChild(bd); backdrop = 1;
     }
-    return 'applied(opaqueFixed=' + fixed + ')';
+    return 'applied(backdrop=' + backdrop + ')';
   })()`)
-  if (log) console.log('     环境: 停插件动画 + 宿主底色不透明 ' + r)
+  if (log) console.log('     环境: 停插件动画 + 对话框垫固定底 ' + r)
   await sleep(200)
+}
+
+/**
+ * 环境清理（与 prepareEnvironment 成对）。**必须在 finally 里独立调用**：
+ * 还原轮播的路径有提前返回（"原本就关着"时直接 return），把清理挂在还原后面
+ * ⇒ 那条路径上样式/垫底会**残留在页面里**（审核方沙箱复现：selftest 与"原本关着"的
+ * compare 都残留）。所以清理不能依赖还原函数有没有走到底。
+ */
+async function cleanupEnvironment(log) {
+  const r = await readState(`(()=>{
+    const out={style:false,backdrop:false};
+    const st=document.getElementById('vb-env');
+    if(st){ st.remove(); out.style=true }
+    const bd=document.getElementById('vb-backdrop');
+    if(bd){ bd.remove(); out.backdrop=true }
+    return JSON.stringify(out);
+  })()`).catch(() => null)
+  if (log) console.log('     环境清理: ' + (r || '页面已不可用（样式随刷新消失）'))
 }
 
 /**
@@ -802,6 +813,9 @@ if (mode === 'capture') {
       console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
       if (exitCode === 0) exitCode = 5
     }
+    // 环境清理必须**独立于还原**调用：还原有提前返回的路径（"无需还原"时直接 return），
+    // 挂在它后面的清理会跳过 ⇒ 样式/垫底残留（审核方沙箱复现）。
+    await cleanupEnvironment(true)
   }
 } else if (mode === 'selftest') {
   // ────────────────────────────────────────────────────────────────────────────
@@ -838,46 +852,69 @@ if (mode === 'capture') {
   let stPass = 0, stFail = 0
   const stOk = (n, c, e = '') => { if (c) { stPass++; console.log('  ✅ ' + n + (e ? '  [' + e + ']' : '')) } else { stFail++; console.log('  ❌ ' + n + (e ? '  [' + e + ']' : '')) } }
 
-  await prepareState(s, true)
-  const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
-  const raw = decodePng(Buffer.from(shot.data, 'base64'))
-  const sc = cssScale(raw)
-  const rect = STABLE_RECT_BY_STATE[s.name]
-  const inRect = (r) => r.l >= rect.x0 - 2 && r.r <= rect.x1 + 2 && r.t >= rect.y0 - 2 && r.b <= rect.y1 + 2
-  const masked = (MASK_RECTS[s.name] || [])
+  // ⚠️ 上一版有两个"静默放行"的口子（审核方第六轮指出，模拟面板缺失时 6 个目标全部
+  //    跳过仍 exit=0）：
+  //      ① prepareState 的返回值被忽略 —— 图片未就绪/几何不符照样往下走；
+  //      ② 元素找不到/越界直接"跳过"—— 6 个全跳 = 零验证还报成功。
+  //    现在：准备失败 = 直接失败；**每个探针都是强制的**（找不到 = 失败，越界 = 失败
+  //    —— 越界说明比较矩形没盖住该盖的元素）。
+  try {
+    const prep = await prepareState(s, true)
+    if (!prep || prep.imagesReady === false) {
+      stOk('截图前图片就绪', false, 'prepareState 报告未就绪 —— 继续截只会得到半成品')
+    } else { stOk('截图前图片就绪', true) }
+    if (!prep || prep.geometryOk === false) {
+      stOk('插件元素几何核对', false, '几何与基准记录不符 ⇒ 裁剪区域失准（详见上方错误）')
+    } else { stOk('插件元素几何核对', true) }
 
-  for (const [label, finder] of PROBES) {
-    const got = await readState(`(()=>{const e=${finder}; if(!e) return JSON.stringify({absent:true});
-      const r=e.getBoundingClientRect();
-      return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right),b:Math.round(r.bottom)})})()`)
-    let g = null
-    try { g = JSON.parse(got) } catch { g = null }
-    if (!g || g.absent || g.r <= g.l) { console.log('  ⏭️  ' + label + '：页面里找不到（跳过）'); continue }
-    if (!inRect(g)) { console.log('  ⏭️  ' + label + '：CSS' + JSON.stringify(g) + ' 不在比较矩形内（跳过）'); continue }
-    // 落在屏蔽框内的元素无法验证（那正是"能力缺口"）—— 标注而不是当成失败。
-    // ⚠️ MASK_RECTS 每项是 [x0, y0, x1, y1]（x 在前）。第一版我按 [x0,x1,y0,y1] 解构，
-    //    于是"当前选择"标签（在预览屏蔽框内）被判定"不在框内"，断言方向反了、误报失败。
-    const inMask = masked.some(([mx0, my0, mx1, my1]) =>
-      g.l >= mx0 - 2 && g.r <= mx1 + 2 && g.t >= my0 - 2 && g.b <= my1 + 2)
-    // 涂该元素（CSS→px，向内缩 1px 避免涂到边界外）
-    const px0 = Math.round(g.l * sc) + 1, px1 = Math.round(g.r * sc) - 1
-    const py0 = Math.round(g.t * sc) + 1, py1 = Math.round(g.b * sc) - 1
-    const painted = paint(raw, px0, py0, Math.max(px0 + 1, px1), Math.max(py0 + 1, py1), [255, 0, 255])
-    const cmp = compareStableImages(raw, painted, s.name)
-    const detected = !cmp.same
-    stOk(label + ' 改色被抓到' + (inMask ? '（注：该元素在屏蔽框内，预期抓不到）' : ''),
-      inMask ? detected === false : detected,
-      'CSS' + JSON.stringify(g) + ' → px[' + px0 + ',' + py0 + ',' + px1 + ',' + py1 + '] diff=' + cmp.diff)
-  }
+    const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
+    const raw = decodePng(Buffer.from(shot.data, 'base64'))
+    const sc = cssScale(raw)
+    const rect = STABLE_RECT_BY_STATE[s.name]
+    const inRect = (r) => r.l >= rect.x0 - 2 && r.r <= rect.x1 + 2 && r.t >= rect.y0 - 2 && r.b <= rect.y1 + 2
+    const masked = (MASK_RECTS[s.name] || [])
 
-  // 反向：比较矩形**之外**的插件元素不应被覆盖（说明矩形没白扩）
-  const ownStudio = await readState(`(()=>{const e=document.querySelector('.bga-studio');if(!e)return 'absent';
-    const r=e.getBoundingClientRect();return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right),b:Math.round(r.bottom)})})()`)
-  let os = null
-  try { os = JSON.parse(ownStudio) } catch { os = null }
-  if (os && !os.absent) {
-    stOk('面板 .bga-studio 的水平范围被比较矩形覆盖（CSS ' + os.l + '–' + os.r + ' vs 矩形 ' + rect.x0 + '–' + rect.x1 + '）',
-      os.l >= rect.x0 && os.r <= rect.x1)
+    for (const [label, finder] of PROBES) {
+      const got = await readState(`(()=>{const e=${finder}; if(!e) return JSON.stringify({absent:true});
+        const r=e.getBoundingClientRect();
+        return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right),b:Math.round(r.bottom)})})()`)
+      let g = null
+      try { g = JSON.parse(got) } catch { g = null }
+      // 找不到 = 失败（面板没打开/DOM 变了/选择器失效 —— 都不该静默通过）
+      if (!g || g.absent || g.r <= g.l) { stOk(label + ' 存在于面板中', false, '页面里找不到：' + String(got).slice(0, 60)); continue }
+      // 越界 = 失败（比较矩形没盖住它 —— 正是第五轮漏检的形态）
+      if (!inRect(g)) { stOk(label + ' 落在比较矩形内', false, 'CSS' + JSON.stringify(g) + ' 越出矩形 ' + JSON.stringify(rect)); continue }
+      stOk(label + ' 落在比较矩形内', true, 'CSS' + JSON.stringify(g))
+      // 落在屏蔽框内的元素无法验证（那正是"能力缺口"）—— 标注而不是当成失败。
+      // ⚠️ MASK_RECTS 每项是 [x0, y0, x1, y1]（x 在前）。第一版我按 [x0,x1,y0,y1] 解构，
+      //    于是"当前选择"标签（在预览屏蔽框内）被判定"不在框内"，断言方向反了。
+      const inMask = masked.some(([mx0, my0, mx1, my1]) =>
+        g.l >= mx0 - 2 && g.r <= mx1 + 2 && g.t >= my0 - 2 && g.b <= my1 + 2)
+      // 涂该元素（CSS→px，向内缩 1px 避免涂到边界外）
+      const px0 = Math.round(g.l * sc) + 1, px1 = Math.round(g.r * sc) - 1
+      const py0 = Math.round(g.t * sc) + 1, py1 = Math.round(g.b * sc) - 1
+      const painted = paint(raw, px0, py0, Math.max(px0 + 1, px1), Math.max(py0 + 1, py1), [255, 0, 255])
+      const cmp = compareStableImages(raw, painted, s.name)
+      const detected = !cmp.same
+      stOk(label + ' 改色被抓到' + (inMask ? '（注：该元素在屏蔽框内，预期抓不到）' : ''),
+        inMask ? detected === false : detected,
+        'px[' + px0 + ',' + py0 + ',' + px1 + ',' + py1 + '] diff=' + cmp.diff)
+    }
+
+    // 面板本身必须存在且被矩形覆盖（'absent' = 失败，不是跳过）
+    const ownStudio = await readState(`(()=>{const e=document.querySelector('.bga-studio');if(!e)return 'absent';
+      const r=e.getBoundingClientRect();return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right),b:Math.round(r.bottom)})})()`)
+    let os = null
+    try { os = JSON.parse(ownStudio) } catch { os = null }
+    if (!os || os.absent) {
+      stOk('面板 .bga-studio 存在', false, '找不到 —— 面板没打开或 DOM 变了，整轮自检无效')
+    } else {
+      stOk('面板 .bga-studio 的水平范围被比较矩形覆盖（CSS ' + os.l + '–' + os.r + ' vs 矩形 ' + rect.x0 + '–' + rect.x1 + '）',
+        os.l >= rect.x0 && os.r <= rect.x1)
+    }
+  } finally {
+    // selftest 也会注入环境样式 —— 必须成对清理（审核方：残留）
+    await cleanupEnvironment(true)
   }
 
   console.log('\n自检：' + stPass + ' 通过 / ' + stFail + ' 失败')
@@ -885,6 +922,11 @@ if (mode === 'capture') {
   cdp.close()
   process.exit(exitCode)
 } else {
+  // ⚠️ 这里曾丢过一行：上一轮加 selftest 分支时把 `const manifest = ...` 一起替换掉了
+  //    却没有补回来 ⇒ compare 一跑就 ReferenceError: manifest is not defined。
+  //    提交前没跑真机 compare（只跑了 selftest/离线套件）所以没发现 —— 教训：
+  //    动过 compare 分支就必须跑一次真机 compare 再提交。
+  const manifest = JSON.parse(fs.readFileSync(path.join(baseDir, 'manifest.json'), 'utf8'))
   // 比对时：冻结轮播 + **钉回基准里记的那张底图**。
   // 只关轮播是不够的：录制之后轮播可能已经换过图，那"现在这张"与基准那张就不是同一张 ——
   // 实测连踩三次（洁西卡金蜜 → 重返未来1999 → 百夫长），探针里能直接看到 url 不同。
@@ -973,6 +1015,8 @@ if (mode === 'capture') {
       console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
       if (exitCode === 0) exitCode = 5
     }
+    // 环境清理独立于还原（同 capture 的 finally；还原提前返回的路径也要清）
+    await cleanupEnvironment(true)
   }
   cdp.close()
   process.exit(exitCode)

@@ -243,23 +243,51 @@ export function paint(img, x0, y0, x1, y1, rgb) {
 // 所以把判断逻辑抽到这里（纯函数、无副作用），由 visual-baseline 调用、由离线测试覆盖。
 
 /**
+ * 合法设置对象的判据（宿主读失败会返回 `{}` 且 HTTP 仍是 200 —— 见 host 的 readSettings：
+ * `catch { return {} }`。所以**只检查"是对象"远远不够**，`{}` 恰好是对象）。
+ *
+ * 判据：非 null、是对象、不是数组、且**至少含一个已知设置键**。
+ * "至少一个已知键"这条与插件自己的 load() 闸门同思路（它写 `patch.effect !== undefined`）。
+ *
+ * 审核方用真实 readSettings 复现过两条丢设置路径，都因 `{}` 骗过了"是对象"检查：
+ *   ① 首次 GET 返回 `{}`（读失败）⇒ 被当合法原值 ⇒ 钉图写入 autoOn=false ⇒
+ *      还原时 `{}`.autoOn !== true 判"无需还原" ⇒ **exit=0，轮播被留在关**。
+ *   ② 原本关着轮播 + 钉图自己的 GET 返回 `{}` ⇒ `{...{}, autoOn:false, wallpaper}` ⇒
+ *      **26 字段被写成 2 字段**，exit=0。
+ */
+const SETTINGS_KEYS = [
+  'autoOn', 'autoMin', 'wallpaper', 'effect', 'accent', 'deep', 'veil', 'glass',
+  'cardA', 'cardBlur', 'cardShadow', 'focus', 'zoom', 'preset',
+  'fadeOn', 'fadeDelayMs', 'fadeMs',
+  'playbackSource', 'playbackMode', 'playlists', 'recent', 'imageFraming',
+  'weId', 'weMode', 'weQuality', 'styles',
+]
+export function isValidSettings(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  let known = 0
+  for (const k of SETTINGS_KEYS) if (k in v) known++
+  return known >= 1
+}
+
+/**
  * 从"冻结前读到的原始设置 JSON 文本"判断**是否需要还原**。
- *   'skip'      —— 无可还原的原值（当初就没冻结成功）
+ *   'skip'      —— 无可还原的原值（当初就没冻结成功，**或读到的不是合法设置**）
  *   'not-needed' —— 用户原本就关着轮播，我们从未改动它 ⇒ 无需还原、**也不算失败**
  *   'need'      —— 确实需要还原
  *
  * 为什么要区分后两者：原来只返回布尔，调用方写 `!== true` ⇒ "用户原本就关着"被误报成
  * **还原失败**，一次正常运行的退出码变成 5（审核方模拟复现）。
+ *
+ * ⚠️ `{}`（宿主读失败的样子）在这里判 'skip' 而不是 'not-needed'：读不到 ⇒ 没有可靠原值
+ * ⇒ 什么也别说。配合 isValidSettings 守卫（拿不到合法原值就不许写），这条路径上我们
+ * **从未写入**，所以 'skip' 是事实陈述。
  */
 export function rotationRestoreNeed(beforeRaw) {
   if (!beforeRaw) return 'skip'
   let want = null
   try { want = JSON.parse(beforeRaw) } catch { want = null }
-  // ⚠️ 必须排除数组：`typeof [] === 'object'`，但数组不是合法设置对象。
-  // 这个漏洞是**离线套件测出来的**（[1,2] 应判 skip 却走到 not-needed）——
-  // 正是"把判断逻辑抽成纯函数才测得到"的价值。插件自己的 load() 也是这么判的
-  // （它写 `Array.isArray(saved)` 显式排除）。
-  if (!want || typeof want !== 'object' || Array.isArray(want)) return 'skip'
+  // 数组也要排除：`typeof [] === 'object'`。这个漏洞是离线套件测出来的。
+  if (!isValidSettings(want)) return 'skip'
   if (want.autoOn !== true) return 'not-needed'
   return 'need'
 }

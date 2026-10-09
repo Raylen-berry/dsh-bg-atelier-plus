@@ -13,7 +13,7 @@
 // 本套件逐条覆盖，**并对每个断言做变异说明**（改坏哪一行会让它失败）。
 //
 // 用法：node tools/verify-oracle-restore.mjs
-import { rotationRestoreNeed, judgeRotationRestore } from './oracle-compare.mjs'
+import { rotationRestoreNeed, judgeRotationRestore, isValidSettings } from './oracle-compare.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -26,6 +26,21 @@ const ok = (name, cond, extra = '') => {
 
 console.log('\n=== oracle 还原判定离线回归 ===')
 
+console.log('\n— ⓪ isValidSettings：宿主读失败长什么样（审核方第六轮路径）—')
+{
+  // 宿主 readSettings 在磁盘读失败时返回 `{}` 且 GET 报 200（host index.js: catch { return {} }）。
+  // "只查是不是对象"拦不住它 —— 这是两条丢设置路径的共同根因。
+  ok('null 不是有效设置', isValidSettings(null) === false)
+  ok('★ {}（宿主读失败的样子）不是有效设置', isValidSettings({}) === false)
+  ok('★ 数组不是有效设置（typeof [] === "object" 的坑）', isValidSettings([1, 2]) === false)
+  ok('数字/字符串不是有效设置', isValidSettings(42) === false && isValidSettings('x') === false)
+  ok('只含未知字段的对象不算（防止随缘放行）', isValidSettings({ foo: 1 }) === false)
+  ok('含任一已知设置键 ⇒ 有效', isValidSettings({ autoOn: false }) === true)
+  ok('正常 26 字段对象 ⇒ 有效', isValidSettings({
+    autoOn: true, autoMin: 5, wallpaper: { file: 'x' }, accent: '#fff', styles: { surface: 0.3 },
+  }) === true)
+}
+
 console.log('\n— ① rotationRestoreNeed：要不要还原 —')
 {
   ok('没冻结成功（null）⇒ skip', rotationRestoreNeed(null) === 'skip')
@@ -33,6 +48,9 @@ console.log('\n— ① rotationRestoreNeed：要不要还原 —')
   ok('坏 JSON ⇒ skip', rotationRestoreNeed('{不是合法 json') === 'skip')
   ok('JSON 不是对象（数组）⇒ skip', rotationRestoreNeed('[1,2]') === 'skip')
   ok('JSON 不是对象（数字）⇒ skip', rotationRestoreNeed('42') === 'skip')
+  // ★ 审核方第六轮：{} 是宿主读失败的样子，必须判 skip（"没有可靠原值"），
+  //   绝不能走到 not-needed —— 那会掩盖"我们其实改过 autoOn 却没有原值可对照"。
+  ok('★ {}（宿主读失败）⇒ skip（不是 not-needed）', rotationRestoreNeed('{}') === 'skip')
 
   // ★ 审核方第 2 条的根因：这一条必须与"需要还原"分开
   ok('★ 用户原本就关着轮播 ⇒ not-needed（**不是失败**）',

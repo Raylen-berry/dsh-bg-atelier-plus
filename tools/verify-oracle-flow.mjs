@@ -50,8 +50,11 @@ function sliceFrom(src, sig) {
 /**
  * 把 freezeRotation / pinWallpaper / restoreRotation 三个真函数装进沙箱。
  * 做法：从源码里切出这三个函数（连同它们依赖的 readState/cdp 桩），避免复制实现。
+ *
+ * getEmptyObjectReads：让前 N 次 GET 返回 `{}`（宿主 readSettings 读失败的样子，
+ * HTTP 仍是 200）—— 专门复现审核方第六轮指出的两条丢设置路径。
  */
-function loadFns({ getFailuresBeforeSuccess = 0, initialAutoOn = true } = {}) {
+function loadFns({ getFailuresBeforeSuccess = 0, emptyObjectAt = [], initialAutoOn = true } = {}) {
   const writes = []            // 记录所有 PUT
   const reads = { n: 0 }
   const settings = { autoOn: initialAutoOn, autoMin: 5, wallpaper: { file: 'x.png', cat: 'c' }, accent: '#fff' }
@@ -69,8 +72,14 @@ ${sliceFn('async function pinWallpaper(')}
 ${sliceFn('async function restoreRotation(')}
 return { freezeRotation, pinWallpaper, restoreRotation };
 `
-  // restoreRotation 依赖 oracle-compare.mjs 里的两个纯函数 —— 一并注入真实现（不复制）
+  // restoreRotation 依赖 oracle-compare.mjs 里的纯函数 —— 一并注入**真实现**（不复制）。
+  // ⚠️ isValidSettings 还依赖模块级常量 SETTINGS_KEYS，得连它一起切进来
+  //    （第一版只切了函数 ⇒ ReferenceError: SETTINGS_KEYS is not defined）。
   const cmpSrc = fs.readFileSync(path.join(HERE, 'oracle-compare.mjs'), 'utf8')
+  const keysBegin = cmpSrc.indexOf('const SETTINGS_KEYS = [')
+  const keysEnd = cmpSrc.indexOf(']', keysBegin) + 1
+  const keysSrc = cmpSrc.slice(keysBegin, keysEnd)
+  const validSrc = sliceFrom(cmpSrc, 'export function isValidSettings(')
   const needSrc = sliceFrom(cmpSrc, 'export function rotationRestoreNeed(')
   const judgeSrc = sliceFrom(cmpSrc, 'export function judgeRotationRestore(')
   const logs = []
@@ -82,6 +91,10 @@ return { freezeRotation, pinWallpaper, restoreRotation };
     __settings: settings,
     __reads: reads,
     __getFailuresLeft: { n: getFailuresBeforeSuccess },
+    // ⚠️ 宿主的 readSettings 在**磁盘读失败时返回 `{}` 且 GET 仍报 200**（host index.js：
+    //    `catch { return {} }`）。这是审核方第六轮抓出来的真路径 —— 所以桩也要能模拟它。
+    //    按第 N 次 GET 计（1 起），便于精确命中"freeze 的那次"或"pin 内部的那次"。
+    __emptyObjectAt: Array.isArray(emptyObjectAt) ? emptyObjectAt.slice() : [],
     log: () => {},
   }
   // readState：模拟页面里执行 fetch('/bga/settings.json')；GET 可按需失败若干次
@@ -97,14 +110,16 @@ return { freezeRotation, pinWallpaper, restoreRotation };
     }
     if (/cache:'no-store'/.test(expr) || /cache: 'no-store'/.test(expr)) {
       reads.n++
-      if (sandbox.__getFailuresLeft.n > 0) { sandbox.__getFailuresLeft.n--; return null }   // 模拟读失败
+      if (sandbox.__getFailuresLeft.n > 0) { sandbox.__getFailuresLeft.n--; return null }   // 模拟整次读挂掉
+      const idx = sandbox.__emptyObjectAt.indexOf(reads.n)
+      if (idx >= 0) { sandbox.__emptyObjectAt.splice(idx, 1); return '{}' }                  // 模拟宿主读失败：200 + {}
       return JSON.stringify(settings)
     }
     return '"ok"'
   }
   sandbox.cdp = { send: async () => ({}) }
   vm.createContext(sandbox)
-  const fns = vm.runInContext('(function(){' + needSrc + '\n' + judgeSrc + '\n' + code + '})()', sandbox, { filename: 'oracle-fns.js' })
+  const fns = vm.runInContext('(function(){' + keysSrc + '\n' + validSrc + '\n' + needSrc + '\n' + judgeSrc + '\n' + code + '})()', sandbox, { filename: 'oracle-fns.js' })
   return { fns, writes, reads, settings, logs, sandbox }
 }
 
@@ -135,6 +150,36 @@ console.log('\n— A2. 反证：若把二次读到的值当依据传进去，才
   ok('有有效原始设置时允许写入', pinned === true && writes.length >= 1, 'PUT ' + writes.length + ' 次')
   ok('写入带上了全部字段（不是只写两个）', writes[0] && typeof writes[0] === 'object' && Object.keys(writes[0]).length >= 4,
     writes[0] ? Object.keys(writes[0]).length + ' 个字段' : '无')
+}
+
+console.log('\n— A3. 宿主读失败返回 {}（HTTP 200）：{} 不算有效原值 —')
+{
+  // 审核方第六轮复现的路径①：宿主 readSettings 磁盘读失败 ⇒ 返回 {} 且 GET 报 200。
+  // 旧守卫只查"是对象" ⇒ {} 放行 ⇒ 钉图写 autoOn:false ⇒ 还原判"无需还原" ⇒ exit=0，
+  // 用户的轮播被留在关。现在 {} 必须被 freezeRotation 当成读失败。
+  const { fns, writes, settings } = loadFns({ emptyObjectAt: [1], initialAutoOn: true })
+  const frozen = await fns.freezeRotation(false)
+  ok('★ freezeRotation 把 {} 视同读失败（返回 null）', frozen === null, String(frozen))
+  ok('★ 此后钉图被拒绝、0 次 PUT、autoOn 仍为 true',
+    (await fns.pinWallpaper(settings.wallpaper, false, null)) === false
+      && writes.length === 0 && settings.autoOn === true,
+    'PUT ' + writes.length + ' 次, autoOn=' + settings.autoOn)
+}
+
+console.log('\n— A4. 原本关着 + 钉图自己的 GET 返回 {}：不得把整份设置写成残缺 —')
+{
+  // 审核方第六轮复现的路径②：freeze 正常（autoOn=false 的完整设置），
+  // 但 pinWallpaper 内部那次 GET 读失败返回 {} ⇒ 旧代码 {...{}, autoOn:false, wallpaper}
+  // 会把 26 字段写成 2 字段。现在 must 拒绝写。
+  const { fns, writes, settings } = loadFns({ emptyObjectAt: [2], initialAutoOn: false })
+  const frozen = await fns.freezeRotation(false)          // 第 1 次 GET：拿到真实设置；{} 命中第 2 次（pin 内部）
+  ok('freeze 正常拿到原值', !!(frozen && frozen.before), 'autoOn=' + frozen?.before?.autoOn)
+  const pinned = await fns.pinWallpaper({ file: 'y.png', cat: 'c' }, false, frozen.before)
+  ok('★ 钉图被拒绝（自己那次 GET 拿到 {}）', pinned === false, String(pinned))
+  ok('★ **0 次写入**（旧路径会写 2 字段残缺文件）', writes.length === 0,
+    writes.length ? 'PUT 了 ' + writes.length + ' 次：' + JSON.stringify(writes[0]) : '无')
+  ok('★ 设置对象原封不动（4 个字段都还在）', Object.keys(settings).length === 4,
+    Object.keys(settings).join(','))
 }
 
 console.log('\n— B. 轮播原本关闭：整条链不应产生"失败" —')
