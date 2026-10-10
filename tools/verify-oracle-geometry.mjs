@@ -21,7 +21,6 @@ import {
   compareStableImages, cropStable, cssScale, deriveGeom,
   pluginRectRel, assertLayoutContract,
 } from './oracle-compare.mjs'
-
 let pass = 0, fail = 0
 const ok = (name, cond, extra = '') => {
   if (cond) { pass++; console.log('  ✅ ' + name + (extra ? '  [' + extra + ']' : '')) }
@@ -39,6 +38,20 @@ const BG = [30, 30, 30]
 
 function panelPixel(px, py) {
   return [(px * 3 + py * 7) & 0xff, (px * 5 + py * 11) & 0xff, (px * 9 + py * 13) & 0xff]
+}
+
+/** 一张纯色图 + 指定矩形内涂另一种颜色（验宿主表面底色变化用）。 */
+function makeShot2(w, h, rect, inside) {
+  const data = Buffer.alloc(w * h * 4)
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = (y * w + x) * 4
+      const inR = x >= rect.x0 && x < rect.x1 && y >= rect.y0 && y < rect.y1
+      const c = inR ? inside : [10, 10, 10]
+      data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = 255
+    }
+  }
+  return { width: w, height: h, channels: 4, data }
 }
 
 function makeShot(cssWidth, cssHeight, panelLeft, panelTop, opts = {}) {
@@ -293,6 +306,34 @@ console.log('\n— ⑧ 比较范围缩水必须报"覆盖不足"，不能继续�
   ok('★ 两侧一起缩水 ⇒ 仍被判覆盖不足（与录制尺寸不符）',
     rBoth.coverage.ok === false && /录制时 604/.test(rBoth.coverage.reason || ''),
     rBoth.coverage.reason)
+}
+
+console.log('\n— ⑨ 主题/透明度状态的宿主表面锚点（第 3 项验收）—')
+{
+  // 覆盖对象按"插件影响的输出"定：宿主主体表面 [data-composer-card] 被插件按主题改底色
+  // ⇒ 它必须**整块**进比较区，且不按类名排除。
+  const a = { w: 1426, h: 807, surface: { l: 456, t: 397, r: 1244, b: 511 } }
+  const g = deriveGeom('surface', a)
+  ok('★ surface 锚点 ⇒ 比较区 = 整块宿主表面（456–1244 × 397–511）',
+    JSON.stringify(g.rect) === JSON.stringify({ x0: 456, y0: 397, x1: 1244, y1: 511 }), JSON.stringify(g.rect))
+  ok('宿主表面四周不外扩（避免卷进周围会变的对话内容）',
+    g.rect.x0 === a.surface.l && g.rect.x1 === a.surface.r && g.rect.y0 === a.surface.t && g.rect.y1 === a.surface.b)
+  ok('surface 状态没有"插件自己的元素"可断言 ⇒ pluginRectRel 返回 null（跳过布局契约而非失败）',
+    pluginRectRel('surface', a) === null)
+  // 锚点缺失 ⇒ 拒绝（不回落到别的地方比）
+  ok('surface 锚点缺失 ⇒ null', deriveGeom('surface', { w: 1426, h: 807 }) === null)
+  // rel 往返：宿主移动后框跟着走
+  const g2 = deriveGeom('surface', { w: 1426, h: 807, surface: { l: 466, t: 397, r: 1254, b: 511 } }, g.rel)
+  ok('宿主表面右移 10px ⇒ 框跟着走（可迁移）', g2.rect.x0 === 466 && g2.rect.x1 === 1254, JSON.stringify(g2.rect))
+  // 坏例：宿主表面换了个位置**但**没跟着宿主锚点走 ⇒ 必须判差异（证明"跟着锚点"不是碰巧）
+  const gBase = deriveGeom('surface', a)
+  const gStale = { cssWidth: 1426, rect: { x0: 456, y0: 397, x1: 1244, y1: 511 }, masks: [] }
+  const imgA = makeShot2(1426, 807, { x0: 456, y0: 397, x1: 1244, y1: 511 }, [40, 40, 40])
+  const imgB = makeShot2(1426, 807, { x0: 456, y0: 397, x1: 1244, y1: 511 }, [90, 90, 90])
+  const rBad = compareStableImages(imgA, imgB, 'surface', gBase, gStale)
+  ok('★ 宿主表面底色变了（40→90）⇒ 判有差异', rBad.same === false, 'diff=' + rBad.diff)
+  const rSame = compareStableImages(imgA, imgA, 'surface', gBase, gStale)
+  ok('同一张图 ⇒ 判一致（对照，证明上面那条来自像素差异）', rSame.same === true, 'diff=' + rSame.diff)
 }
 
 console.log('\n几何回归：' + pass + ' 通过 / ' + fail + ' 失败')

@@ -98,6 +98,7 @@ return { freezeRotation, pinWallpaper, restoreRotation };
     __renderedOverride: renderedOverride,
     // restoreRotation 里引用的模块级标志（本次是否切换过底图）——沙箱必须提供，否则 ReferenceError
     wallpaperSwitched: !!wallpaperSwitched,
+    themeSwitched: false,   // 主题/透明度状态是否改过设置（本套件不涉及）
     log: () => {},
   }
   // readState：模拟页面里执行 fetch('/bga/settings.json')；GET 可按需失败若干次

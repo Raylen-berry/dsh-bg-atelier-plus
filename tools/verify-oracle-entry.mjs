@@ -265,7 +265,7 @@ function runScript(mode, dir, port) {
     const child = spawn(process.execPath, [SCRIPT, mode, dir], {
       // 跳过标记图状态：它要读底图清单、换图、再确认渲染，假服务器抄不全就会假失败。
       // 入口套件验的是**入口控制流与退出码**；标记图的真实交互由真机 + 几何离线套件覆盖。
-      env: { ...process.env, VB_CDP_PORT: String(port), VB_SKIP_STATES: '04-preview-framing' },
+      env: { ...process.env, VB_CDP_PORT: String(port), VB_SKIP_STATES: '04-preview-framing,05-theme-light-veil,06-theme-dark-veil,07-surface-veil,08-surface-solid' },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let out = ''

@@ -295,6 +295,29 @@ export function deriveGeom(hostKind, a, rel) {
       rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, masks: relMasks },
     }
   }
+  // 'surface'：宿主"主体表面"节点（由调用方传入 a.surface，例如 [data-composer-card]）。
+  // 用途见下面的主题/透明度状态：插件会按深浅主题改这个宿主节点的底色
+  //（client.js 的 `body[data-ds-dark-theme] [data-composer-card]{background:…}`），
+  // 所以它属于"被插件改样式的宿主节点"——按规则必须算覆盖对象，不能按类名排除。
+  if (hostKind === 'surface') {
+    if (!a.surface) return null
+    const host = a.surface
+    if (rel) {
+      const rect = { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom }
+      return {
+        cssWidth, hostKind: 'surface', host, rel, rect,
+        masks: (rel.masks || []).map(([x0, y0, x1, y1]) =>
+          [rect.x0 + x0, rect.y0 + y0, rect.x0 + x1, rect.y0 + y1]),
+      }
+    }
+    // 录制：整块宿主表面都收，四周不外扩（紧贴它，避免卷进周围会变的对话内容）
+    const rect = { x0: host.l, y0: host.t, x1: host.r, y1: host.b }
+    const relMasks = []
+    return {
+      cssWidth, hostKind: 'surface', host, rect, masks: [],
+      rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, masks: relMasks },
+    }
+  }
   // 01/02：宿主锚点 = 左侧栏列
   if (!a.sidebar) return null
   const host = a.sidebar
@@ -336,6 +359,9 @@ export function deriveGeom(hostKind, a, rel) {
  * pluginKind='studio' 用对话框作宿主；'sidebar' 用侧栏列。
  */
 export function pluginRectRel(pluginKind, a) {
+  // 'surface'（主题/透明度状态锚在宿主主体表面上）没有"插件自己的元素"可断言 ⇒ 返回 null，
+  // 调用方据此跳过布局契约（不是失败）。
+  if (pluginKind === 'surface') return null
   const host = pluginKind === 'studio' ? a.dlg : a.sidebar
   if (!host) return null
   if (pluginKind === 'studio') {

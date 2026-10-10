@@ -137,6 +137,43 @@ export const STATES = [
   },
 ]
 
+/**
+ * **05–08：主题与透明度**（验收约定第 3 项）。
+ *
+ * 两个维度、四个组合：
+ *   · 深浅主题 = 宿主 `body[data-ds-dark-theme]`（插件每个 token 都有 `{light,dark}` 两套值）
+ *   · 透明度档位 = 插件 `styles.surface`（大面积表面不透明度，经 `themeSurfaceAlpha()`）
+ * 覆盖对象按"插件影响的输出"定，**不按类名**：
+ *   · 宿主**侧栏**列（插件写 `--dsw-specific-sidebar-fill`）→ 05/06 用 sidebar 锚点
+ *   · 宿主**主体表面** `[data-composer-card]`（插件写
+ *     `body[data-ds-dark-theme] [data-composer-card]{background:…}`）→ 07/08 用 surface 锚点
+ *   · 宿主**对话框面板**（`settingsSurfaceCss` 写 `[role="dialog"][class*="panel"]`）→ 03/04 已覆盖
+ *   · 插件自己的 UI → 03/04 已覆盖
+ *
+ * 排序：05 vs 06 只差主题（证明"深/浅两套 token 都真的生效"）；
+ *       07 vs 08 只差透明度档（证明"两个档位确实不同、且都稳定"）。
+ */
+const THEME_STATES = [
+  { name: '05-theme-light-veil', note: '浅色主题 + 低透明度档（侧栏）', dark: false, surface: 0.15, hostKind: 'sidebar' },
+  { name: '06-theme-dark-veil', note: '深色主题 + 低透明度档（侧栏）', dark: true, surface: 0.15, hostKind: 'sidebar' },
+  { name: '07-surface-veil', note: '主体表面：低透明度档（宿主 [data-composer-card]）', dark: true, surface: 0.15, hostKind: 'surface' },
+  { name: '08-surface-solid', note: '主体表面：高透明度档（宿主 [data-composer-card]）', dark: true, surface: 0.75, hostKind: 'surface' },
+].map((c) => ({
+  name: c.name,
+  note: c.note,
+  hostKind: c.hostKind,
+  settleMs: 2000,
+  themeControls: { dark: c.dark, surface: c.surface },
+  probe: `(()=>{const h=getComputedStyle(document.documentElement);
+    const b=document.body.hasAttribute('data-ds-dark-theme');
+    return JSON.stringify({dark:b,
+      bgBase:h.getPropertyValue('--dsw-alias-bg-base').trim(),
+      sidebarFill:h.getPropertyValue('--dsw-specific-sidebar-fill').trim(),
+      layer1:h.getPropertyValue('--dsw-alias-bg-layer-1').trim(),
+      accent:h.getPropertyValue('--bga-accent').trim()})})()`,
+}))
+STATES.push(...THEME_STATES)
+
 // ---------------------------------------------------------------- CDP 客户端
 /** DSH GUI 的地址（要对着它做视觉回归，不是随便哪个标签页）。 */
 const GUI_HOST = process.env.VB_GUI_HOST || '127.0.0.1:19387'
@@ -208,6 +245,9 @@ let exitCode = 0
 // 本次运行是否**切换过底图**（标记图状态会切）。切过 ⇒ 还原时必须把 wallpaper/zoom/focus
 // 一起写回原值，否则等于把用户的底图永久换掉（验收约定第 1 项要检出的错误）。
 let wallpaperSwitched = false
+// 主题/透明度状态是否改过设置或宿主主题属性；以及**改之前**的宿主深浅主题（用于还原）。
+let themeSwitched = false
+let themeOriginalDark = null
 // selftest 不需要基准目录（它拿"当前截图 vs 涂改后的当前截图"自比）⇒ 别让 path.join 炸掉
 const baseDir = dir ? path.join(OUT_ROOT, dir) : null
 if (mode === 'compare' && !fs.existsSync(path.join(baseDir, 'manifest.json'))) {
@@ -510,6 +550,12 @@ async function restoreRotation(before, log) {
     }
     if (log) console.log('     还原: 本次切换过底图 ⇒ 把 wallpaper/zoom/focus 一并写回原值')
   }
+  // 主题/透明度状态改过 `styles`（大面积表面不透明度）⇒ 一并写回原值
+  if (themeSwitched) {
+    if (want && 'styles' in want) merged.styles = want.styles
+    else delete merged.styles
+    if (log) console.log('     还原: 本次改过主题/透明度 ⇒ 把 styles 写回原值')
+  }
   for (const k of Object.keys(want)) if (!(k in merged)) merged[k] = want[k] // 兜底：任何丢掉的字段补回来
 
   // ⚠️ **只写磁盘是不够的** —— 这是本脚本一个真实的缺陷（审核方复现指出）：
@@ -713,6 +759,21 @@ async function cleanupEnvironment(log) {
     return false
   }
   if (log) console.log('     环境清理: ' + (r || '读不到结果'))
+  // 宿主深浅主题属性也在这里还（**必须晚于** restoreRotation 里可能发生的刷新 ——
+  // 刷新会被宿主按自己的偏好重设属性，早还等于没还）。它是宿主状态，不是插件设置。
+  if (themeSwitched && themeOriginalDark !== null) {
+    const wantDark = themeOriginalDark
+    const got = await readState(`(()=>{const b=document.body;
+      if (${wantDark ? 'true' : 'false'}) b.setAttribute('data-ds-dark-theme',''); else b.removeAttribute('data-ds-dark-theme');
+      return b.hasAttribute('data-ds-dark-theme') ? 'dark' : 'light'})()`).catch(() => null)
+    const okTheme = got === (wantDark ? 'dark' : 'light')
+    if (log) console.log('     宿主主题还原: ' + (wantDark ? 'dark' : 'light') + (okTheme ? ' ✅' : ' ❌ 实测 ' + got))
+    if (!okTheme) {
+      console.error('     ✗ 宿主主题未能确认还原（期望 ' + (wantDark ? 'dark' : 'light') + '，实测 ' + got
+        + '）—— 用户的界面主题可能被留在验收用的那一档')
+      return false
+    }
+  }
   return true
 }
 
@@ -768,6 +829,12 @@ async function measureLiveGeom(stateName, log, rel, hostKind) {
       studio: R(document.querySelector('.bga-studio')),
       hero: R(document.querySelector('.bga-hero')),
       sidebar: R(document.querySelector('[class*="sidebar" i]')),
+      // 宿主"主体表面"：插件按深浅主题改它的底色（client.js 里的
+      // body[data-ds-dark-theme] [data-composer-card]{background:…} 那条规则）⇒ 属覆盖对象。
+      // 用属性选择器（不是插件类名）——"类名没有 bga 就不是插件的"那种判断已被推翻两次。
+      // ⚠️ 注释里别写反引号：这里是**模板字符串内部**，反引号会把模板提前闭合（踩过两次）。
+      surface: R(document.querySelector('[data-composer-card]')),
+      darkTheme: document.body.hasAttribute('data-ds-dark-theme'),
       volatile: vol.slice(0, 60),
       // 插件**自己**在左侧栏里画出来的可见元素（orb / dock 特效等）。
       // 有它才叫比到插件；此前 01/02 的矩形是整列宿主装饰，插件的 orb（实测 y724–751）
@@ -825,7 +892,7 @@ async function measureLiveGeom(stateName, log, rel, hostKind) {
   }
   g.volatileCount = (a.volatile || []).length
   // 插件自己相对宿主的量 —— 布局契约的断言对象（比对时与基准记的那份比）
-  g.pluginRel = pluginRectRel(hostKind === 'dialog' ? 'studio' : 'sidebar', a)
+  g.pluginRel = pluginRectRel(hostKind === 'dialog' ? 'studio' : hostKind === 'surface' ? 'surface' : 'sidebar', a)
   if (stateName !== '03-settings-studio' && g.volatileCount === 0) {
     console.log('     ⚠️ 这页没探测到随时间变的时间/日期标签 ⇒ 右边界取"侧栏右−8"；'
       + '若之后这类标签被圈进比较区会报假回归（实测踩过："6分钟"→"7分钟" 差 397 像素）')
@@ -875,6 +942,73 @@ async function assertGeometry(s, log) {
  * ident 形如 { cat, file }；完整的条目（url/size/no/…）从宿主 /bga/wallpapers.json 里取，
  * 不自己拼 —— 拼错 url 就会变成"设置值对、画面错"。
  */
+/**
+ * 应用"主题 / 透明度"控制（第 3 项验收用）。
+ *
+ * 两个维度：
+ *  · **透明度档位** = 插件设置 `styles.surface`（`themeSurfaceAlpha()` 大面积表面不透明度，
+ *    默认 0.30）。它会改变 `--dsw-alias-bg-base` / `--dsw-specific-sidebar-fill` /
+ *    `layer-1..4` 这些**宿主 token** 的 alpha ⇒ 是"插件改宿主样式"的典型路径。
+ *  · **深浅主题** = 宿主自己的 `body[data-ds-dark-theme]` 属性（插件 `buildTokens` 里每个
+ *    token 都有 `{light, dark}` 两套值，另有若干 `body[data-ds-dark-theme] …` 规则）。
+ *
+ * ⚠️ 顺序有讲究：`styles.surface` 是**设置**，客户端只在启动时 load 一次 ⇒ 必须写盘 + 刷新；
+ *    而 `data-ds-dark-theme` 是**宿主状态**，刷新会被宿主按它自己的偏好重新设回去
+ *    ⇒ 必须在**刷新之后**再设，且设置在打开面板之前（插件算 `settingsSolidColor()` 时
+ *    会读这个属性，顺序错了会拿到另一套配色）。
+ *
+ * 两处改动都记原值，由 restoreRotation 还原（验收约定第 1 项：结束后完整恢复用户状态）。
+ */
+async function applyThemeControls(ctrl, log) {
+  if (ctrl.surface != null) {
+    const nowRaw = await readState(`(async()=>{const r=await fetch('/bga/settings.json',{cache:'no-store'});return await r.text()})()`)
+    let now = null
+    try { now = JSON.parse(nowRaw) } catch { now = null }
+    if (!isValidSettings(now)) {
+      console.error('  ✗ 当前设置读失败/不合法 —— 拒绝改透明度（写下去会覆盖成残缺文件）')
+      return false
+    }
+    const cur = now.styles && typeof now.styles === 'object' ? now.styles.surface : undefined
+    if (cur !== ctrl.surface) {
+      const patched = { ...now, styles: { ...(now.styles || {}), surface: ctrl.surface } }
+      const r = await readState(`(async()=>{
+        const res = await fetch('/bga/settings.json', {
+          method:'PUT', headers:{'content-type':'application/json'},
+          body: ${JSON.stringify(JSON.stringify(patched))},
+        });
+        return res.ok ? 'switched' : 'PUT failed ' + res.status;
+      })()`).catch((e) => 'PUT threw: ' + String(e && e.message || e))
+      if (r !== 'switched') { console.error('  ✗ 写 styles.surface 未确认：' + String(r)); return false }
+      themeSwitched = true
+      await sleep(300)
+      try { await cdp.send('Page.reload', { ignoreCache: false }) } catch (e) {
+        console.error('  ✗ 改透明度后刷新失败：' + String(e && e.message || e).slice(0, 80))
+        return false
+      }
+      await sleep(3500)
+    }
+  }
+  // 宿主主题属性：**刷新之后**设（刷新会被宿主按自己的偏好覆盖掉）
+  if (ctrl.dark != null) {
+    if (themeOriginalDark === null) {
+      const cur = await readState(`document.body.hasAttribute('data-ds-dark-theme') ? 'dark' : 'light'`).catch(() => null)
+      themeOriginalDark = cur === 'dark'
+    }
+    const got = await readState(`(()=>{const b=document.body;
+      if (${ctrl.dark ? 'true' : 'false'}) b.setAttribute('data-ds-dark-theme',''); else b.removeAttribute('data-ds-dark-theme');
+      return b.hasAttribute('data-ds-dark-theme') ? 'dark' : 'light'})()`).catch(() => null)
+    const want = ctrl.dark ? 'dark' : 'light'
+    if (got !== want) {
+      console.error('  ✗ 设置宿主主题未生效（期望 ' + want + '，实测 ' + got + '）—— 本次不用这个状态')
+      return false
+    }
+    themeSwitched = true
+    await sleep(400)
+  }
+  if (log) console.log('     主题控制已应用: dark=' + ctrl.dark + ' surface=' + ctrl.surface)
+  return true
+}
+
 async function switchWallpaperTo(ident, log) {
   const listRaw = await readState(`(async()=>{const r=await fetch('/bga/wallpapers.json',{cache:'no-store'});return await r.text()})()`)
   let entry = null
@@ -969,6 +1103,14 @@ async function prepareState(s, log, rel, basePluginRel) {
     const okSwap = await switchWallpaperTo(s.wallpaperIdent, log)
     if (!okSwap) {
       console.error('  ✗ ' + s.name + '：底图切换未确认 ⇒ 这个状态本次不参与比较')
+      return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
+    }
+  }
+  // 主题/透明度状态：改 styles.surface（要写盘+刷新）与宿主深浅主题（刷新后设）
+  if (s.themeControls) {
+    const okTheme = await applyThemeControls(s.themeControls, log)
+    if (!okTheme) {
+      console.error('  ✗ ' + s.name + '：主题/透明度控制未确认 ⇒ 这个状态本次不参与比较')
       return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
     }
   }
