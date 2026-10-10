@@ -132,6 +132,10 @@ function makeServer(cfg) {
           if (cfg.cleanupFail) throw new Error('Simulated cleanup timeout')
           return val(JSON.stringify({ style: true, backdrop: true }))
         }
+        // ⚠️ 顺序：__bgaStateProbe 的分支必须在前面 —— 钉图的确认表达式**同时**含
+        //    __bgaStateProbe 与 getComputedStyle，而且它要求 probe==='ok' 且带 rendered。
+        //    反过来把 getComputedStyle 放前面，钉图就会拿到只有 rendered 的对象、
+        //    判"探针 undefined"而失败（实测踩过：S1 全挂）。
         if (/__bgaStateProbe/.test(e)) {
           // 返回值同时带**设置值**和**实际渲染的背景 URL**（pinWallpaper 两者都要确认）
           const wf = state.settings.wallpaper ? state.settings.wallpaper.file : null
@@ -142,6 +146,21 @@ function makeServer(cfg) {
             ? { probe: 'ok', autoOn: true, file: 'OTHER.png', rendered }
             : { probe: 'ok', autoOn: state.settings.autoOn === true, file: wf, rendered }
           return val(JSON.stringify(v))
+        }
+        // 换图后的"渲染确认"只读 getComputedStyle(body/documentElement,'::before')，
+        // 不含 __bgaStateProbe ⇒ 必须放在 probe 分支**之后**，否则会把钉图的确认抢走。
+        // ⚠️ 空格要容忍：钉图那份写的是 `getComputedStyle(document.body, '::before')`（带空格），
+        //    换图那份是 `getComputedStyle(document.body,'::before')`（不带）。写死带空格的
+        //    正则匹配不到换图的确认 ⇒ 换图判失败（实测踩过）。
+        // ⚠️⚠️ **顺序**：waitImagesReady 的表达式**也**含 `getComputedStyle(document.body,'::before')`，
+        //    所以必须把 `pending:pending.length` 排在前面，否则就绪探测被抢走、
+        //    所有状态恒判"图片未就绪"（实测踩过：跳过标记图之后 01 直接 exit=4）。
+        if (/pending:pending\.length/.test(e)) {
+          return val(JSON.stringify({ pending: 0, broken: 0, visible: 1, bg: 'ready', heroState: 'ready' }))
+        }
+        if (/getComputedStyle\(document\.body,\s*'::before'\)/.test(e)) {
+          const wf = state.settings.wallpaper && state.settings.wallpaper.file
+          return val(JSON.stringify({ rendered: 'url("http://x/bga/wallpapers/' + (wf ? encodeURIComponent(wf) : '') + '")' }))
         }
         if (/vb-backdrop/.test(e)) {
           state.sawPrepare++
@@ -154,12 +173,45 @@ function makeServer(cfg) {
           let body = null
           try { body = JSON.parse(JSON.parse('"' + m[1] + '"')) } catch { body = null }
           if (cfg.putFail) return val('PUT failed ' + cfg.putFail)
-          if (body) { state.writes.push(body); Object.assign(state.settings, body) }
+          if (body) {
+            // 记录"是否**换了另一张**底图"（不是首次钉图）：切换才需要还原 wallpaper
+            if (body.wallpaper && body.wallpaper.file
+              && state.settings.wallpaper && state.settings.wallpaper.file
+              && body.wallpaper.file !== state.settings.wallpaper.file) state.switched = true
+            state.writes.push(body); Object.assign(state.settings, body)
+          }
+          // 真页面上这两处 PUT 表达式各自 return 不同的字符串：钉图是 'pinned(...)'，
+          // 换图是 'switched'。桩必须按**表达式**区分，不能一律回 'pinned' ——
+          // 否则换图判"写入未确认"、标记图状态直接失败（实测踩过，S1 全挂）。
+          if (/'switched'/.test(e)) return val('switched')
+          state.pinned = true
           return val('pinned(w) + autoOn=false')
+        }
+        // ⚠️ 底图清单：新增的"标记图"状态会 fetch /bga/wallpapers.json 拿**完整条目**
+        //    （不自己拼 url）。桩不答这个就会落到下面通用的 .text() 分支、拿到设置 JSON、
+        //    解析不出条目 ⇒ 切换失败 ⇒ 全场景 exit=4（实测踩过）。
+        if (/wallpapers\.json/.test(e)) {
+          // ⚠️ 条目必须同时带 `name` 与 `file`：switchWallpaperTo 按 **file** 匹配，
+          //    渲染确认也按 file 比对。只给 name 会匹配不到 ⇒ 切换判失败（实测踩过）。
+          return val(JSON.stringify({
+            categories: [
+              { name: 'c', count: 1, items: [{ name: 'w.png', file: 'w.png', base: 'w', hd: false, tags: ['c'], no: 1, url: '/bga/wallpapers/c/w.png', size: 100 }] },
+              { name: '_验收标记图', count: 1, items: [{ name: 'marker-960x540.png', file: 'marker-960x540.png', base: 'marker-960x540', hd: false, tags: ['_验收标记图'], no: 1, url: '/bga/wallpapers/m/marker-960x540.png', size: 100 }] },
+            ],
+          }))
         }
         if (/\.text\(\)/.test(e)) {   // 任何 GET（freeze / pin 内部 / 还原回读）
           state.gets++
           const idx = state.gets - 1
+          // ⚠️ 用"第 N 次 GET"写死下标很脆：状态数从 3 变 4（加了标记图状态）之后，
+          //    还原那一次 GET 的下标就变了，S9 假失败。改成**按语义**定位：
+          //    "切换底图之后的第一次 GET"就是还原的第一次回读。
+          // 语义化触发：**钉图之后的第一批 GET** 就是还原的回读。
+          // 不用"第 N 次 GET"写死下标 —— 状态数一变（新增或跳过状态）下标就错（实测踩过两次）。
+          if (cfg.throwOnFirstGetAfterPin && state.pinned && !state.threwAfterPin) {
+            state.threwAfterPin = true
+            throw new Error('Simulated GET failure (restore read)')
+          }
           if (cfg.emptyAt && cfg.emptyAt.includes(idx)) return val('{}')
           if (cfg.throwAt && cfg.throwAt.includes(idx)) throw new Error('Simulated GET failure')
           return val(JSON.stringify(state.settings))
@@ -211,7 +263,9 @@ function makeServer(cfg) {
 function runScript(mode, dir, port) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [SCRIPT, mode, dir], {
-      env: { ...process.env, VB_CDP_PORT: String(port) },
+      // 跳过标记图状态：它要读底图清单、换图、再确认渲染，假服务器抄不全就会假失败。
+      // 入口套件验的是**入口控制流与退出码**；标记图的真实交互由真机 + 几何离线套件覆盖。
+      env: { ...process.env, VB_CDP_PORT: String(port), VB_SKIP_STATES: '04-preview-framing' },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let out = ''
@@ -290,7 +344,7 @@ await scenario('S7', {}, async (port, state) => {
 })
 // compare 分支的 GET 次序：0=freeze、1=pin 内部、2=还原 nowRaw、3=还原 verifyRaw
 // 让第 2 次抛错 ⇒ 还原过程抛异常 ⇒ 验证"清理仍然执行"且退出码非 0
-await scenario('S7b', { throwAt: [2] }, async (port, state) => {
+await scenario('S7b', { throwOnFirstGetAfterPin: true }, async (port, state) => {
   const before = state.sawCleanup
   const r = await runScript('compare', dir7, port)
   ok('S7 还原阶段读取抛错 ⇒ 退出码 5（不是被冲成 1）', r.code === 5, 'exit=' + r.code)
@@ -319,7 +373,7 @@ await scenario('S10', { noBackdrop: true }, async (port) => {
 // S7 验的是 compare；这里给 capture 补一条对称场景（两个分支的 finally 是分别写的，
 // 只测一个会漏掉另一个的回归 —— 实测过锚点命中错分支导致变异未被抓到的事）
 const dir9 = freshDir(); made.push(dir9)
-await scenario('S9', { throwAt: [2] }, async (port, state) => {
+await scenario('S9', { throwOnFirstGetAfterPin: true }, async (port, state) => {
   const r = await runScript('capture', dir9, port)
   ok('S9 capture 还原阶段抛错 ⇒ 退出码 5（不被冲成 1）', r.code === 5, 'exit=' + r.code)
   ok('S9 ★ capture 侧清理也仍然执行', state.sawCleanup > 0, 'sawCleanup=' + state.sawCleanup)

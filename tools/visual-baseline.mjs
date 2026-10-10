@@ -53,9 +53,18 @@ if (dir) fs.mkdirSync(path.join(OUT_ROOT, dir), { recursive: true })
 //   · 设置面板：底图插件自绘的 UI（不依赖宿主组件）
 //   · dock 特效：bga-dockfx 系列节点
 // 每个状态记录"要不要动状态"以及"截图前等多久"（等图片解码）。
+/**
+ * **中等尺寸标记图**的身份（验收约定第 5 项用）。
+ * 由 tools/make-marker-wallpaper.mjs 生成并装到用户底图目录的 `_验收标记图/` 分类下；
+ * 它是 960×540 的确定性图案 ⇒ 预览渲染的**缩放倍率 ~1.7×**（不像 43MP 原图那样 17×），
+ * 因此预览框**不需要屏蔽**，"预览与取景"才第一次真正参与比较。
+ */
+export const MARKER_WALLPAPER = { cat: '_验收标记图', file: 'marker-960x540.png' }
+
 export const STATES = [
   {
     name: '01-static-wallpaper',
+    hostKind: 'sidebar',
     note: '静态底图：body::before 的 url(...) 与主题 token 已下发',
     settleMs: 4500,
     probe: `(()=>{const b=getComputedStyle(document.body,'::before');const h=getComputedStyle(document.documentElement);
@@ -65,6 +74,7 @@ export const STATES = [
   },
   {
     name: '02-fx-nodes',
+    hostKind: 'sidebar',
     note: '特效节点是否在位（bga-orb / bga-dockfx / bga-ptl）',
     settleMs: 1500,
     probe: `(()=>{const n=[...document.querySelectorAll('[class*="bga"]')].map(e=>e.className);
@@ -72,6 +82,7 @@ export const STATES = [
   },
   {
     name: '03-settings-studio',
+    hostKind: 'dialog',
     note: '底图工坊设置页（自绘 UI；重构最容易被带偏的地方）',
     settleMs: 6000,  // 设置页里的底图预览要解码一张几 MB 的图 + 套 framing；2500 实测不够，会拍到半成品
     // 这个状态**期望**面板头部有底图预览（.bga-hero-image）。审核方指出：不区分"首页"与
@@ -88,6 +99,41 @@ export const STATES = [
       studioSize:s?[s.offsetWidth,s.offsetHeight]:null,
       heading:s&&s.querySelector('h2')?s.querySelector('h2').textContent.trim():null,
       saveState:s&&s.querySelector('.bga-save-state')?s.querySelector('.bga-save-state').textContent.trim():null})})()`,
+  },
+{
+    name: '04-preview-framing',
+    hostKind: 'dialog',
+    note: '中等尺寸标记图：预览/缩放/焦点（**预览框不被屏蔽**）',
+    settleMs: 4000,
+    // 本状态先把底图切到标记图（会 reload），再打开设置页 —— 于是 hero 预览里是这张标记图。
+    // zoom/focus 用非默认值：默认值下有 bug 也可能看不出来（"焦点设置无效"要能被检出）。
+    wallpaperIdent: { cat: MARKER_WALLPAPER.cat, file: MARKER_WALLPAPER.file, zoom: 1.25, focus: '35% 65%' },
+    expectHero: true,
+    open: `(()=>{const b=[...document.querySelectorAll('button,[role="button"]')].find(x=>String(x.textContent||'').trim()==='设置');if(b)b.click();return 'clicked-settings'})()`,
+    openSettleMs: 1200,
+    open2: `(()=>{const d=document.querySelector('[role="dialog"]');if(!d)return 'no-dialog';
+      const el=[...d.querySelectorAll('*')].find(e=>e.children.length===0&&String(e.textContent||'').trim()==='底图工坊');
+      if(!el)return 'no-nav-item';(el.closest('button,[role="button"],li,a')||el).click();return 'clicked-studio'})()`,
+    // 探针记录**取景相关的实际值**：底图身份（完整路径）、缩放、焦点，以及预览图元素上
+    // 真正生效的 object-position / transform —— "焦点设置无效"会在这里显形。
+    probe: `(()=>{const s=document.querySelector('.bga-studio');
+      const hi=document.querySelector('.bga-hero-image');
+      const hs=hi?getComputedStyle(hi):null;
+      const b=getComputedStyle(document.body,'::before');
+      const bi=String(b.backgroundImage||'');
+      const m=bi.match(/\\/bga\\/wallpapers\\/([^"')]+)/);
+      let dec=null; try{ dec=m?decodeURIComponent(m[1]):null }catch{ dec=m?m[1]:null }
+      return JSON.stringify({
+        wallpaperPath: dec,
+        hasStudio: !!s,
+        heroPresent: !!hi,
+        heroObjectFit: hs?hs.objectFit:null,
+        heroObjectPosition: hs?hs.objectPosition:null,
+        heroTransform: hs?hs.transform:null,
+        heroNaturalW: hi?hi.naturalWidth:null,
+        heroRenderW: hi?Math.round(hi.getBoundingClientRect().width):null,
+        studioSize: s?[s.offsetWidth,s.offsetHeight]:null,
+      })})()`,
   },
 ]
 
@@ -159,6 +205,9 @@ if (mode === 'list') {
 }
 
 let exitCode = 0
+// 本次运行是否**切换过底图**（标记图状态会切）。切过 ⇒ 还原时必须把 wallpaper/zoom/focus
+// 一起写回原值，否则等于把用户的底图永久换掉（验收约定第 1 项要检出的错误）。
+let wallpaperSwitched = false
 // selftest 不需要基准目录（它拿"当前截图 vs 涂改后的当前截图"自比）⇒ 别让 path.join 炸掉
 const baseDir = dir ? path.join(OUT_ROOT, dir) : null
 if (mode === 'compare' && !fs.existsSync(path.join(baseDir, 'manifest.json'))) {
@@ -450,6 +499,17 @@ async function restoreRotation(before, log) {
   try { now = JSON.parse(nowRaw) } catch { now = null }
   const merged = { ...(now && typeof now === 'object' ? now : want), autoOn: true }
   if (Number.isFinite(want.autoMin)) merged.autoMin = want.autoMin
+  // ⚠️ 若本次**切换过底图**（标记图状态），必须把 wallpaper/zoom/focus 也写回原值 ——
+  //    否则等于把用户的底图永久换掉（验收约定第 1 项明列的"必须检出的错误"）。
+  //    注意：这里**只在我们确实改过时**才回填；没改过时保持原来的语义
+  //    （"用户看到哪张就留哪张"，因为轮播可能中途换过图）。
+  if (wallpaperSwitched) {
+    for (const k of ['wallpaper', 'zoom', 'focus', 'imageFraming']) {
+      if (want && k in want) merged[k] = want[k]
+      else delete merged[k]
+    }
+    if (log) console.log('     还原: 本次切换过底图 ⇒ 把 wallpaper/zoom/focus 一并写回原值')
+  }
   for (const k of Object.keys(want)) if (!(k in merged)) merged[k] = want[k] // 兜底：任何丢掉的字段补回来
 
   // ⚠️ **只写磁盘是不够的** —— 这是本脚本一个真实的缺陷（审核方复现指出）：
@@ -680,7 +740,7 @@ function comparedBoxOf(geom, pngBase64, stateName) {
  *     下沿 = innerHeight − 156（再往下是宿主状态栏的实时计数），都相对实测视口推导
  *   锚点拿不到 ⇒ 返回 null，由调用方**大声失败**，绝不回落到写死常量去比错地方。
  */
-async function measureLiveGeom(stateName, log, rel) {
+async function measureLiveGeom(stateName, log, rel, hostKind) {
   const raw = await readState(`(()=>{
     const R=(e)=>{ if(!e) return null; const b=e.getBoundingClientRect();
       return {l:Math.round(b.left),t:Math.round(b.top),r:Math.round(b.right),b:Math.round(b.bottom)} };
@@ -738,7 +798,12 @@ async function measureLiveGeom(stateName, log, rel) {
           let l=b.left,t=b.top,r=b.right,bo=b.bottom;
           if(db){ l=Math.max(l,db.left); t=Math.max(t,db.top); r=Math.min(r,db.right); bo=Math.min(bo,db.bottom); }
           if(r-l<4||bo-t<4) return;                       // 被对话框裁得看不见就不算
-          out.push({l:Math.round(l),t:Math.round(t),r:Math.round(r),b:Math.round(bo)});
+          // **缩放倍率**：原图自然宽 / 渲染宽。倍率大 ⇒ 浏览器重采样跨刷新不稳定 ⇒ 需要屏蔽；
+          // 倍率接近 1（中等尺寸标记图）⇒ 稳定 ⇒ **不屏蔽**，让预览框真正参与比较（验收第 5 项）。
+          const nw = (e.naturalWidth || (e.querySelector && e.querySelector('img') ? e.querySelector('img').naturalWidth : 0) || 0);
+          const scale = (nw > 0 && b.width > 0) ? (nw / b.width) : 0;
+          out.push({l:Math.round(l),t:Math.round(t),r:Math.round(r),b:Math.round(bo),
+            scale: Math.round(scale*100)/100, naturalW: nw, renderW: Math.round(b.width)});
         });
         return out.slice(0, 60);
       })(),
@@ -750,7 +815,7 @@ async function measureLiveGeom(stateName, log, rel) {
   // ⚠️ `rel` = **基准录制时**记下的"框相对宿主的内缩量"。
   //    录制时传 undefined（由 deriveGeom 按当前局面定下并回传 rel）；
   //    比对时传基准的 rel ⇒ 框钉在**宿主**上，插件自己挪位不会把差异对齐掉。
-  const g = deriveGeom(stateName, a, rel || undefined)
+  const g = deriveGeom(hostKind || 'sidebar', a, rel || undefined)
   if (!g) {
     console.error('  ✗ ' + stateName + '：实测几何推不出来（锚点缺失：'
       + 'dlg=' + JSON.stringify(a && a.dlg) + ' sidebar=' + JSON.stringify(a && a.sidebar)
@@ -760,7 +825,7 @@ async function measureLiveGeom(stateName, log, rel) {
   }
   g.volatileCount = (a.volatile || []).length
   // 插件自己相对宿主的量 —— 布局契约的断言对象（比对时与基准记的那份比）
-  g.pluginRel = pluginRectRel(stateName === '03-settings-studio' ? 'studio' : 'sidebar', a)
+  g.pluginRel = pluginRectRel(hostKind === 'dialog' ? 'studio' : 'sidebar', a)
   if (stateName !== '03-settings-studio' && g.volatileCount === 0) {
     console.log('     ⚠️ 这页没探测到随时间变的时间/日期标签 ⇒ 右边界取"侧栏右−8"；'
       + '若之后这类标签被圈进比较区会报假回归（实测踩过："6分钟"→"7分钟" 差 397 像素）')
@@ -800,6 +865,95 @@ async function assertGeometry(s, log) {
   return true
 }
 
+/**
+ * 把底图切到指定那一张（用于"中等尺寸标记图"这类**需要固定一张已知图**的状态）。
+ *
+ * 与 `pinWallpaper` 的区别：pinWallpaper 只关轮播、把当前这张钉住；本函数**换图**。
+ * 所以它必须伴随"还原时把 wallpaper 也还回去"（见 restoreRotation 里的 wallpaperSwitched），
+ * 否则验收工具会把用户的底图永久换掉 —— 那正是验收约定第 1 项要检出的错误。
+ *
+ * ident 形如 { cat, file }；完整的条目（url/size/no/…）从宿主 /bga/wallpapers.json 里取，
+ * 不自己拼 —— 拼错 url 就会变成"设置值对、画面错"。
+ */
+async function switchWallpaperTo(ident, log) {
+  const listRaw = await readState(`(async()=>{const r=await fetch('/bga/wallpapers.json',{cache:'no-store'});return await r.text()})()`)
+  let entry = null
+  try {
+    const j = JSON.parse(listRaw)
+    for (const c of (j.categories || [])) {
+      for (const it of (c.items || [])) {
+        if (c.name === ident.cat && it.name === ident.file) { entry = { ...it, cat: c.name } ; break }
+      }
+      if (entry) break
+    }
+  } catch { entry = null }
+  if (!entry) {
+    console.error('  ✗ 列表里找不到底图 ' + ident.cat + '/' + ident.file + ' —— 无法切换（不猜 url）')
+    return false
+  }
+  const nowRaw = await readState(`(async()=>{const r=await fetch('/bga/settings.json',{cache:'no-store'});return await r.text()})()`)
+  let now = null
+  try { now = JSON.parse(nowRaw) } catch { now = null }
+  if (!isValidSettings(now)) {
+    console.error('  ✗ 当前设置读失败/不合法 —— 拒绝切换底图（写下去会覆盖成残缺文件）')
+    return false
+  }
+  if (now.wallpaper && now.wallpaper.file === ident.file && now.wallpaper.cat === ident.cat) {
+    if (log) console.log('     底图已经是 ' + ident.cat + '/' + ident.file + '，无需切换')
+    return true
+  }
+  const patched = { ...now, wallpaper: entry }
+  // ⚠️ **必须把轮播也钉住**（与 pinWallpaper 一致），不能"读到什么写回什么"：
+  //   插件会把轮播开关**画进 UI**（按钮文案「暂停轮播/开始轮播」、状态文字「每 5 分钟切换/轮播已暂停」、
+  //   侧栏的小指示点）。实测：捕获时 04 那次读到的是 autoOn=true（客户端在 reload 后把内存值写回过），
+  //   于是基准录的是"轮播中"，比对时 pinWallpaper 先把它关掉 ⇒ 四个状态里三个报差异
+  //   （01/02 是侧栏指示点 176px/Δ122，04 是整片文案与状态 82699px/Δ226）。
+  //   固定成 false 之后两侧才是同一种画面。
+  patched.autoOn = false
+  if (ident.zoom != null) patched.zoom = ident.zoom
+  if (ident.focus != null) patched.focus = ident.focus
+  const r = await readState(`(async()=>{
+    const res = await fetch('/bga/settings.json', {
+      method:'PUT', headers:{'content-type':'application/json'},
+      body: ${JSON.stringify(JSON.stringify(patched))},
+    });
+    return res.ok ? 'switched' : 'PUT failed ' + res.status;
+  })()`).catch((e) => 'PUT threw: ' + String(e && e.message || e))
+  if (r !== 'switched') { console.error('  ✗ 切换底图写入未确认：' + String(r)); return false }
+  wallpaperSwitched = true          // ← 还原时要连 wallpaper 一起还回去
+  await sleep(300)
+  try { await cdp.send('Page.reload', { ignoreCache: false }) } catch (e) {
+    console.error('  ✗ 切换底图后刷新失败：' + String(e && e.message || e).slice(0, 80))
+    return false
+  }
+  await sleep(3500)
+  // 渲染确认：与 pinWallpaper 同一条判据（解析背景 URL 的 basename 精确比对）
+  const cfRaw = await readState(`(()=>{
+    const bi = String(getComputedStyle(document.body,'::before').backgroundImage||'')
+      + '|' + String(getComputedStyle(document.documentElement,'::before').backgroundImage||'');
+    return JSON.stringify({rendered: bi.slice(0,500)})})()`).catch(() => null)
+  let cf = null
+  try { cf = JSON.parse(cfRaw) } catch { cf = null }
+  const src = String(cf && cf.rendered || '')
+  let hit = false, from = 0
+  for (;;) {
+    const i = src.indexOf('/bga/wallpapers/', from)
+    if (i < 0) break
+    from = i + 1
+    let j = src.length
+    for (const sep of ['"', ')', ',', ' ', "'"]) { const k = src.indexOf(sep, i + 16); if (k >= 0 && k < j) j = k }
+    let dec = src.slice(i + 16, j)
+    try { dec = decodeURIComponent(dec) } catch { /* 保持原样 */ }
+    if (dec === ident.file || dec.replace(/^.*\//, '') === ident.file) { hit = true; break }
+  }
+  if (!hit) {
+    console.error('  ✗ 切换底图后画面背景不是 ' + ident.file + ' —— 不假定成功，本次不用这个状态')
+    return false
+  }
+  if (log) console.log('     底图已切到 ' + ident.cat + '/' + ident.file + '（画面已确认）✓')
+  return true
+}
+
 async function prepareState(s, log, rel, basePluginRel) {
   // 为什么必须做：上一次状态可能开着面板，不复位的话后面的状态会**继承**它 ——
   // 实测踩到过：三个状态全都带着同一个面板，基准之间只差 0.05%，等于没区分开。
@@ -808,6 +962,16 @@ async function prepareState(s, log, rel, basePluginRel) {
   // 关掉后归零（见 CHANGELOG / 本文件下方 REPRODUCIBILITY 段）。
   // 这是**环境准备**不是作弊：观察窗是另一个插件的调试 UI，不属于底图插件的视觉契约。
   await closeObserver(log)
+
+  // 需要固定底图的状态（中等尺寸标记图）先换图 —— 会触发 Page.reload，所以必须在
+  // reset/open 之前做。失败 ⇒ 返回 null 交给调用方，**不拿一张没确认的图去比**。
+  if (s.wallpaperIdent) {
+    const okSwap = await switchWallpaperTo(s.wallpaperIdent, log)
+    if (!okSwap) {
+      console.error('  ✗ ' + s.name + '：底图切换未确认 ⇒ 这个状态本次不参与比较')
+      return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
+    }
+  }
 
   if (s.reset !== false) {
     await resetToCleanHome(log)
@@ -844,7 +1008,7 @@ async function prepareState(s, log, rel, basePluginRel) {
   }
   // 几何：**运行时从实测锚点推导**（见 measureLiveGeom 注释，可迁移、不写死）。
   // 比对时把基准录下的 rel 传进去 ⇒ 框钉在**宿主**上（插件自己挪位不会被对齐掉）。
-  const geom = await measureLiveGeom(s.name, log, rel || undefined)
+  const geom = await measureLiveGeom(s.name, log, rel || undefined, s.hostKind)
   // 环境核对：确认插件元素还在（宽度契约）。失败 ⇒ 后续裁剪无意义。
   const geomOk = await assertGeometry(s, log)
   if (!geom) {
@@ -1040,7 +1204,13 @@ if (mode === 'capture') {
     rotationFrozenFrom: autoBefore,
     states: [],
   }
-  for (const s of STATES) {
+  // ⚠️ VB_SKIP_STATES：跳过指定状态（逗号分隔）。用途是**让入口级离线套件不依赖页面模型** ——
+  //   那个套件验的是"入口控制流与退出码"，它用一个手写的假 CDP 服务器模拟页面；
+  //    一旦状态增多（比如标记图状态要读 /bga/wallpapers.json、换图、再确认渲染），
+  //    假服务器就得把页面的又一套模型抄一遍，抄不全就假失败。真实交互由真机与几何离线套件覆盖。
+  const skipSet = new Set(String(process.env.VB_SKIP_STATES || '').split(',').map((x) => x.trim()).filter(Boolean))
+  const captureStates = STATES.filter((s) => !skipSet.has(s.name))
+  for (const s of captureStates) {
     // 图片没就绪就不录 —— 录下去等于把未完成的画面当基准（审核方指出的缺陷）
     const prep = await prepareState(s, true)
     if (prep && prep.imagesReady === false) {

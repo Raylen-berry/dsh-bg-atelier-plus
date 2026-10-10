@@ -35,6 +35,21 @@ export const STABLE_KEEP_RATIO = Number(process.env.VB_STABLE_RATIO || 0.80)
 export const PIXEL_TOLERANCE = Number(process.env.VB_TOLERANCE || 0)
 
 /**
+ * 位图表面**缩放倍率**超过这个值才屏蔽（原图自然宽 / 渲染宽）。
+ *
+ * 依据（**实测的稳定/不稳定分界**，不是拍的）：
+ *   稳定   —— 1.38×（中等尺寸标记图 960→698，预览框实测 `diff=0`）
+ *   不稳定 —— 3.43×（图库缩略图 640→187，实测 `Δ≤4`）
+ *             5.15×（960→187）、17.5×（43MP→558，`Δ≤3`）
+ * 分界落在 (1.38, 3.43) 之间，取 **2.0**（离两边都有余量）。
+ * 可用 VB_MASK_SCALE 覆盖。
+ *
+ * ⚠️ 这是**按实测定的**：一开始我按"中等尺寸就稳定"把阈值放在 4，结果 3.43× 的缩略图
+ *    漏进比较区、每轮报 79~755 像素的假差异。分界必须用数据定，不能凭"中等"这个词。
+ */
+export const MASK_SCALE_THRESHOLD = Number(process.env.VB_MASK_SCALE || 2)
+
+/**
  * **容差取舍的实测数据**（给后来者一个明确的两难，而不是含糊的"安全"）：
  *
  * | 设置 | 整屏每通道 +1/+2/+5（绘制类错误的典型形态） | 03 状态的抗锯齿抖动 |
@@ -191,36 +206,92 @@ export function cssScale(img, cssWidth = REF_CSS_WIDTH) {
  * @param rel       **基准录制时**记下的内缩量（比对时传它；录制时传 undefined）
  *                  形状 {left,top,right,bottom,masks}，masks 是相对裁剪框左上角的 CSS 偏移
  */
-export function deriveGeom(stateName, a, rel) {
+export function deriveGeom(hostKind, a, rel) {
   if (!a || !(a.w > 0)) return null
   const cssWidth = a.w
-  if (stateName === '03-settings-studio') {
+  if (hostKind === 'dialog') {
     if (!a.dlg) return null
     const host = a.dlg
     if (rel) {
+      const rect = { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom }
       return {
-        cssWidth, hostKind: 'dialog', host, rel,
-        rect: { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom },
-        masks: rel.masks || [],
+        cssWidth, hostKind: 'dialog', host, rel, rect,
+        // ⚠️ `masks` 的约定是**绝对 CSS 坐标**（extract() 就是这么消费的：先乘 cssScale 再减裁剪框原点）。
+        //    而 `rel.masks` 存的是**相对裁剪框**的偏移（为了跟着宿主走）。这里必须换算回来 ——
+        //    直接把 rel.masks 塞进 masks 会让屏蔽框算成负区间、**整块屏蔽静默失效**
+        //    （实测：缩略图的位图重采样噪声就这么漏出来，每轮报 7157px/Δ226）。
+        masks: (rel.masks || []).map(([x0, y0, x1, y1]) =>
+          [rect.x0 + x0, rect.y0 + y0, rect.x0 + x1, rect.y0 + y1]),
       }
     }
-    // 录制：在对话框内缩 6/4/6/7 —— bottom 那 7px 是宿主裁剪边的取整碎行
-    //（实测 127 个 Δ≤2 差异全落在 min(面板底,对话框底) 那两行，属宿主几何边界、非插件内容）
-    const rect = { x0: host.l + 6, y0: host.t + 4, x1: host.r - 6, y1: host.b - 7 }
-    // 屏蔽框 = **壁纸位图表面**（大图预览 hero + 图库缩略图）。
-    // 为什么必须屏蔽：它们把几 MP~43MP 的原图缩到几百 px，**跨刷新重采样不完全可复现** ——
-    // 实测 hero 刷新后 diff=11618/Δ3；图库缩略图带 diff=2185/Δ≤7。这属于浏览器缩放位图的
-    // 非确定性，不是插件逻辑（插件逻辑的变化是几十~几万像素、Δ 常常 >20）。
-    // ⚠️ 这是**明确的盲区**，必须记进文档：屏蔽区内的变化看不见（要覆盖只能另加稳定状态）。
+    // 录制：裁剪框 = **面板可见框 ∩ 对话框**（再向内留 2px、下沿留 7px）。
+    //
+    // ⚠️ 为什么不直接在对话框里内缩固定 6/4/6/7：实测对话框右侧 1085–1107 那条带
+    //    （面板右边之外、对话框里的宿主 chrome）**每轮都在变**（diff 755/Δ4，反复复现），
+    //    把它圈进比较区就变成假回归。这里改成"贴着面板量"，但**量出来的内缩量会冻结进基准**
+    //    （见下面的 rel）—— 比对时用**录制时的内缩量**重建框，所以"插件自己挪位"仍然会被检出，
+    //    不会因为"贴着面板量"而重新变成自动对齐。
+    const sx0 = a.studio ? Math.max(host.l, a.studio.l - 2) : host.l + 6
+    const sy0 = a.studio ? Math.max(host.t, a.studio.t - 2) : host.t + 4
+    const sx1 = a.studio ? Math.min(host.r, a.studio.r + 2) : host.r - 6
+    const sy1 = Math.min(host.b, a.studio ? a.studio.b : host.b) - 7
+    const rect = { x0: sx0, y0: sy0, x1: sx1, y1: sy1 }
+    // 屏蔽框 = **只有"缩放倍率大"的壁纸位图表面**（大图预览 / 大图缩略图）。
+    //
+    // 为什么按倍率而不是按选择器一刀切：
+    //   · 把几 MP~43MP 的原图缩到几百 px（倍率 ~17×）时，浏览器重采样**跨刷新不完全可复现** ——
+    //     实测 hero 刷新后 diff=11618/Δ3；图库缩略图带 diff=2185/Δ≤7。这属渲染非确定性，不是插件逻辑。
+    //   · 但**中等尺寸标记图**（验收第 5 项，960×540 缩到 ~558 CSS，倍率 ~1.7×）是稳定的 ⇒
+    //     这时**不该屏蔽**，预览框必须真正参与比较，否则"预览与取景"永远是盲区。
+    // 所以规则：倍率 > MASK_SCALE_THRESHOLD 才屏蔽，并把每个表面的倍率记进 geom 供审计对照。
     const absMasks = []
-    if (a.hero) absMasks.push([a.hero.l - 2, a.hero.t - 2, a.hero.r + 2, a.hero.b + 2])
+    const maskedSurfaces = []
+    const unmaskedSurfaces = []
+    let heroMasked = false
+    let heroSurface = null
+    if (a.hero) {
+      // hero 的倍率取"与 hero 框**重叠最多**"的那个位图表面。
+      // ⚠️ 不能用"包含关系"判断：设了 zoom 之后图片是 `object-fit:cover` + `transform: scale(1.25)`，
+      //    会**溢出**容器（实测 img 框 477–1113，比 hero 容器大）⇒ 包含判定匹配不到
+      //    ⇒ 倍率取兜底 Infinity ⇒ 中等尺寸标记图也被误屏蔽，"预览与取景"又变回盲区。
+      let best = null, bestArea = 0
+      for (const s of (Array.isArray(a.imgSurfaces) ? a.imgSurfaces : [])) {
+        const ix = Math.min(s.r, a.hero.r) - Math.max(s.l, a.hero.l)
+        const iy = Math.min(s.b, a.hero.b) - Math.max(s.t, a.hero.t)
+        const area = ix > 0 && iy > 0 ? ix * iy : 0
+        if (area > bestArea) { bestArea = area; best = s }
+      }
+      heroSurface = best
+      const hScale = best && best.scale > 0 ? best.scale : Infinity
+      if (hScale > MASK_SCALE_THRESHOLD) {
+        absMasks.push([a.hero.l - 2, a.hero.t - 2, a.hero.r + 2, a.hero.b + 2])
+        heroMasked = true
+      }
+    }
     for (const s of (Array.isArray(a.imgSurfaces) ? a.imgSurfaces : [])) {
-      absMasks.push([s.l, s.t, s.r, s.b])
+      // 与 hero 是**同一块**（重叠最多的那个）⇒ 不重复加框，只在记录里标明归属
+      if (s === heroSurface) {
+        if (heroMasked) maskedSurfaces.push({ ...s, coveredByHero: true })
+        else unmaskedSurfaces.push(s)
+        continue
+      }
+      // ⚠️ 倍率**量不出来时按"大倍率"处理（保守屏蔽）**，不能当"小倍率＝稳定"放行。
+      //   实测踩过：图库缩略图是 `<span>` + CSS 背景图，读不到 naturalWidth ⇒ scale=0 ⇒
+      //   旧写法 `0 > 阈值` 为假 ⇒ 不屏蔽 ⇒ 位图重采样噪声漏出来（每轮 7157px/Δ226）。
+      //   量不出 = 未知 = 未知的东西更可能是大图，所以保守屏蔽。
+      const effScale = (typeof s.scale === 'number' && s.scale > 0) ? s.scale : Infinity
+      if (effScale > MASK_SCALE_THRESHOLD) {
+        absMasks.push([s.l, s.t, s.r, s.b])
+        maskedSurfaces.push(effScale === Infinity ? { ...s, coveredBy: 'unknown-scale' } : s)
+      } else unmaskedSurfaces.push(s)
     }
     // 屏蔽框存成**相对裁剪框**的偏移 ⇒ 宿主移动时它跟着走，不会因为绝对坐标漂移而遮错地方
     const relMasks = absMasks.map(([x0, y0, x1, y1]) => [x0 - rect.x0, y0 - rect.y0, x1 - rect.x0, y1 - rect.y0])
     return {
-      cssWidth, hostKind: 'dialog', host, rect, masks: relMasks,
+      cssWidth, hostKind: 'dialog', host, rect,
+      // masks 一律**绝对 CSS**（别再塞 relMasks —— 那是相对量，见上面 rel 分支的告警）
+      masks: absMasks,
+      maskedSurfaces, unmaskedSurfaces,
       rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, masks: relMasks },
     }
   }
@@ -228,10 +299,11 @@ export function deriveGeom(stateName, a, rel) {
   if (!a.sidebar) return null
   const host = a.sidebar
   if (rel) {
+    const rect = { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom }
     return {
-      cssWidth, hostKind: 'sidebar', host, rel,
-      rect: { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom },
-      masks: rel.masks || [],
+      cssWidth, hostKind: 'sidebar', host, rel, rect,
+      masks: (rel.masks || []).map(([x0, y0, x1, y1]) =>
+        [rect.x0 + x0, rect.y0 + y0, rect.x0 + x1, rect.y0 + y1]),
     }
   }
   // 录制：右边界要避开**随时间变**的那一列

@@ -129,7 +129,7 @@ console.log('\n— ⑥ deriveGeom：侧栏必须**以插件自己的元素为锚
     volatile: [{ l: 234, r: 261, t: '6分钟' }, { l: 229, r: 233, t: '' }],
     plugin: [{ l: 12, t: 724, r: 40, b: 751 }],          // .bga-orb 实测位置
   }
-  const g = deriveGeom('01-static-wallpaper', anchors)
+  const g = deriveGeom('sidebar', anchors)
   ok('★ 右边界取时间标签左沿−1（228），不是侧栏右−8（272）',
     g && g.rect.x1 === 228, g ? 'x1=' + g.rect.x1 : 'null')
   ok('★ 纵向覆盖到插件的 orb（y724–751 落在区域内）',
@@ -140,28 +140,85 @@ console.log('\n— ⑥ deriveGeom：侧栏必须**以插件自己的元素为锚
     g && g.rect.y0 > 375, g ? 'y0=' + g.rect.y0 : 'null')
 
   // 没有 volatile 时确实退到侧栏右−8（反证：上面那条不是巧合）
-  const gNo = deriveGeom('01-static-wallpaper', { ...anchors, volatile: [] })
+  const gNo = deriveGeom('sidebar', { ...anchors, volatile: [] })
   ok('反证：探测不到时间标签时才退到侧栏右−8=272', gNo.rect.x1 === 272, 'x1=' + gNo.rect.x1)
 
   // 锚点缺失 ⇒ null（大声失败，不回落常量）
   ok('插件元素测不到 ⇒ null（不比宿主装饰冒充覆盖）',
-    deriveGeom('01-static-wallpaper', { ...anchors, plugin: [] }) === null)
-  ok('侧栏锚点也没有 ⇒ null', deriveGeom('01-static-wallpaper', { w: 1426, h: 807, plugin: [] }) === null)
-  ok('03 缺 dlg ⇒ null', deriveGeom('03-settings-studio', { w: 1426, h: 807 }) === null)
+    deriveGeom('sidebar', { ...anchors, plugin: [] }) === null)
+  ok('侧栏锚点也没有 ⇒ null', deriveGeom('sidebar', { w: 1426, h: 807, plugin: [] }) === null)
+  ok('03 缺 dlg ⇒ null', deriveGeom('dialog', { w: 1426, h: 807 }) === null)
 
-  // 03 的屏蔽框 = 壁纸位图表面（hero + 图库缩略图），且**存成相对裁剪框的偏移**
-  const g3 = deriveGeom('03-settings-studio', {
+  // 03 的屏蔽框 = **只有大倍率的**位图表面（hero + 大缩略图），且**存成相对裁剪框的偏移**
+  // 判定已改成按倍率：> MASK_SCALE_THRESHOLD(4) 才屏蔽；中等尺寸标记图（~1.7×）不屏蔽。
+  const g3 = deriveGeom('dialog', {
+    w: 1426, h: 807, dlg: { l: 313, t: 24, r: 1113, b: 783 },
+    studio: { l: 525, t: 78, r: 1085, b: 1419 },
+    hero: { l: 545, t: 148, r: 1059, b: 360 },
+    imgSurfaces: [
+      { l: 545, t: 148, r: 1059, b: 360, scale: 17.5, naturalW: 9744, renderW: 558 },  // 大图预览 ⇒ 屏蔽
+      { l: 683, t: 748, r: 869, b: 776, scale: 12.0, naturalW: 3000, renderW: 250 },   // 大缩略图 ⇒ 屏蔽
+    ],
+  })
+  ok('03 裁剪框 = 面板框 ∩ 对话框（±2、下沿留 7；内缩量会冻结进基准）',
+    JSON.stringify(g3.rect) === JSON.stringify({ x0: 523, y0: 76, x1: 1087, y1: 776 }),
+    JSON.stringify(g3.rect))
+  ok('03 大倍率位图表面被屏蔽（hero + 大缩略图，共 2 个）', g3.masks.length === 2,
+    JSON.stringify(g3.masks))
+  ok('03 屏蔽框是**绝对 CSS 坐标**（extract() 消费的格式；rel 里另存相对量）',
+    JSON.stringify(g3.masks[0]) === JSON.stringify([543, 146, 1061, 362]), JSON.stringify(g3.masks[0]))
+
+  // ★ 回归：`rel.masks` 是**相对量**、`masks` 是**绝对量**，两者必须换算。
+  //   踩过的 bug：把 rel.masks 直接透传进 masks ⇒ 屏蔽区间算成负数 ⇒ **屏蔽静默失效**，
+  //   缩略图的位图重采样噪声漏出来，每轮报 7157px/Δ226。
+  const gRel = deriveGeom('dialog', { w: 1426, h: 807, dlg: { l: 313, t: 24, r: 1113, b: 783 } },
+    { left: 210, top: 52, right: 26, bottom: 7, masks: [[160, 672, 346, 707]] })
+  const expectAbs = [gRel.rect.x0 + 160, gRel.rect.y0 + 672, gRel.rect.x0 + 346, gRel.rect.y0 + 707]
+  ok('★ rel.masks 的相对量被换算成绝对量（不是直接透传）',
+    JSON.stringify(gRel.masks[0]) === JSON.stringify(expectAbs) && gRel.masks[0][0] > 400,
+    'mask=' + JSON.stringify(gRel.masks[0]) + ' 期望=' + JSON.stringify(expectAbs))
+
+  // ★ 倍率**量不出来**（naturalWidth=0，例如 `<span>` + CSS 背景图）⇒ 必须**保守屏蔽**，
+  //   不能当"小倍率=稳定"放行。实测踩过：漏屏蔽 ⇒ 缩略图位图噪声每轮报 7157px/Δ226。
+  const gUnknown = deriveGeom('dialog', {
     w: 1426, h: 807, dlg: { l: 313, t: 24, r: 1113, b: 783 },
     hero: { l: 545, t: 148, r: 1059, b: 360 },
-    imgSurfaces: [{ l: 683, t: 748, r: 869, b: 776 }],
+    imgSurfaces: [
+      { l: 545, t: 148, r: 1059, b: 360, scale: 1.38, naturalW: 960, renderW: 698 },   // 中等图：不屏蔽
+      { l: 683, t: 748, r: 869, b: 783, scale: 0, naturalW: 0, renderW: 187 },          // 量不出：屏蔽
+      { l: 884, t: 748, r: 1071, b: 783, scale: 0, naturalW: 0, renderW: 187 },         // 量不出：屏蔽
+    ],
   })
-  ok('03 裁剪框 = 对话框内缩 6/4/6/7（锚在宿主上）',
-    JSON.stringify(g3.rect) === JSON.stringify({ x0: 319, y0: 28, x1: 1107, y1: 776 }),
-    JSON.stringify(g3.rect))
-  ok('03 屏蔽框 = hero ±2 + 图库缩略图（共 2 个）', g3.masks.length === 2,
-    JSON.stringify(g3.masks))
-  ok('03 屏蔽框是**相对裁剪框**的偏移（宿主移动时跟着走）',
-    JSON.stringify(g3.masks[0]) === JSON.stringify([224, 118, 742, 334]), JSON.stringify(g3.masks[0]))
+  ok('★ 倍率量不出的表面一律保守屏蔽（共 2 个），中等图仍不屏蔽',
+    gUnknown.masks.length === 2, '屏蔽框 ' + gUnknown.masks.length + ' 个: ' + JSON.stringify(gUnknown.masks))
+
+  // ★ 坏例/正例配对：**中等尺寸标记图**（倍率 ~1.7）必须**不被屏蔽** ——
+  //   否则"预览与取景"永远是盲区（验收约定第 5 项）。
+  const g4 = deriveGeom('dialog', {
+    w: 1426, h: 807, dlg: { l: 313, t: 24, r: 1113, b: 783 },
+    hero: { l: 545, t: 148, r: 1059, b: 360 },
+    imgSurfaces: [{ l: 545, t: 148, r: 1059, b: 360, scale: 1.38, naturalW: 960, renderW: 698 }],
+  })
+  ok('★ 中等尺寸标记图（1.38×，实测稳定）⇒ 预览框**不被屏蔽**（第 5 项才真正被覆盖）', g4.masks.length === 0,
+    '屏蔽框 ' + g4.masks.length + ' 个')
+  const g5 = deriveGeom('dialog', {
+    w: 1426, h: 807, dlg: { l: 313, t: 24, r: 1113, b: 783 },
+    hero: { l: 545, t: 148, r: 1059, b: 360 },
+    imgSurfaces: [{ l: 545, t: 148, r: 1059, b: 360, scale: 3.43, naturalW: 640, renderW: 187 }],
+  })
+  ok('★ 实测不稳定的 3.43×（640→187）⇒ 屏蔽（阈值两侧都有断言，不是单侧）', g5.masks.length === 1,
+    '屏蔽框 ' + g5.masks.length + ' 个')
+
+  // ★ 溢出场景：设了 zoom 之后图片是 object-fit:cover + transform:scale()，会**比 hero 容器大**
+  //   ⇒ 若用"包含关系"去找 hero 的倍率就匹配不到、退化成 Infinity、把中等图也误屏蔽（真机踩过：
+  //   04 状态明明用 1.38× 的标记图却仍被屏蔽）。必须按"重叠最多"配对。
+  const g6 = deriveGeom('dialog', {
+    w: 1426, h: 807, dlg: { l: 313, t: 24, r: 1113, b: 783 },
+    hero: { l: 545, t: 148, r: 1059, b: 360 },
+    imgSurfaces: [{ l: 477, t: 120, r: 1113, b: 372, scale: 1.38, naturalW: 960, renderW: 698 }],
+  })
+  ok('★ img 溢出 hero 容器时仍能配到倍率 1.38 ⇒ **不屏蔽**', g6.masks.length === 0,
+    '屏蔽框 ' + g6.masks.length + ' 个')
 }
 
 console.log('\n— ⑦ 插件自身横移必须被检出（不能靠"跟着插件锚点走"自动对齐掉）—')
@@ -173,12 +230,12 @@ console.log('\n— ⑦ 插件自身横移必须被检出（不能靠"跟着插�
     hero: { l: 545, t: 148, r: 1059, b: 360 } }
   const aShift = { ...aBase, studio: { l: 537, t: 78, r: 1097, b: 1419 } }   // 宿主没动，插件右移 12
 
-  const gBase = deriveGeom('03-settings-studio', aBase)          // 录制：定下 rel
+  const gBase = deriveGeom('dialog', aBase)          // 录制：定下 rel
   ok('录制时记下了相对宿主的内缩量 rel', !!(gBase && gBase.rel), JSON.stringify(gBase && gBase.rel))
 
   // 比对时用**录制时的 rel** + 当前宿主 ⇒ 框钉在宿主上，不跟插件走
-  const gNowBase = deriveGeom('03-settings-studio', aBase, gBase.rel)
-  const gNowShift = deriveGeom('03-settings-studio', aShift, gBase.rel)
+  const gNowBase = deriveGeom('dialog', aBase, gBase.rel)
+  const gNowShift = deriveGeom('dialog', aShift, gBase.rel)
   ok('★ 宿主不变时，两侧裁剪框**完全一致**（框锚在宿主上，不跟插件漂）',
     gNowBase.rect.x0 === gNowShift.rect.x0 && gNowBase.rect.x1 === gNowShift.rect.x1,
     '基准 ' + JSON.stringify(gNowBase.rect) + ' 横移后 ' + JSON.stringify(gNowShift.rect))

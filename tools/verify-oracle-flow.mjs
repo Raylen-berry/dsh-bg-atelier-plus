@@ -54,7 +54,7 @@ function sliceFrom(src, sig) {
  * getEmptyObjectReads：让前 N 次 GET 返回 `{}`（宿主 readSettings 读失败的样子，
  * HTTP 仍是 200）—— 专门复现审核方第六轮指出的两条丢设置路径。
  */
-function loadFns({ getFailuresBeforeSuccess = 0, emptyObjectAt = [], initialAutoOn = true, renderedOverride = null } = {}) {
+function loadFns({ getFailuresBeforeSuccess = 0, emptyObjectAt = [], initialAutoOn = true, renderedOverride = null, wallpaperSwitched = false } = {}) {
   const writes = []            // 记录所有 PUT
   const reads = { n: 0 }
   const settings = { autoOn: initialAutoOn, autoMin: 5, wallpaper: { file: 'x.png', cat: 'c' }, accent: '#fff' }
@@ -96,6 +96,8 @@ return { freezeRotation, pinWallpaper, restoreRotation };
     //    按第 N 次 GET 计（1 起），便于精确命中"freeze 的那次"或"pin 内部的那次"。
     __emptyObjectAt: Array.isArray(emptyObjectAt) ? emptyObjectAt.slice() : [],
     __renderedOverride: renderedOverride,
+    // restoreRotation 里引用的模块级标志（本次是否切换过底图）——沙箱必须提供，否则 ReferenceError
+    wallpaperSwitched: !!wallpaperSwitched,
     log: () => {},
   }
   // readState：模拟页面里执行 fetch('/bga/settings.json')；GET 可按需失败若干次
