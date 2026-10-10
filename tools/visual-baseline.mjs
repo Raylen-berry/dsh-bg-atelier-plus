@@ -245,6 +245,12 @@ let exitCode = 0
 // 本次运行是否**切换过底图**（标记图状态会切）。切过 ⇒ 还原时必须把 wallpaper/zoom/focus
 // 一起写回原值，否则等于把用户的底图永久换掉（验收约定第 1 项要检出的错误）。
 let wallpaperSwitched = false
+// 我们**钉过图**（pinWallpaper 写过 wallpaper）。钉图也是一次对用户设置的写入 ⇒
+// 只要钉过就必须把用户的底图还回去，**不能只在"换过图"时才还**。
+// 实测踩到：比对因页面状态全部拒绝 ⇒ 没有任何状态走到换图 ⇒ wallpaperSwitched 仍是 false
+// ⇒ 还原逻辑跳过 wallpaper ⇒ **用户的底图被永久留在基准那张（标记图）上**，
+// 标记图一卸载就变成"底图指向不存在的文件"。这正是验收约定第 1 项要防的事。
+let wallpaperPinned = false
 // 主题/透明度状态是否改过设置或宿主主题属性；以及**改之前**的宿主深浅主题（用于还原）。
 let themeSwitched = false
 let themeOriginalDark = null
@@ -258,6 +264,22 @@ if (mode === 'compare' && !fs.existsSync(path.join(baseDir, 'manifest.json'))) {
 console.log('=== 视觉基准 ' + mode + '：' + dir + ' ===')
 const cdp = await cdpSession(port)
 console.log('  已连上: ' + cdp.url)
+
+// ⚠️ **开工前必须让页面在协议层"可见且聚焦"** —— 这不是可选优化，是正确性前提。
+//    插件在后台标签页里**故意不画壁纸**（`wallpaperBackgrounded()` = document.hidden，
+//    走 suspendWallpapers ⇒ paintBackground(false)），也**故意不装轮播定时器**。
+//    实测：本机 GUI 标签页默认 `document.hidden === true` ⇒
+//      · "钉图/换图后画面确认"读不到壁纸 URL ⇒ 拒绝录基准（exit 4，现象是"读不到"）；
+//      · 之前偶尔成功，只是因为那几次标签页恰好在**前台** —— 环境一换就复现，
+//        属于"看着在跑、其实依赖运气"。
+//    用 CDP 的 focus 模拟让页面一直报告可见+聚焦，与真实窗口状态无关（收尾再关掉）。
+try {
+  await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true })
+  await cdp.send('Page.bringToFront', {})
+  console.log('  页面可见性: 已用 focus 模拟置为可见+聚焦（后台不画底图会让确认假失败）')
+} catch (e) {
+  console.error('  ⚠️ 无法启用 focus 模拟（' + String(e && e.message || e).slice(0, 60) + '）⇒ 若标签页在后台，画面确认可能失败')
+}
 
 // 开工前先探页面网络通道（见 preflightPageFetch 注释：挂了的话后面会以一个看不懂的超时崩）
 {
@@ -306,6 +328,13 @@ async function preflightPageFetch() {
  * returnByValue 也一起开着，否则拿到的是远程对象引用、取不到值。
  */
 async function readState(expr) {
+  // 守卫：这些表达式都是**模板字符串拼出来的**，而我在中文注释里写过反引号，
+  // 结果是模板被提前闭合、后面的方括号内容被当成 JS 求值（报 "data is not defined"），
+  // 而 `node --check` 因为是合法语法照样放行 —— 已经踩了四次。
+  // 表达式里出现反引号一定是我写错了（要写也用普通引号），当场报错比让它跑到浏览器里再猜快。
+  if (typeof expr === 'string' && expr.includes('`')) {
+    throw new Error('readState 的表达式里出现了反引号 —— 几乎可以肯定是模板字符串内注释写反引号把模板提前闭合了（见本文件多处告警）。请改成普通引号。')
+  }
   const r = await cdp.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
   if (r && r.exceptionDetails) {
     // 页面里抛错时不要静默返回 null —— 那会让"读不到"和"读到 null"混在一起
@@ -406,6 +435,50 @@ async function freezeRotation(log) {
  * 现在：必须**显式传入已确认有效的原始设置**（frozen.before）才允许写；
  * 拿不到就拒绝写入并如实报告，由调用方决定怎么退出。
  */
+/**
+ * 等"画面渲染的底图 = 期望的这张"。
+ *
+ * ⚠️ 为什么必须**轮询**而不是 reload 后睡固定时间再单查一次：底图大小差得很远
+ *    （实测用户当时那张 `高清/洁西卡金蜜.png` 是 **53 MB**，而验收标记图只有 14 KB），
+ *    reload 后解码 53MB 的那张要好几秒 —— 固定 3.5 秒的单次确认会**假失败**
+ *    （报"画面背景不是 marker-960x540.png"，其实只是还没画完），
+ *    于是录基准被拒、状态 04 直接不参与比较。
+ * 返回 { hit, names }：hit=false 时 names 用来把"到底画的是哪张"如实报出来。
+ */
+async function waitRenderedWallpaper(want, timeoutMs = 15000, stepMs = 1200) {
+  const deadline = Date.now() + timeoutMs
+  let names = []
+  for (;;) {
+    const cfRaw = await readState(`(()=>{
+      const bi = String(getComputedStyle(document.body,'::before').backgroundImage||'')
+        + '|' + String(getComputedStyle(document.documentElement,'::before').backgroundImage||'');
+      return JSON.stringify({rendered: bi.slice(0,500)})})()`).catch((e) => {
+        // 不静默吞掉：读不到时把原因打出来（否则只会看到"读不到"，无从下手）
+        if (process.env.VB_DEBUG_RENDER) console.error('     [渲染确认读取失败] ' + String(e && e.message || e).slice(0, 140))
+        return null
+      })
+    let cf = null
+    try { cf = JSON.parse(cfRaw) } catch { cf = null }
+    const src = String(cf && cf.rendered || '')
+    names = []
+    let from = 0
+    for (;;) {
+      const i = src.indexOf('/bga/wallpapers/', from)
+      if (i < 0) break
+      from = i + 1
+      let j = src.length
+      for (const sep of ['"', ')', ',', ' ', "'"]) { const k = src.indexOf(sep, i + 16); if (k >= 0 && k < j) j = k }
+      const raw = src.slice(i + 16, j)
+      let dec = raw
+      try { dec = decodeURIComponent(raw) } catch { /* 保持原样 */ }
+      names.push(dec)
+    }
+    if (want !== '' && names.some((n) => n === want || n.replace(/^.*\//, '') === want)) return { hit: true, names }
+    if (Date.now() >= deadline) return { hit: false, names }
+    await sleep(stepMs)
+  }
+}
+
 async function pinWallpaper(wallpaper, log, frozenBefore) {
   if (!isValidSettings(frozenBefore)) {
     console.error('     ✗ 钉图被拒绝：没有有效的原始设置可依据（{} 不算有效——宿主读失败长这样）。')
@@ -476,31 +549,19 @@ async function pinWallpaper(wallpaper, log, frozenBefore) {
     return false
   }
   const want = String(wallpaper && wallpaper.file || '')
-  // 渲染确认：从背景的 URL 里**解析出壁纸文件名再精确比对**。
+  // 渲染确认：从背景的 URL 里**解析出壁纸文件名再精确比对**（判据在 waitRenderedWallpaper 里）。
   // ⚠️ 不要写成 `rendered.indexOf(want)` 这种子串匹配 —— 实测 A5 场景里
   //    want='x.png'，而 URL 是 http://x/... 就含 'x' ⇒ 松匹配会**假通过**。
-  //    页面里 URL 是 encodeURIComponent 过的，所以取 /bga/wallpapers/ 之后那段并解码。
-  const names = []
-  const src = String(cf.rendered || '')
-  let from = 0
-  for (;;) {
-    const i = src.indexOf('/bga/wallpapers/', from)
-    if (i < 0) break
-    from = i + 1
-    let j = src.length
-    for (const sep of ['"', ')', ',', ' ', "'"]) { const k = src.indexOf(sep, i + 16); if (k >= 0 && k < j) j = k }
-    const raw = src.slice(i + 16, j)
-    let dec = raw
-    try { dec = decodeURIComponent(raw) } catch { /* 保持原样 */ }
-    names.push(dec)
-  }
-  const hit = want !== '' && names.some((n) => n === want || n.replace(/^.*\//, '') === want)
-  if (!hit) {
+  //    并且**必须轮询等待**：53MB 的底图 reload 后要好几秒才画完，单次 3.5s 会假失败。
+  const rc = await waitRenderedWallpaper(want)
+  if (!rc.hit) {
     console.error('     ✗ 钉图未渲染：设置是「' + want + '」但画面背景是 '
-      + (names.length ? names.join(' / ').slice(0, 120) : '（没解析出壁纸 URL）') + ' —— 不能继续')
+      + (rc.names.length ? rc.names.join(' / ').slice(0, 120) : '（没解析出壁纸 URL）') + ' —— 不能继续')
     return false
   }
   if (log) console.log('     钉图确认: autoOn=false、设置已钉上、**画面背景确实是这张** ✓')
+  // 钉图 = 我们写过用户的 wallpaper ⇒ 收尾必须回填（见 restoreRotation 的 wallpaperPinned）
+  wallpaperPinned = true
   return true
 }
 
@@ -524,8 +585,12 @@ async function restoreRotation(before, log) {
     return 'skipped'
   }
   if (need === 'not-needed') {
-    if (log) console.log('     轮播: 原本就是关的，无需还原（不算失败）')
-    return 'restored'
+    // ⚠️ 不能直接返回：轮播原本是关的，但我们**钉过图/改过主题** —— 那些改动同样要还。
+    if (!wallpaperPinned && !themeSwitched) {
+      if (log) console.log('     轮播: 原本就是关的、且没改过底图/主题，无需还原（不算失败）')
+      return 'restored'
+    }
+    if (log) console.log('     轮播: 原本就是关的；但仍需把底下这些改动还回去')
   }
   let want = null
   try { want = JSON.parse(before) } catch { /* 已由 need 判定过，这里必然可解析 */ }
@@ -537,18 +602,22 @@ async function restoreRotation(before, log) {
   const nowRaw = await readState(`(async()=>{const r=await fetch('/bga/settings.json',{cache:'no-store'});return await r.text()})()`)
   let now = null
   try { now = JSON.parse(nowRaw) } catch { now = null }
-  const merged = { ...(now && typeof now === 'object' ? now : want), autoOn: true }
+  // ⚠️ autoOn 要还原成**冻结时的那个布尔值**，不能写死 true。
+  //    旧写法 `{...now, autoOn: true}` 只在"原本开着轮播"那条路径上是对的；一旦冻结点原本是关的，
+  //    还原就会**把用户的轮播打开**（实测：跑完一轮 autoOn 从 false 变成 true）。
+  const wantAutoOn = want.autoOn === true
+  const merged = { ...(now && typeof now === 'object' ? now : want), autoOn: wantAutoOn }
   if (Number.isFinite(want.autoMin)) merged.autoMin = want.autoMin
-  // ⚠️ 若本次**切换过底图**（标记图状态），必须把 wallpaper/zoom/focus 也写回原值 ——
-  //    否则等于把用户的底图永久换掉（验收约定第 1 项明列的"必须检出的错误"）。
-  //    注意：这里**只在我们确实改过时**才回填；没改过时保持原来的语义
-  //    （"用户看到哪张就留哪张"，因为轮播可能中途换过图）。
-  if (wallpaperSwitched) {
+  // ⚠️ 只要**钉过图**（pinWallpaper 写过 wallpaper）或**换过图**，就必须把
+  //    wallpaper/zoom/focus/imageFraming 写回冻结时的原值 —— 那是用户的设置，我们改过就得还。
+  //    旧写法只判 `wallpaperSwitched`，于是"全部状态被拒绝、没走到换图"那一轮就把用户的底图
+  //    留在基准那张上（实测）。钉图 = 写入 = 必须回填。
+  if (wallpaperPinned || wallpaperSwitched) {
     for (const k of ['wallpaper', 'zoom', 'focus', 'imageFraming']) {
       if (want && k in want) merged[k] = want[k]
       else delete merged[k]
     }
-    if (log) console.log('     还原: 本次切换过底图 ⇒ 把 wallpaper/zoom/focus 一并写回原值')
+    if (log) console.log('     还原: 本次钉过/换过底图 ⇒ 把 wallpaper/zoom/focus 一并写回原值')
   }
   // 主题/透明度状态改过 `styles`（大面积表面不透明度）⇒ 一并写回原值
   if (themeSwitched) {
@@ -597,7 +666,7 @@ async function restoreRotation(before, log) {
   const verifyRaw = await readState(`(async()=>{const x=await fetch('/bga/settings.json',{cache:'no-store'});return await x.text()})()`).catch(() => null)
   let v = null
   try { v = JSON.parse(verifyRaw) } catch { v = null }
-  const diskOk = !!(v && v.autoOn === true)
+  const diskOk = !!(v && v.autoOn === wantAutoOn)
 
   // 客户端内存：读插件自己挂的**只读观测点** window.__bgaStateProbe()。
   // 为什么必须有这一条：磁盘与客户端内存是两份；客户端在任何变更时会把**内存整份写回**，
@@ -623,7 +692,7 @@ async function restoreRotation(before, log) {
   let mem = null
   try { mem = JSON.parse(memProbe) } catch { mem = null }
   const memKnown = !!(mem && mem.src !== 'unavailable' && mem.src !== 'error')
-  const memOk = memKnown ? mem.autoOn === true : null
+  const memOk = memKnown ? mem.autoOn === wantAutoOn : null
 
   if (log) {
     console.log('     轮播还原·磁盘: autoOn=' + (v ? v.autoOn : '读不到') + (diskOk ? ' ✅' : ' ❌'))
@@ -709,8 +778,28 @@ async function prepareEnvironment(log) {
     //      · 面板 alpha/颜色任何变化仍然被检出（垫底色与面板色差异大 ⇒ alpha 变化信号最强）；
     //      · 同机制的有效性已实测：背后铺红 ⇒ 面板像素变 137116 px（证明透光通道是活的）。
     const dlg = document.querySelector('[role="dialog"]');
+    // ⚠️ **先清掉旧的再重建**（自愈），不能"已存在就当失败"。
+    //    踩过：上一轮若异常退出（没走到清理），DOM 里会残留 vb-backdrop / vb-env；
+    //    再跑时"元素已存在"为真 ⇒ backdrop=0 ⇒ 判定"垫底未生效"、拒绝录基准 ——
+    //    一个**陈旧残留**把后续每一轮都堵死，而原因看不出来。
+    //    重建的代价接近零，且顺带保证元素属性确实是本次注入的那份。
+    for (const id of ['vb-env', 'vb-backdrop']) {
+      const old = document.getElementById(id); if (old) old.remove();
+    }
+    const st2 = document.createElement('style'); st2.id = 'vb-env';
+    st2.textContent = [
+      '[class*="bga"]{animation:none!important}',
+      '[class*="bga"] *{animation:none!important}',
+      // ③ 停掉**输入框光标**（宿主 UI，不是插件输出）。
+      //    实测：07/08 锚在宿主主体表面 [data-composer-card]，首页那个是"新会话"输入框，
+      //    里面有个会闪的光标 ⇒ 抓图时正好一个是亮点、一个是底色，
+      //    表现为 CSS x471、y412-430 的 **1px×19px 竖线、Δ183**（连跑 3 次都复现）。
+      //    这是"宿主自己的动效"，与上面停插件动画同源；停掉它不隐藏插件的任何输出。
+      'input,textarea{caret-color:transparent!important}',
+    ].join('\\n');
+    document.head.appendChild(st2);
     let backdrop = 0;
-    if (dlg && !document.getElementById('vb-backdrop')) {
+    if (dlg) {
       const bd = document.createElement('div'); bd.id = 'vb-backdrop';
       bd.style.cssText = 'position:fixed;inset:0;z-index:1;pointer-events:none;background:rgb(255,0,255)';
       document.body.appendChild(bd); backdrop = 1;
@@ -835,17 +924,35 @@ async function measureLiveGeom(stateName, log, rel, hostKind) {
       // ⚠️ 注释里别写反引号：这里是**模板字符串内部**，反引号会把模板提前闭合（踩过两次）。
       surface: R(document.querySelector('[data-composer-card]')),
       darkTheme: document.body.hasAttribute('data-ds-dark-theme'),
+      // 页面状态：**有没有打开会话**。为什么必须记并核对 —— [data-composer-card] 在
+      // 首页（居中）与会话页（贴底）**是两个不同位置**，所以 07/08 的裁剪框依赖页面状态。
+      // 不核对的话，状态不一致会报"覆盖不足：高度 X vs Y"（是响的，但信息不达意，
+      // 容易被当成像素问题）。核对了就能直接说清原因与怎么办。
+      // ⚠️ 本段在**模板字符串内部**：注释里一律别写反引号！踩过三次 ——
+      //    反引号会把模板提前闭合，后面的方括号内容被当成 JS 表达式求值，
+      //    变成运行时报 "data is not defined"，而 --check 因为是合法语法照样放行。
+      hasConversation: document.querySelectorAll('[class*="_bubble"]').length > 0,
       volatile: vol.slice(0, 60),
-      // 插件**自己**在左侧栏里画出来的可见元素（orb / dock 特效等）。
+      // 插件**自己**在左侧栏里画出来的可见元素（orb 等）。
       // 有它才叫比到插件；此前 01/02 的矩形是整列宿主装饰，插件的 orb（实测 y724–751）
       // 完全落在矩形之外 ⇒ 那两张状态实际上没比插件任何像素（真机查出来的）。
+      //
+      // ⚠️ 判据必须是**"在侧栏宿主里"**，不能是"left < 35% 视口宽"。实测踩到：
+      //    打开一个会话后，插件的动效 dock 也带 bga- 前缀类名、宽 1297px，left 落在 35% 以内
+      //    ⇒ 被算进"侧栏插件元素" ⇒ 包围盒从 28×27 变成 1297×98 ⇒ 01/02/05/06 四个状态
+      //    **全部假报"插件相对宿主的布局漂移 w 28→1297"**（而侧栏里的 orb 根本没动）。
+      //    改成"元素被侧栏宿主包含"就与页面状态无关了。
+      //    （另：本段在**模板字符串内部**，注释里一律别写反引号 —— 会把模板提前闭合，踩过三次。）
       plugin: (()=>{
+        const sb=document.querySelector('[class*="sidebarCol" i]')||document.querySelector('[class*="sidebar" i]');
         const out=[];
         document.querySelectorAll('[class*="bga"]').forEach(e=>{
           const b=e.getBoundingClientRect(); const cs=getComputedStyle(e);
           if(b.width<2||b.height<2) return;
           if(cs.display==='none'||cs.visibility==='hidden'||+cs.opacity===0) return;
-          if(b.left>innerWidth*0.35) return;              // 只取左区的
+          // 首选：被侧栏宿主包含（精确、与页面状态无关）。侧栏找不到时才退回"左区"兜底。
+          if(sb) { if(!sb.contains(e)) return }
+          else if(b.left>innerWidth*0.35) return;
           out.push({l:Math.round(b.left),t:Math.round(b.top),r:Math.round(b.right),b:Math.round(b.bottom)});
         });
         return out.slice(0, 40);
@@ -883,6 +990,8 @@ async function measureLiveGeom(stateName, log, rel, hostKind) {
   //    录制时传 undefined（由 deriveGeom 按当前局面定下并回传 rel）；
   //    比对时传基准的 rel ⇒ 框钉在**宿主**上，插件自己挪位不会把差异对齐掉。
   const g = deriveGeom(hostKind || 'sidebar', a, rel || undefined)
+  // 把"页面状态"挂在几何上：录制时会被存进基准，比对时用来核对（见 prepareState 的 pageStateDrift）。
+  if (g) g.pageState = { hasConversation: !!(a && a.hasConversation) }
   if (!g) {
     console.error('  ✗ ' + stateName + '：实测几何推不出来（锚点缺失：'
       + 'dlg=' + JSON.stringify(a && a.dlg) + ' sidebar=' + JSON.stringify(a && a.sidebar)
@@ -1036,7 +1145,24 @@ async function switchWallpaperTo(ident, log) {
     if (log) console.log('     底图已经是 ' + ident.cat + '/' + ident.file + '，无需切换')
     return true
   }
-  const patched = { ...now, wallpaper: entry }
+  // ⚠️ 写入要用**插件自己的完整形状**（id/cat/file/name/url/hd/tags/no/size），不能直接塞列表条目：
+  //    字段**必须取自上面从 /bga/wallpapers.json 找到的完整条目 `entry`**，不能从 `ident` 取 ——
+  //    `wallpaperIdent` 只有 {cat,file,zoom,focus}，**没有 url**。
+  //    踩过的坑：改成"完整格式"时字段从 ident 取 ⇒ 写进去 `url: undefined` ⇒
+  //    磁盘与客户端内存里 wallpaper 都是对的（探针查得到 marker），**但画面画不出来**
+  //    （body::before 里没有壁纸 URL）⇒ 换图确认失败 ⇒ 状态 04 不参与比较（exit 4）。
+  const wallpaperValue = {
+    id: ident.cat + '\u0000' + (ident.file || ident.name),
+    cat: ident.cat,
+    file: ident.file || ident.name,
+    name: String((entry && entry.base) || String(ident.file || ident.name).replace(/\.[^.]+$/, '')),
+    url: (entry && entry.url) || ident.url,
+    hd: !!(entry && entry.hd),
+    tags: (entry && entry.tags) || [ident.cat],
+    no: entry && entry.no,
+    size: entry && entry.size,
+  }
+  const patched = { ...now, wallpaper: wallpaperValue }
   // ⚠️ **必须把轮播也钉住**（与 pinWallpaper 一致），不能"读到什么写回什么"：
   //   插件会把轮播开关**画进 UI**（按钮文案「暂停轮播/开始轮播」、状态文字「每 5 分钟切换/轮播已暂停」、
   //   侧栏的小指示点）。实测：捕获时 04 那次读到的是 autoOn=true（客户端在 reload 后把内存值写回过），
@@ -1060,35 +1186,36 @@ async function switchWallpaperTo(ident, log) {
     console.error('  ✗ 切换底图后刷新失败：' + String(e && e.message || e).slice(0, 80))
     return false
   }
-  await sleep(3500)
-  // 渲染确认：与 pinWallpaper 同一条判据（解析背景 URL 的 basename 精确比对）
-  const cfRaw = await readState(`(()=>{
-    const bi = String(getComputedStyle(document.body,'::before').backgroundImage||'')
-      + '|' + String(getComputedStyle(document.documentElement,'::before').backgroundImage||'');
-    return JSON.stringify({rendered: bi.slice(0,500)})})()`).catch(() => null)
-  let cf = null
-  try { cf = JSON.parse(cfRaw) } catch { cf = null }
-  const src = String(cf && cf.rendered || '')
-  let hit = false, from = 0
-  for (;;) {
-    const i = src.indexOf('/bga/wallpapers/', from)
-    if (i < 0) break
-    from = i + 1
-    let j = src.length
-    for (const sep of ['"', ')', ',', ' ', "'"]) { const k = src.indexOf(sep, i + 16); if (k >= 0 && k < j) j = k }
-    let dec = src.slice(i + 16, j)
-    try { dec = decodeURIComponent(dec) } catch { /* 保持原样 */ }
-    if (dec === ident.file || dec.replace(/^.*\//, '') === ident.file) { hit = true; break }
+  await sleep(1200)
+  if (process.env.VB_DEBUG_RENDER) {
+    const dbgDisk = await readState(`(async()=>{const r=await fetch('/bga/settings.json',{cache:'no-store'});const j=await r.json();
+      return JSON.stringify({disk:j.wallpaper&&j.wallpaper.file, n:Object.keys(j).length})})()`).catch((e) => 'err:' + String(e.message).slice(0, 60))
+    const dbgProbe = await readState(`(()=>{try{return JSON.stringify(window.__bgaStateProbe?window.__bgaStateProbe():{noProbe:true})}catch(e){return 'throw:'+String(e.message).slice(0,60)}})()`).catch((e) => 'err:' + String(e.message).slice(0, 60))
+    console.error('     [诊断] 期望=' + ident.file + ' 磁盘=' + dbgDisk + ' 探针=' + dbgProbe)
+    console.error('     [诊断] 有没有 vb-env=' + await readState(`!!document.getElementById('vb-env')`).catch(() => '?')
+      + ' 插件在不在=' + await readState(`!!document.querySelector('[class*="bga"]')`).catch(() => '?'))
   }
-  if (!hit) {
-    console.error('  ✗ 切换底图后画面背景不是 ' + ident.file + ' —— 不假定成功，本次不用这个状态')
+  // 渲染确认：与 pinWallpaper 同一条判据（解析背景 URL 的 basename 精确比对），同样**轮询等待**。
+  // ⚠️ 再给一次机会：实测偶发"reload 之后插件这一轮没起来"（15 秒内 body::before 里
+  //    连壁纸 URL 都没有 —— 页面本身健康、探针也在，就是那一轮没画）。
+  //    一次刷新重试能兜住这种瞬时情况；两次都不行才算真失败（不假定成功）。
+  let rc2 = await waitRenderedWallpaper(String(ident.file || ''))
+  if (!rc2.hit) {
+    if (log) console.log('     换图后 15 秒内没看到画面更新 ⇒ 再刷新一次重试')
+    try { await cdp.send('Page.reload', { ignoreCache: false }) } catch { /* 下面按失败处理 */ }
+    await sleep(1500)
+    rc2 = await waitRenderedWallpaper(String(ident.file || ''), 20000)
+  }
+  if (!rc2.hit) {
+    console.error('  ✗ 切换底图后画面背景不是 ' + ident.file + '（实际 '
+      + (rc2.names.length ? rc2.names.join(' / ').slice(0, 100) : '读不到壁纸 URL') + '）—— 不假定成功，本次不用这个状态')
     return false
   }
   if (log) console.log('     底图已切到 ' + ident.cat + '/' + ident.file + '（画面已确认）✓')
   return true
 }
 
-async function prepareState(s, log, rel, basePluginRel) {
+async function prepareState(s, log, rel, basePluginRel, recordedPageState) {
   // 为什么必须做：上一次状态可能开着面板，不复位的话后面的状态会**继承**它 ——
   // 实测踩到过：三个状态全都带着同一个面板，基准之间只差 0.05%，等于没区分开。
   // 关掉 dsh-browser-live 的观察窗：它**实时镜像当前页面**（截出来的图里能看到 FPS 计数与
@@ -1163,6 +1290,25 @@ async function prepareState(s, log, rel, basePluginRel) {
     layoutDrift = assertLayoutContract(basePluginRel, geom.pluginRel)
     if (layoutDrift) console.error('  ✗ ' + s.name + ' ' + layoutDrift)
   }
+  // 页面状态契约：**有没有打开会话**必须和录制时一致。
+  // 为什么：`[data-composer-card]`（07/08 的主体表面锚点）在首页与会话页是**两个不同位置**，
+  // 不核对会退化成"覆盖不足：高度 X vs Y"——响，但信息不达意，容易被误当成像素问题。
+  let pageStateDrift = null
+  // ⚠️ 录制时的页面状态必须**当参数传进来**：调用方传给本函数的是 STATES 里的条目
+  //    （只有 name/hostKind/probe 等），基准 manifest 条目才是另一个对象 —— 一开始写成
+  //    `s.pageState`，于是恒为 undefined、守卫**从不触发**（实测：会话页下 8 个状态照报像素差异，
+  //    而我以为守卫在看着）。这类"看着有守卫、实际永不生效"的错，比没有守卫更坏。
+  const recHas = recordedPageState ? recordedPageState.hasConversation : null
+  if (geom && recHas !== null && recHas !== undefined) {
+    const nowHas = !!(geom.pageState && geom.pageState.hasConversation)
+    if (nowHas !== recHas) {
+      pageStateDrift = '页面状态与录制时不一致：录制时' + (recHas ? '**打开着会话**' : '**在首页/新会话页**')
+        + '，现在是' + (nowHas ? '打开着会话' : '在首页/新会话页')
+        + ' ⇒ 主体表面锚点 [data-composer-card] 位置不同，本次不比对。'
+        + (recHas ? '先点开一个会话再重跑。' : '先回到首页/新会话页再重跑。')
+      console.error('  ✗ ' + s.name + ' ' + pageStateDrift)
+    }
+  }
   return {
     imagesReady: ready,
     geometryOk: geomOk && !!geom,
@@ -1170,6 +1316,7 @@ async function prepareState(s, log, rel, basePluginRel) {
     envApplied: env.applied,
     geom,
     layoutDrift,
+    pageStateDrift,
   }
 }
 
@@ -1385,6 +1532,8 @@ if (mode === 'capture') {
       // 覆盖基准：这次**实际参与比较的设备像素尺寸**。比对时若当前侧与之不符（哪怕两侧
       // 一起缩水），一律判"覆盖不足" —— 不许静默比交集（审核方第十轮第二条）。
       expectCompared: prep ? comparedBoxOf(prep.geom, shot.data, s.name) : null,
+      // 页面状态也入基准：比对时用它核对"有没有打开会话"（见 prepareState 的 pageStateDrift）
+      pageState: prep && prep.geom ? prep.geom.pageState || null : null,
     })
     console.log('  ✅ ' + s.name + '  ' + fs.statSync(file).size + ' 字节')
     console.log('     探针: ' + String(probeValue).slice(0, 160))
@@ -1526,6 +1675,7 @@ if (mode === 'capture') {
 
   console.log('\n自检：' + stPass + ' 通过 / ' + stFail + ' 失败')
   if (stFail > 0) exitCode = 1
+  try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }) } catch {}
   cdp.close()
   process.exit(exitCode)
 } else {
@@ -1576,7 +1726,7 @@ if (mode === 'capture') {
     // 把基准录下的 rel（框相对宿主的内缩量）与 pluginRel（插件相对宿主的位置）传进去：
     // 前者让裁剪框钉在宿主上，后者用来抓"插件自己挪了"。
     const baseGeom = s.geom || null
-    if (state) prep = await prepareState(state, false, baseGeom && baseGeom.rel, baseGeom && baseGeom.pluginRel)
+    if (state) prep = await prepareState(state, false, baseGeom && baseGeom.rel, baseGeom && baseGeom.pluginRel, s.pageState || null)
     else await sleep(2000)
     // 图片没就绪 ⇒ **本次比对不算数**，记为"就绪失败"而不是"有回归"。
     // 两者必须分开：混在一起会把"图没加载完"误报成视觉回归（审核方指出的缺陷）。
@@ -1601,6 +1751,13 @@ if (mode === 'capture') {
     if (prep && prep.layoutDrift) {
       diff++
       console.log('  ❌ ' + s.name + '  ' + prep.layoutDrift + ' —— 插件自身布局错误（宿主没动）')
+      continue
+    }
+    // 页面状态不一致（有没有打开会话）⇒ 主体表面锚点位置不同，**不是像素问题**，
+    // 也不该算"未就绪"，直接计为不可比对并说清怎么办。
+    if (prep && prep.pageStateDrift) {
+      diff++
+      console.log('  ❌ ' + s.name + '  ' + prep.pageStateDrift)
       continue
     }
     const probeNow = await readState(state ? state.probe : 'null')
@@ -1684,6 +1841,7 @@ if (mode === 'capture') {
       console.error('  ✗ 未预期异常：' + String(e && e.message || e).slice(0, 120))
     }
   }
+  try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }) } catch {}
   cdp.close()
   process.exit(exitCode)
 }

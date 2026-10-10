@@ -40,14 +40,21 @@ function panelPixel(px, py) {
   return [(px * 3 + py * 7) & 0xff, (px * 5 + py * 11) & 0xff, (px * 9 + py * 13) & 0xff]
 }
 
-/** 一张纯色图 + 指定矩形内涂另一种颜色（验宿主表面底色变化用）。 */
-function makeShot2(w, h, rect, inside) {
+/** 一张纯色图 + 指定矩形内涂另一种颜色（验宿主表面底色变化用）。
+ *  opts.ringColor/ringWidth：改成**只涂矩形外圈 N px**（验"屏蔽内文后外圈仍能检出"）。
+ *  opts.overlay={rect,color}：在主矩形之上再叠一块（验"内文区被屏蔽后改色检不出来"）。 */
+function makeShot2(w, h, rect, inside, opts = {}) {
   const data = Buffer.alloc(w * h * 4)
+  const ringW = opts.ringWidth || 0
+  const ov = opts.overlay
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const o = (y * w + x) * 4
       const inR = x >= rect.x0 && x < rect.x1 && y >= rect.y0 && y < rect.y1
-      const c = inR ? inside : [10, 10, 10]
+      const onRing = ringW > 0 && inR
+        && (x < rect.x0 + ringW || x >= rect.x1 - ringW || y < rect.y0 + ringW || y >= rect.y1 - ringW)
+      let c = onRing ? opts.ringColor : (inR ? inside : [10, 10, 10])
+      if (ov && x >= ov.rect.x0 && x < ov.rect.x1 && y >= ov.rect.y0 && y < ov.rect.y1) c = ov.color
       data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = 255
     }
   }
@@ -360,15 +367,31 @@ console.log('\n— ⑨ 主题/透明度状态的宿主表面锚点（第 3 项�
   // rel 往返：宿主移动后框跟着走
   const g2 = deriveGeom('surface', { w: 1426, h: 807, surface: { l: 466, t: 397, r: 1254, b: 511 } }, g.rel)
   ok('宿主表面右移 10px ⇒ 框跟着走（可迁移）', g2.rect.x0 === 466 && g2.rect.x1 === 1254, JSON.stringify(g2.rect))
-  // 坏例：宿主表面换了个位置**但**没跟着宿主锚点走 ⇒ 必须判差异（证明"跟着锚点"不是碰巧）
+  // 坏例：插件把这个表面的**底色**改了 ⇒ 必须判差异。
+  // ⚠️ 注意内文被屏蔽（见下一条），所以这里改的是**整块**（含外圈）—— 外圈能代表插件改的底色。
   const gBase = deriveGeom('surface', a)
-  const gStale = { cssWidth: 1426, rect: { x0: 456, y0: 397, x1: 1244, y1: 511 }, masks: [] }
   const imgA = makeShot2(1426, 807, { x0: 456, y0: 397, x1: 1244, y1: 511 }, [40, 40, 40])
   const imgB = makeShot2(1426, 807, { x0: 456, y0: 397, x1: 1244, y1: 511 }, [90, 90, 90])
-  const rBad = compareStableImages(imgA, imgB, 'surface', gBase, gStale)
+  const rBad = compareStableImages(imgA, imgB, 'surface', gBase, gBase)
   ok('★ 宿主表面底色变了（40→90）⇒ 判有差异', rBad.same === false, 'diff=' + rBad.diff)
-  const rSame = compareStableImages(imgA, imgA, 'surface', gBase, gStale)
+  const rSame = compareStableImages(imgA, imgA, 'surface', gBase, gBase)
   ok('同一张图 ⇒ 判一致（对照，证明上面那条来自像素差异）', rSame.same === true, 'diff=' + rSame.diff)
+  // ★ 如实钉住屏蔽的**代价**：内文区（inset 8px 以内）里改色**检不出来** —— 这是有意的，
+  //   因为那块是宿主内容（占位文字/chip），会随"新会话/打开会话"变（实测假回归 1070px/Δ157）。
+  //   插件对该表面只贡献 background/border ⇒ 外圈足够。
+  ok('★ 内文区（屏蔽框内）单独改色检不出来 —— 这是有意的代价，不是泄漏',
+    compareStableImages(
+      makeShot2(1426, 807, { x0: 456, y0: 397, x1: 1244, y1: 511 }, [40, 40, 40]),
+      makeShot2(1426, 807, { x0: 456, y0: 397, x1: 1244, y1: 511 }, [40, 40, 40],
+        { overlay: { rect: { x0: 470, y0: 410, x1: 1230, y1: 500 }, color: [200, 30, 30] } }),
+      'surface', gBase, gBase,
+    ).same === true)
+  ok('★ 但外圈（屏蔽框外）改色必须检出 —— 证明屏蔽没有吃掉插件的影响',
+    compareStableImages(
+      makeShot2(1426, 807, { x0: 456, y0: 397, x1: 1244, y1: 511 }, [40, 40, 40]),
+      makeShot2(1426, 807, { x0: 456, y0: 397, x1: 1244, y1: 511 }, [40, 40, 40], { ringColor: [200, 30, 30], ringWidth: 6 }),
+      'surface', gBase, gBase,
+    ).same === false)
 }
 
 console.log('\n几何回归：' + pass + ' 通过 / ' + fail + ' 失败')

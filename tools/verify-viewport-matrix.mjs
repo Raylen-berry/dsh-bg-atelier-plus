@@ -32,7 +32,7 @@ const MATRIX = [
   { id: 'wide-1600x900@dpr1.1667', w: 1600, h: 900, dpr: BASE_VIEWPORT.dpr, mode: 'fresh' },
   { id: 'small-1180x720@dpr1.25', w: 1180, h: 720, dpr: 1.25, mode: 'fresh' },
   // ② 只换 DPR：沿用现成基准
-  { id: 'dpr1.0-same-css', w: 1426, h: 807, dpr: 1.0, mode: 'reuse', base: 'audit-r26' },
+  { id: 'dpr1.0-same-css', w: 1426, h: 807, dpr: 1.0, mode: 'reuse', base: 'audit-r28' },
 ].filter((c) => !only || c.id.includes(only))
 
 const st = JSON.parse(readFileSync(process.env.DSH_HOME + '/dsh-browser-live/state.json', 'utf8'))
@@ -135,7 +135,7 @@ for (const c of MATRIX) {
 //    把两者混为一谈会变成"通过得理由不对"。
 console.log('\n  — 坏例：视口压到 1180x360（渲染器不吐帧）—')
 if (await applyViewport({ w: 1180, h: 360, dpr: BASE_VIEWPORT.dpr })) {
-  const rBad = await runOracle('compare', 'audit-r26')
+  const rBad = await runOracle('compare', 'audit-r28')
   ok('★ 极端视口下非零退出（不静默判一致）', rBad.code !== 0, 'exit=' + rBad.code)
   const tail = rBad.out.split('\n').map((l) => l.trim()).filter((l) => /✗|❌|超时|拒绝/.test(l)).slice(-2)
   console.log('       实测失败原因: ' + (tail.join(' ; ').slice(0, 150) || '(无)'))

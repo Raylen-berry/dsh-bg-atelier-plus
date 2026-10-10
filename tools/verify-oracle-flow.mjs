@@ -68,6 +68,9 @@ function loadFns({ getFailuresBeforeSuccess = 0, emptyObjectAt = [], initialAuto
 
   const code = `
 ${sliceFn('async function freezeRotation(')}
+// pinWallpaper 现在走"轮询等画面渲染"（waitRenderedWallpaper），必须一并切进来 ——
+// 否则沙箱里 ReferenceError（上一版就是这么挂的：函数签名变了、切名单没跟）。
+${sliceFn('async function waitRenderedWallpaper(')}
 ${sliceFn('async function pinWallpaper(')}
 ${sliceFn('async function restoreRotation(')}
 return { freezeRotation, pinWallpaper, restoreRotation };
@@ -86,6 +89,9 @@ return { freezeRotation, pinWallpaper, restoreRotation };
   const sandbox = {
     JSON, Object, Array, String, Number, Boolean, Math, Promise, Error, isFinite, console: { log: (...a) => logs.push(a.join(' ')), error: (...a) => logs.push('ERR:' + a.join(' ')) },
     sleep: async () => {},                       // 不真等
+    // 时间快进：waitRenderedWallpaper 用 Date.now() 判超时，而 sleep 是空的 ——
+    // 不虚拟时间的话，"渲染不匹配"的场景会**真转 15 秒**才失败。
+    Date: { now: (() => { let t = 1e12; return () => (t += 6000) })() },
     cdpSend: null,                                // 由 readState 桩替代
     __writes: writes,
     __settings: settings,
@@ -96,8 +102,10 @@ return { freezeRotation, pinWallpaper, restoreRotation };
     //    按第 N 次 GET 计（1 起），便于精确命中"freeze 的那次"或"pin 内部的那次"。
     __emptyObjectAt: Array.isArray(emptyObjectAt) ? emptyObjectAt.slice() : [],
     __renderedOverride: renderedOverride,
-    // restoreRotation 里引用的模块级标志（本次是否切换过底图）——沙箱必须提供，否则 ReferenceError
+    // restoreRotation 里引用的模块级标志 —— 沙箱必须提供，否则 ReferenceError
     wallpaperSwitched: !!wallpaperSwitched,
+    // 钉过图也必须还原用户底图（pinWallpaper 成功时会把它置 true）
+    wallpaperPinned: false,
     themeSwitched: false,   // 主题/透明度状态是否改过设置（本套件不涉及）
     log: () => {},
   }
@@ -117,6 +125,14 @@ return { freezeRotation, pinWallpaper, restoreRotation };
         file: wf,
         rendered,
       })
+    }
+    // ⚠️ 还有一个**纯渲染**读取（waitRenderedWallpaper 用的，不含 __bgaStateProbe）。
+    //    桩必须也答它 —— 否则它落到设置分支、拿不到 rendered、轮询到超时 ⇒ 钉图判失败（A2 假失败）。
+    if (/::before/.test(expr)) {
+      const wf = sandbox.__settings.wallpaper ? sandbox.__settings.wallpaper.file : null
+      const rendered = sandbox.__renderedOverride != null ? sandbox.__renderedOverride
+        : ('url("http://x/bga/wallpapers/' + (wf ? encodeURIComponent(wf) : '') + '")')
+      return JSON.stringify({ rendered })
     }
     const isPut = /method:\s*'PUT'/.test(expr)
     if (isPut) {

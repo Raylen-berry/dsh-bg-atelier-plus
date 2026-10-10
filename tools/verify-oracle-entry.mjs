@@ -160,7 +160,13 @@ function makeServer(cfg) {
         }
         if (/getComputedStyle\(document\.body,\s*'::before'\)/.test(e)) {
           const wf = state.settings.wallpaper && state.settings.wallpaper.file
-          return val(JSON.stringify({ rendered: 'url("http://x/bga/wallpapers/' + (wf ? encodeURIComponent(wf) : '') + '")' }))
+          // ⚠️ `renderWrong` 必须在这里也生效：pinWallpaper 的渲染确认现在走**轮询**
+          //    （waitRenderedWallpaper，读的就是这条纯渲染表达式）。不在这儿生效的话，
+          //    S11 会拿到"正确的那张"⇒ 轮询立刻命中 ⇒ 本该拒绝的场景反而 exit 0（实测踩过）。
+          const rendered = cfg.renderWrong
+            ? 'url("http://x/bga/wallpapers/' + encodeURIComponent('WRONG.png') + '")'
+            : 'url("http://x/bga/wallpapers/' + (wf ? encodeURIComponent(wf) : '') + '")'
+          return val(JSON.stringify({ rendered }))
         }
         if (/vb-backdrop/.test(e)) {
           state.sawPrepare++

@@ -104,14 +104,30 @@ for (const s of manifest.states) {
   }
 
   // ① 比较区内的小变化：必须抓到（这是"不放水"的核心证据）
-  // 找一个不在任何屏蔽框里的中心点，避免"其实落在屏蔽区"的假失败
-  const inAnyMask = (x, y) => masked.some(([x0, y0, x1, y1]) => x >= x0 && x < x1 && y >= y0 && y < y1)
-  let midX = Math.round((px.x0 + px.x1) / 2), midY = Math.round((px.y0 + px.y1) / 2)
-  for (let k = 0; k < 200 && inAnyMask(midX, midY); k++) { midY += 20; if (midY > px.y1 - 12) { midY = px.y0 + 10; midX += 20 } }
-  const small = paint(img, midX, midY, midX + 10, midY + 10, [255, 0, 255])
-  const rSmall = wouldDetect(img, small, s.name, g)
-  ok('比较区内 10×10 小变化被抓到（px ' + midX + ',' + midY + '）', rSmall.detected,
-    rSmall.detected ? rSmall.diff + ' 像素' : '**漏检**')
+  // 找一个**整块 10×10 都落在比较框内、且不与任何屏蔽框相交**的位置。
+  // ⚠️ 旧写法是"从中心点开始，落在屏蔽里就 +20 挪"，它有两个坑（本轮都踩到了）：
+  //    · 只判 y 越界、不判 x ⇒ 会一路挪到**框外**（实测 png 侧 x=1452 而框到 1451），
+  //      于是在框外植入变化 ⇒ 当然"漏检"，是**测试自己位置选错**；
+  //    · 07/08 主体表面现在**只比外圈 8px、内文整块屏蔽** ⇒ 10×10 的补丁在框内
+  //      **根本放不下**。这时正确做法是**如实跳过这一条**，不是报漏检（那是把有意的盲区当缺陷）。
+  const inAnyMask = (x, y) => masked.some(([x0, y0, x1, y1]) => x < x1 && x + 10 > x0 && y < y1 && y + 10 > y0)
+  let spot = null
+  for (let y = px.y0; y <= px.y1 - 10 && !spot; y += 8) {
+    for (let x = px.x0; x <= px.x1 - 10; x += 8) {
+      if (!inAnyMask(x, y)) { spot = { x, y }; break }
+    }
+  }
+  if (!spot) {
+    console.log('  ⏭️  ' + s.name + '：比较区去掉屏蔽框后**放不下 10×10**（只剩一圈窄边）⇒ 本条不适用，跳过')
+  } else {
+    const small = paint(img, spot.x, spot.y, spot.x + 10, spot.y + 10, [255, 0, 255])
+    const rSmall = wouldDetect(img, small, s.name, g)
+    ok('比较区内 10×10 小变化被抓到（px ' + spot.x + ',' + spot.y + '）', rSmall.detected,
+      rSmall.detected ? rSmall.diff + ' 像素' : '**漏检**')
+  }
+
+  const midY = spot ? spot.y : Math.round((px.y0 + px.y1) / 2)   // 后面的"框外植入"还要用
+  const midX = spot ? spot.x : Math.round((px.x0 + px.x1) / 2)
 
   // ①b 屏蔽框内植入变化 ⇒ **应抓不到**（如实记录这个缺口，别假装没有）
   // ⚠️ 补丁必须**完全落在框内**。第一版固定涂 60×40 并以框心为中心，遇到 01/02 那个

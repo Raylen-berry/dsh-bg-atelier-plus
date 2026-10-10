@@ -310,12 +310,21 @@ export function deriveGeom(hostKind, a, rel) {
           [rect.x0 + x0, rect.y0 + y0, rect.x0 + x1, rect.y0 + y1]),
       }
     }
-    // 录制：整块宿主表面都收，四周不外扩（紧贴它，避免卷进周围会变的对话内容）
+    // 录制：只比这个宿主表面的**外圈**，内文整块屏蔽。
+    // ⚠️ 为什么（实测）：`[data-composer-card]` 是宿主输入框容器，里面是**宿主内容**
+    //    （占位文字、上下文 chip），会随"新会话 / 打开会话"变化 —— 实测同属首页状态，
+    //    点一次"新会话"后这块就报 1070px/Δ157 的**假回归**。
+    //    插件对这个表面只贡献 background/border（client.js 的
+    //    body[data-ds-dark-theme] [data-composer-card]{background:…}）⇒ **外圈足够反映插件影响**，
+    //    内文是会变的宿主内容，应当屏蔽。这不降低对插件的灵敏度：插件改的是底色，
+    //    底色在外圈同样可见（垫底/透明度机制不变）。
     const rect = { x0: host.l, y0: host.t, x1: host.r, y1: host.b }
-    const relMasks = []
+    const INSET = 8
+    const inner = [[rect.x0 + INSET, rect.y0 + INSET, rect.x1 - INSET, rect.y1 - INSET]]
+    const relMasks = inner.map(([x0, y0, x1, y1]) => [x0 - rect.x0, y0 - rect.y0, x1 - rect.x0, y1 - rect.y0])
     return {
-      cssWidth, hostKind: 'surface', host, rect, masks: [],
-      rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, w: rect.x1 - rect.x0, h: rect.y1 - rect.y0, masks: relMasks },
+      cssWidth, hostKind: 'surface', host, rect, masks: inner,
+      rel: { left: 0, top: 0, right: 0, bottom: 0, w: rect.x1 - rect.x0, h: rect.y1 - rect.y0, masks: relMasks },
     }
   }
   // 01/02：宿主锚点 = 左侧栏列

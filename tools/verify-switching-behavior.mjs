@@ -115,6 +115,52 @@ async function fxCssPresent() {
   try { return JSON.parse(raw) } catch { return null }
 }
 
+/**
+ * 确保**打开着一个会话** —— 动效节点注入在宿主 slot `conversation.composer.dock`（client.js:3105），
+ * 而首页/「新会话」页那个 slot 不挂 ⇒ 动效节点恒为 0。实测：点开一个真会话后节点数 41、且位置在变。
+ *
+ * 怎么认出"真会话"（**不写死工作区名字**，否则换个环境就失效）：侧栏是虚拟化树
+ * `[role="treeitem"]`，会话行**自带相对时间**（"刚刚 / 5天 / 12天"），工作区分组行没有。
+ * 判据用"文本里带相对时间"，而不是"名字不等于 ChatGPT/DeepSeek"。
+ * 顺带跳过"新会话"（它没有时间标记，天然被排除）。
+ */
+async function ensureConversationOpen() {
+  const has = await ev(`document.querySelectorAll('[class*="_bubble"]').length`)
+  if (typeof has === 'number' && has > 0) return 'already'
+  const clicked = await ev(`(()=>{
+    const TIME=/(刚刚|[0-9]+\\s*(秒|分钟|小时|天|周|月)前?)\\s*$/;
+    const items=[...document.querySelectorAll('[role="treeitem"]')];
+    const cand=items.find(e=>{const t=String(e.textContent||'').trim(); return t && t.length<80 && TIME.test(t)});
+    if(!cand) return 'no-session';
+    cand.click();
+    return 'clicked:'+String(cand.textContent||'').trim().slice(0,26)})()`)
+  await sleep(4200)
+  const now = await ev(`document.querySelectorAll('[class*="_bubble"]').length`)
+  return clicked + ' bubbles=' + now
+}
+/** 记录用户当前在看的那个条目（可能就是「新会话」页），收尾还原用。 */
+async function selectedTreeItemText() {
+  const t = await ev(`(()=>{const e=document.querySelector('[role="treeitem"][aria-selected="true"]');
+    return e?String(e.textContent||'').trim().slice(0,60):''})()`)
+  return typeof t === 'string' ? t : ''
+}
+async function restoreSelectedTreeItem(text) {
+  if (!text) return 'no-record'
+  const r = await ev(`(()=>{const want=${JSON.stringify(text)};
+    const items=[...document.querySelectorAll('[role="treeitem"]')];
+    const e=items.find(x=>String(x.textContent||'').trim().slice(0,60)===want);
+    if(e){ e.click(); return 'clicked' }
+    // 兜底：侧栏是虚拟化树，"新会话"那一行可能已经不在树里（它不是稳定条目）。
+    // 这时用应用自己的"新会话"按钮回同一个视图 —— 目标一致：把用户看到的页面还回去。
+    if(/^新会话/.test(want)){
+      const b=[...document.querySelectorAll('button')].find(x=>/新会话/.test(String(x.textContent||'')));
+      if(b){ b.click(); return 'clicked-newsession-button' }
+    }
+    return 'not-found'})()`)
+  await sleep(2500)
+  return r
+}
+
 console.log('=== 第 6 项「切换与动效」功能验收（真机）===\n')
 
 // ⚠️ **前置：页面必须"可见且聚焦"**。插件在后台/失焦时**故意**不装轮播定时器
@@ -144,6 +190,7 @@ if (!snapshot || typeof snapshot !== 'object') {
   console.error('读不到当前设置 ⇒ 为安全起见直接退出（绝不盲写）')
   ws.close(); process.exit(4)
 }
+const viewedBefore = await selectedTreeItemText()   // 用户当前在看的侧栏条目（收尾还原）
 const fieldCount0 = Object.keys(snapshot).length
 console.log('  设置快照: ' + fieldCount0 + ' 字段, wallpaper=' +
   (snapshot.wallpaper ? snapshot.wallpaper.cat + '/' + snapshot.wallpaper.file : 'null') +
@@ -192,8 +239,11 @@ try {
 
   // ---------------------------------------------------------------- ④ 动效（不依赖轮播，先跑省时间）
   console.log('\n— ④ 动效：开着要真在动，关掉后不许残留 —')
+  // 每次 reload 之后都要重新打开会话：reload 会回到首页，composer dock 那个 slot 就不挂了
+  await ensureConversationOpen()
   await writeSettings({ ...snapshot, wallpaper: B, effect: 'firefly', autoOn: false })
   await reload()
+  console.log('     打开会话: ' + await ensureConversationOpen())
   const fx1 = await fxSample()
   await sleep(1600)
   const fx2 = await fxSample()
@@ -204,6 +254,7 @@ try {
       '第一次 ' + JSON.stringify(fx1.pos.slice(0, 2)) + ' 第二次 ' + JSON.stringify(fx2.pos.slice(0, 2)))
     await writeSettings({ ...snapshot, wallpaper: B, effect: 'off', autoOn: false })
     await reload()
+    await ensureConversationOpen()
     const fxOff = await fxSample()
     ok('★ effect=off ⇒ 装饰节点不残留（数量为 0）', fxOff.count === 0, 'count=' + fxOff.count)
     const fxOff2 = await fxSample()
@@ -265,8 +316,18 @@ try {
 } finally {
   // ---------------------------------------------------------------- 还原用户状态
   console.log('\n— 还原用户状态 —')
-  const nowBack = snapshot
-  const wrote = await writeSettings(nowBack)
+  // ⚠️ **两段式还原**：先连 autoOn 一起关掉再写快照，确认底图落定后再把原来的 autoOn 还回去。
+  //    为什么：单段还原时，如果用户原本开着轮播（autoOn=true），还原瞬间轮播就可能**立刻又换一张**
+  //    并落盘 —— 实测踩到：跑完套件后用户底图变成了套件用的标记图，
+  //    而我把标记图卸载之后就变成"底图指向不存在的文件"（8 个状态全未就绪）。
+  //    先关轮播再还原，就把这个竞态窗口消掉了。
+  const restoreWith = { ...snapshot, autoOn: false }
+  const wroteQuiet = await writeSettings(restoreWith)
+  await reload()
+  const mid = await readSettings()
+  const wpOk = !!(mid && JSON.stringify(mid.wallpaper) === JSON.stringify(snapshot.wallpaper))
+  if (!wpOk) console.error('     ⚠️ 关轮播后写快照，底图仍未对上（继续走完并如实报出）')
+  const finalOk = await writeSettings(snapshot)   // 把原来的 autoOn 等一并还回去
   await reload()
   const disk = await readSettings()
   const pb = await probe()
@@ -277,10 +338,18 @@ try {
     '字段 ' + (disk ? Object.keys(disk).length : '?') + '/' + fieldCount0
     + ', wallpaper=' + (disk && disk.wallpaper ? disk.wallpaper.file : 'null')
     + ', autoOn=' + (disk && disk.autoOn) + ', effect=' + (disk && disk.effect))
+  ok('★ 底图对象字段完整（没被写残成 {cat:…}）',
+    !!(disk && disk.wallpaper && disk.wallpaper.file),
+    JSON.stringify(disk && disk.wallpaper).slice(0, 110))
   ok('★ 客户端内存也同步（探针可用且底图一致）',
     !!(pb && snapshot.wallpaper && pb.wallpaper && pb.wallpaper.file === snapshot.wallpaper.file),
     JSON.stringify(pb))
-  if (!wrote) console.error('     ⚠️ 还原写入未确认');
+  if (!wroteQuiet || !finalOk) console.error('     ⚠️ 还原写入未确认');
+  // 把侧栏"当前在看的条目"也还回去（动效那一段为挂 slot 点开了会话）
+  if (viewedBefore) {
+    const rsel = await restoreSelectedTreeItem(viewedBefore)
+    ok('★ 侧栏选中项已还原（' + viewedBefore.slice(0, 22) + '…）', rsel === 'clicked', String(rsel))
+  }
 }
 
 try { await send('Emulation.setFocusEmulationEnabled', { enabled: false }) } catch {}
