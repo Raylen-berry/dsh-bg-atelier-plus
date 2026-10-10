@@ -278,6 +278,41 @@ console.log('\n— ⑦ 插件自身横移必须被检出（不能靠"跟着插�
   ok('正常例：宿主与插件**一起**右移 8px ⇒ 契约通过（不误报）',
     assertLayoutContract(rec, pluginRectRel('studio', aMovedTogether)) === null,
     String(assertLayoutContract(rec, pluginRectRel('studio', aMovedTogether))))
+
+  // ★ 真机矩阵逼出来的一条：**宿主自己变尺寸导致的重排不是错误**。
+  //   实测：视口 807 → 720（宿主变矮），贴底的侧栏 orb 跟着上移 top 724→636（Δ-88）；
+  //   旧判据把 top 也算进契约 ⇒ 把环境变化误判成"插件自身布局错误"。
+  //   新判据：尺寸严格 + 水平(左或右)/垂直(上或下) 各至少一边不变。
+  const sideHost = { l: 0, t: 0, r: 280, b: 807 }
+  const sidePlugin = [{ l: 12, t: 724, r: 40, b: 751 }]
+  const recSide = pluginRectRel('sidebar', { sidebar: sideHost, plugin: sidePlugin })
+  // 宿主变矮 87px，orb 贴底不变（bottom 保持 56）
+  const shorterHost = { l: 0, t: 0, r: 280, b: 720 }
+  const orbMovedUp = [{ l: 12, t: 637, r: 40, b: 664 }]
+  ok('★ 宿主变矮、贴底元素跟着上移(top Δ-87) ⇒ **契约必须通过**（环境变化不是插件错误）',
+    assertLayoutContract(recSide, pluginRectRel('sidebar', { sidebar: shorterHost, plugin: orbMovedUp })) === null,
+    String(assertLayoutContract(recSide, pluginRectRel('sidebar', { sidebar: shorterHost, plugin: orbMovedUp }))))
+  // 反面：宿主尺寸不变、插件自己上移 12px ⇒ 上/下两个间隙都变 ⇒ 必须拒绝
+  const orbShift = [{ l: 12, t: 736, r: 40, b: 763 }]
+  const driftSide = assertLayoutContract(recSide, pluginRectRel('sidebar', { sidebar: sideHost, plugin: orbShift }))
+  ok('★ 宿主不动、插件自己上移 12px ⇒ 契约拒绝（上/下间隙都变）',
+    typeof driftSide === 'string' && /垂直位置漂移/.test(driftSide), String(driftSide))
+  // 反面：宿主不动、插件自己变宽 20px ⇒ 尺寸变了 ⇒ 必须拒绝
+  const orbWider = [{ l: 12, t: 724, r: 60, b: 751 }]
+  const driftW = assertLayoutContract(recSide, pluginRectRel('sidebar', { sidebar: sideHost, plugin: orbWider }))
+  ok('★ 宿主不动、插件自己变宽 20px ⇒ 契约拒绝', typeof driftW === 'string' && /w /.test(driftW), String(driftW))
+
+  // ★ 裁剪框尺寸必须**冻结**、只贴宿主上"内容所靠的那一边"（真机矩阵逼出来）：
+  //   旧写法"四边各按 rel 内缩"会让框跟着宿主一起变大（视口 807→900 时 87→196），
+  //   与基准裁剪尺寸对不上 ⇒ 覆盖校验判"覆盖不足"、八状态全挂。
+  const hostA = { l: 0, t: 0, r: 280, b: 807 }
+  const gCap = deriveGeom('sidebar', { w: 1426, h: 807, sidebar: hostA, plugin: [{ l: 12, t: 724, r: 40, b: 751 }] })
+  const gTall = deriveGeom('sidebar', { w: 1426, h: 900, sidebar: { l: 0, t: 0, r: 280, b: 900 } }, gCap.rel)
+  ok('★ 宿主变高 93px ⇒ 框**高度不变**（87 保持）', (gTall.rect.y1 - gTall.rect.y0) === (gCap.rect.y1 - gCap.rect.y0),
+    '基准 ' + (gCap.rect.y1 - gCap.rect.y0) + ' 变高后 ' + (gTall.rect.y1 - gTall.rect.y0))
+  ok('★ 贴底 band 跟着宿主底边下移（顶边也下移同样的量）',
+    gTall.rect.y0 === gCap.rect.y0 + 93 && gTall.rect.y1 === gCap.rect.y1 + 93,
+    '基准 y' + gCap.rect.y0 + '–' + gCap.rect.y1 + ' 变高后 y' + gTall.rect.y0 + '–' + gTall.rect.y1)
 }
 
 console.log('\n— ⑧ 比较范围缩水必须报"覆盖不足"，不能继续宣称一致 —')

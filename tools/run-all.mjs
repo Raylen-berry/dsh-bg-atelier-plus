@@ -71,6 +71,8 @@ const EXCLUDED = [
   // visual-baseline 共用的比对口径（原来两份实现漂移过，见该文件头部注释）。
   ['tools/audit-oracle-coverage.mjs', 'oracle 覆盖边界审计：需要 baselines/<名称>/ 里的基准图（图不入库）⇒ CI 里没有基准；本机跑 `node tools/audit-oracle-coverage.mjs [基准名]`'],
   ['tools/visual-baseline.mjs', '视觉 oracle：需要 GUI 在 127.0.0.1:19387 跑着 + 已连接的浏览器（走 CDP）⇒ 不是纯离线测试，本机手动跑 capture/compare'],
+  ['tools/verify-viewport-matrix.mjs', '迁移适配真机矩阵：需要 GUI + 浏览器（用 CDP Emulation 改视口/DPR），且依赖已录基准 audit-r26 ⇒ 本机手动跑 `node tools/verify-viewport-matrix.mjs`'],
+  ['tools/make-marker-wallpaper.mjs', '生成"中等尺寸标记图"并装到用户底图目录（04 状态的前置）⇒ 有副作用、不是测试；本机按需跑 `node tools/make-marker-wallpaper.mjs [--remove]`'],
 ]
 
 const ENV = {}

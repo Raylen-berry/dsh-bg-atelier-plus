@@ -213,7 +213,7 @@ export function deriveGeom(hostKind, a, rel) {
     if (!a.dlg) return null
     const host = a.dlg
     if (rel) {
-      const rect = { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom }
+      const rect = rectFromRel(host, rel)
       return {
         cssWidth, hostKind: 'dialog', host, rel, rect,
         // ⚠️ `masks` 的约定是**绝对 CSS 坐标**（extract() 就是这么消费的：先乘 cssScale 再减裁剪框原点）。
@@ -292,7 +292,7 @@ export function deriveGeom(hostKind, a, rel) {
       // masks 一律**绝对 CSS**（别再塞 relMasks —— 那是相对量，见上面 rel 分支的告警）
       masks: absMasks,
       maskedSurfaces, unmaskedSurfaces,
-      rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, masks: relMasks },
+      rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, w: rect.x1 - rect.x0, h: rect.y1 - rect.y0, masks: relMasks },
     }
   }
   // 'surface'：宿主"主体表面"节点（由调用方传入 a.surface，例如 [data-composer-card]）。
@@ -303,7 +303,7 @@ export function deriveGeom(hostKind, a, rel) {
     if (!a.surface) return null
     const host = a.surface
     if (rel) {
-      const rect = { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom }
+      const rect = rectFromRel(host, rel)
       return {
         cssWidth, hostKind: 'surface', host, rel, rect,
         masks: (rel.masks || []).map(([x0, y0, x1, y1]) =>
@@ -315,14 +315,14 @@ export function deriveGeom(hostKind, a, rel) {
     const relMasks = []
     return {
       cssWidth, hostKind: 'surface', host, rect, masks: [],
-      rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, masks: relMasks },
+      rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, w: rect.x1 - rect.x0, h: rect.y1 - rect.y0, masks: relMasks },
     }
   }
   // 01/02：宿主锚点 = 左侧栏列
   if (!a.sidebar) return null
   const host = a.sidebar
   if (rel) {
-    const rect = { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom }
+    const rect = rectFromRel(host, rel)
     return {
       cssWidth, hostKind: 'sidebar', host, rel, rect,
       masks: (rel.masks || []).map(([x0, y0, x1, y1]) =>
@@ -350,12 +350,13 @@ export function deriveGeom(hostKind, a, rel) {
   if (rect.y1 - rect.y0 < 8) return null
   return {
     cssWidth, hostKind: 'sidebar', host, rect, masks: [],
-    rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, masks: [] },
+    rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, w: rect.x1 - rect.x0, h: rect.y1 - rect.y0, masks: [] },
   }
 }
 
 /**
- * 把"插件自己"的矩形换算成**相对宿主**的量（尺寸 + 左/上/下偏移）——布局契约的断言对象。
+ * 把"插件自己"的矩形换算成**相对宿主**的量（尺寸 + 到宿主四边的间隙）——布局契约的断言对象。
+ * 四条间隙都要给：元素可能贴宿主任意一边，判据按"至少一边不变"（见 assertLayoutContract）。
  * pluginKind='studio' 用对话框作宿主；'sidebar' 用侧栏列。
  */
 export function pluginRectRel(pluginKind, a) {
@@ -368,30 +369,78 @@ export function pluginRectRel(pluginKind, a) {
     if (!a.studio) return null
     return {
       w: a.studio.r - a.studio.l, h: a.studio.b - a.studio.t,
-      left: a.studio.l - host.l, top: a.studio.t - host.t, bottom: host.b - a.studio.b,
+      left: a.studio.l - host.l, right: host.r - a.studio.r,
+      top: a.studio.t - host.t, bottom: host.b - a.studio.b,
     }
   }
   const plug = Array.isArray(a.plugin) ? a.plugin : []
   if (!plug.length) return null
   const l = Math.min(...plug.map((p) => p.l)), r = Math.max(...plug.map((p) => p.r))
   const t = Math.min(...plug.map((p) => p.t)), b = Math.max(...plug.map((p) => p.b))
-  return { w: r - l, h: b - t, left: l - host.l, top: t - host.t, bottom: host.b - b }
+  return {
+    w: r - l, h: b - t,
+    left: l - host.l, right: host.r - r,
+    top: t - host.t, bottom: host.b - b,
+  }
 }
 
 /**
  * 布局契约断言：插件自己相对宿主的偏移与录制时相比不许漂（容差 tol CSS px）。
  * 返回 null=通过；字符串=失败原因（带数字，便于定位）。
+ *
+ * 判据（真机矩阵逼出来的）：
+ *   · **尺寸 w/h 必须严格一致**（插件固有布局，与宿主尺寸无关）。
+ *   · 水平方向：`left`（距宿主左边）**或** `right`（距宿主右边）至少一个不变。
+ *   · 垂直方向：`top`（距宿主顶边）**或** `bottom`（距宿主底边）至少一个不变。
+ * 为什么用"或"而不是全部相等：元素可能贴宿主任意一边。实测踩到 —— 侧栏 orb 是**贴底**的，
+ * 视口从 807 变 720（宿主变矮）时它 `top 724→636（Δ-88）`；旧判据把 top 也算进契约，
+ * 于是**把环境变化误判成"插件自身布局错误"**（正是审核方要求区分的那件事）。
+ * 而"宿主没动、插件自己横移 12px"时 left 与 right **同时**变化 ⇒ 仍被拒绝（不会漏检）。
+ *
  * 这条是"可迁移性不许把真错误吃掉"的另一半：rel 负责吸收宿主移动，本函数负责抓住插件移动。
  */
 export function assertLayoutContract(recorded, current, tol = 3) {
   if (!current) return '当前测不到插件自己的元素，无法核对布局契约'
   if (!recorded) return null   // 旧基准没记 ⇒ 不因此失败（调用方另行提示）
   const bad = []
-  for (const k of ['w', 'h', 'left', 'top', 'bottom']) {
-    const d = (current[k] ?? 0) - (recorded[k] ?? 0)
-    if (Math.abs(d) > tol) bad.push(`${k} ${recorded[k]}→${current[k]}（Δ${d > 0 ? '+' : ''}${d}）`)
+  const drift = (k) => (current[k] ?? 0) - (recorded[k] ?? 0)
+  // ① 尺寸：严格
+  for (const k of ['w', 'h']) {
+    if (Math.abs(drift(k)) > tol) bad.push(`${k} ${recorded[k]}→${current[k]}（Δ${drift(k) > 0 ? '+' : ''}${drift(k)}）`)
+  }
+  // ② 水平：贴左或贴右，有一个不变即可
+  const hPinned = Math.abs(drift('left')) <= tol || Math.abs(drift('right')) <= tol
+  if (!hPinned) {
+    bad.push(`水平位置漂移：left ${recorded.left}→${current.left}（Δ${drift('left') > 0 ? '+' : ''}${drift('left')}）`
+      + ` 且 right ${recorded.right}→${current.right}（Δ${drift('right') > 0 ? '+' : ''}${drift('right')}）`)
+  }
+  // ③ 垂直：贴顶或贴底，有一个不变即可
+  const vPinned = Math.abs(drift('top')) <= tol || Math.abs(drift('bottom')) <= tol
+  if (!vPinned) {
+    bad.push(`垂直位置漂移：top ${recorded.top}→${current.top}（Δ${drift('top') > 0 ? '+' : ''}${drift('top')}）`
+      + ` 且 bottom ${recorded.bottom}→${current.bottom}（Δ${drift('bottom') > 0 ? '+' : ''}${drift('bottom')}）`)
   }
   return bad.length ? `插件相对宿主的布局漂移：${bad.join('、')}` : null
+}
+
+/**
+ * 用**录制时冻结的 rel** 重建裁剪框。
+ *
+ * 规则：**尺寸用 rel.w/h 冻结不变**，位置贴宿主上"内容所靠的那一边"（间隙较小的一边）。
+ *
+ * 为什么不能直接"四边各按 rel 内缩"（真机矩阵逼出来的）：那样框的尺寸会**跟着宿主一起变** ——
+ * 视口 807→900 时宿主变高、框跟着变高（87→196），与基准的裁剪尺寸对不上 ⇒ 覆盖校验判"覆盖不足"、
+ * 八状态全挂。而内容（侧栏 orb / 面板）的尺寸是固定的，框就该固定；只有它靠的那条边会随宿主移动。
+ * 贴边选择：左右间隙谁小贴谁、上下间隙谁小贴谁（内容总是挤在宿主某一侧）。
+ */
+function rectFromRel(host, rel) {
+  const w = rel.w != null ? rel.w : (host.r - host.l) - rel.left - rel.right
+  const h = rel.h != null ? rel.h : (host.b - host.t) - rel.top - rel.bottom
+  const pinLeft = (rel.left ?? 0) <= (rel.right ?? 0)
+  const pinTop = (rel.top ?? 0) <= (rel.bottom ?? 0)
+  const x0 = pinLeft ? host.l + rel.left : host.r - rel.right - w
+  const y0 = pinTop ? host.t + rel.top : host.b - rel.bottom - h
+  return { x0, y0, x1: x0 + w, y1: y0 + h }
 }
 
 /** 取本次比对用的几何：调用方实测的 geom 优先，表里常量兜底。 */
