@@ -5,12 +5,22 @@
 // 整体右移 4px。而我把换算锚点 REF_CSS_WIDTH 和 03 的矩形**写死**成那次测量的绝对值，
 // 于是几何核对直接把整个 oracle 判死（exit=4）。
 //
-// 修法不是把常量改成 1426（那只是押注下一次不变），而是**每次从锚点实测推导几何**，
-// 并且基准侧用"录制时实测的那份"、当前侧用"这次实测的那份"分别裁剪。
-// 本套件用两张**合成图**证明这一点：可迁移 + 灵敏度没丢。
+// 修法不是把常量改成 1426（那只是押注下一次不变），而是**每次从锚点实测推导几何**。
+//
+// ⚠️ 但"跟着插件锚点走"又引入了第八轮之后被审核方抓到的**两条新漏检**，本套件把它们
+//    钉成坏例（正常例通过 + 故意弄坏后必须失败）：
+//      ① 插件自身横移 12px（视口与宿主对话框都不变）⇒ 裁剪框跟着插件走 ⇒ 被自动对齐吃掉。
+//         修法：**裁剪框锚在宿主上**（对话框/侧栏列），插件相对宿主的偏移变成**断言对象**
+//         （assertLayoutContract）。本文件 ⑦ 节给出正例与坏例。
+//      ② 比较范围大幅缩水 ⇒ 只比交集、丢掉基准若干行 ⇒ 原本能检出的变化变 diff=0。
+//         修法：compareStableImages 的**覆盖校验**（两侧框不齐 / 与录制尺寸不符 ⇒
+//         coverage.ok=false ⇒ 调用方按"覆盖不足"失败）。本文件 ⑧ 节给出正例与坏例。
 //
 // 用法：node tools/verify-oracle-geometry.mjs
-import { compareStableImages, cropStable, cssScale, deriveGeom } from './oracle-compare.mjs'
+import {
+  compareStableImages, cropStable, cssScale, deriveGeom,
+  pluginRectRel, assertLayoutContract,
+} from './oracle-compare.mjs'
 
 let pass = 0, fail = 0
 const ok = (name, cond, extra = '') => {
@@ -137,14 +147,95 @@ console.log('\n— ⑥ deriveGeom：侧栏必须**以插件自己的元素为锚
   ok('插件元素测不到 ⇒ null（不比宿主装饰冒充覆盖）',
     deriveGeom('01-static-wallpaper', { ...anchors, plugin: [] }) === null)
   ok('侧栏锚点也没有 ⇒ null', deriveGeom('01-static-wallpaper', { w: 1426, h: 807, plugin: [] }) === null)
-  ok('03 缺 studio/dlg ⇒ null', deriveGeom('03-settings-studio', { w: 1426, h: 807 }) === null)
+  ok('03 缺 dlg ⇒ null', deriveGeom('03-settings-studio', { w: 1426, h: 807 }) === null)
+
+  // 03 的屏蔽框 = 壁纸位图表面（hero + 图库缩略图），且**存成相对裁剪框的偏移**
   const g3 = deriveGeom('03-settings-studio', {
-    w: 1426, h: 807, studio: { l: 525, t: 78, r: 1085, b: 1419 }, dlg: { l: 313, t: 24, r: 1113, b: 783 },
+    w: 1426, h: 807, dlg: { l: 313, t: 24, r: 1113, b: 783 },
     hero: { l: 545, t: 148, r: 1059, b: 360 },
+    imgSurfaces: [{ l: 683, t: 748, r: 869, b: 776 }],
   })
-  ok('03 下沿 = min(面板底,对话框底)−7 = 776', g3.rect.y1 === 776, 'y1=' + g3.rect.y1)
-  ok('03 屏蔽框 = hero ±2', JSON.stringify(g3.masks) === JSON.stringify([[543, 146, 1061, 362]]),
+  ok('03 裁剪框 = 对话框内缩 6/4/6/7（锚在宿主上）',
+    JSON.stringify(g3.rect) === JSON.stringify({ x0: 319, y0: 28, x1: 1107, y1: 776 }),
+    JSON.stringify(g3.rect))
+  ok('03 屏蔽框 = hero ±2 + 图库缩略图（共 2 个）', g3.masks.length === 2,
     JSON.stringify(g3.masks))
+  ok('03 屏蔽框是**相对裁剪框**的偏移（宿主移动时跟着走）',
+    JSON.stringify(g3.masks[0]) === JSON.stringify([224, 118, 742, 334]), JSON.stringify(g3.masks[0]))
+}
+
+console.log('\n— ⑦ 插件自身横移必须被检出（不能靠"跟着插件锚点走"自动对齐掉）—')
+{
+  // 审核方第十轮第一条：视口与宿主对话框**都不变**，只让插件横移 12 CSS px ⇒
+  // 上一版把裁剪框锚在插件上，两边各自跟着插件 ⇒ 内容重新对齐 ⇒ same=true、diff=0（漏检）。
+  const DLG = { l: 313, t: 24, r: 1113, b: 783 }
+  const aBase = { w: 1426, h: 807, dlg: DLG, studio: { l: 525, t: 78, r: 1085, b: 1419 },
+    hero: { l: 545, t: 148, r: 1059, b: 360 } }
+  const aShift = { ...aBase, studio: { l: 537, t: 78, r: 1097, b: 1419 } }   // 宿主没动，插件右移 12
+
+  const gBase = deriveGeom('03-settings-studio', aBase)          // 录制：定下 rel
+  ok('录制时记下了相对宿主的内缩量 rel', !!(gBase && gBase.rel), JSON.stringify(gBase && gBase.rel))
+
+  // 比对时用**录制时的 rel** + 当前宿主 ⇒ 框钉在宿主上，不跟插件走
+  const gNowBase = deriveGeom('03-settings-studio', aBase, gBase.rel)
+  const gNowShift = deriveGeom('03-settings-studio', aShift, gBase.rel)
+  ok('★ 宿主不变时，两侧裁剪框**完全一致**（框锚在宿主上，不跟插件漂）',
+    gNowBase.rect.x0 === gNowShift.rect.x0 && gNowBase.rect.x1 === gNowShift.rect.x1,
+    '基准 ' + JSON.stringify(gNowBase.rect) + ' 横移后 ' + JSON.stringify(gNowShift.rect))
+
+  // 像素层面：真实比较函数必须检出这 12px 横移
+  const A = makeShot(1426, 807, 525, 78)      // 面板在 525
+  const B = makeShot(1426, 807, 537, 78)      // 面板挪到 537（同一套图案内容）
+  const r = compareStableImages(A, B, '03-settings-studio', gNowBase, gNowShift)
+  ok('★ 插件横移 12px ⇒ **判有差异**（上一版这里是 diff=0 的漏检）', r.same === false,
+    'same=' + r.same + ' diff=' + r.diff)
+
+  // 反证：手工构造**上一版那种"框跟着插件锚点走"**的几何 ⇒ 就会漏检。
+  // （现在 deriveGeom 无论传不传 rel 都不再跟插件走，所以这里必须手写旧口径才能复现旧行为。）
+  const gFollowA = { cssWidth: 1426, rect: { x0: aBase.studio.l - 6, x1: aBase.studio.r + 4, y0: 74, y1: 678 }, masks: [] }
+  const gFollowB = { cssWidth: 1426, rect: { x0: aShift.studio.l - 6, x1: aShift.studio.r + 4, y0: 74, y1: 678 }, masks: [] }
+  const rFollow = compareStableImages(A, B, '03-settings-studio', gFollowA, gFollowB)
+  ok('反证：框跟着插件走 ⇒ diff=0 漏检（这正是上一版的行为）', rFollow.same === true, 'diff=' + rFollow.diff)
+
+  // 布局契约：插件相对宿主的偏移漂了 12px ⇒ 必须报出来（带数字）
+  const rec = pluginRectRel('studio', aBase)
+  const drift = assertLayoutContract(rec, pluginRectRel('studio', aShift))
+  ok('★ 布局契约抓到"左偏移 212→224（Δ+12）"', typeof drift === 'string' && drift.includes('12'),
+    String(drift))
+  // 正常例：宿主与插件一起随窗口移动 ⇒ 契约不该误报（这正是可迁移要放行的）
+  const aMovedTogether = { ...aBase, dlg: { l: 321, t: 24, r: 1121, b: 783 },
+    studio: { l: 533, t: 78, r: 1093, b: 1419 }, hero: { l: 553, t: 148, r: 1067, b: 360 } }
+  ok('正常例：宿主与插件**一起**右移 8px ⇒ 契约通过（不误报）',
+    assertLayoutContract(rec, pluginRectRel('studio', aMovedTogether)) === null,
+    String(assertLayoutContract(rec, pluginRectRel('studio', aMovedTogether))))
+}
+
+console.log('\n— ⑧ 比较范围缩水必须报"覆盖不足"，不能继续宣称一致 —')
+{
+  // 审核方第十轮第二条：把比较高度缩到 31 个截图像素、丢掉基准 789 行之后，
+  // 原本能检出的 1600 像素变化变成 diff=0、same=true。
+  const A = makeShot(1426, 807, 521, 78)
+  const B = makeShot(1426, 807, 521, 78, { regressAt: [40, 300, 80, 340] })   // 回归点在 ry≈300
+  const gFull = { cssWidth: 1426, rect: { x0: 515, x1: 1085, y0: 74, y1: 678 }, masks: [] }
+  const rFull = compareStableImages(A, B, '03-settings-studio', gFull, gFull, { expectCompared: { width: 570, height: 604 } })
+  ok('正常例：完整范围下 1600 像素变化被检出，且 coverage.ok=true',
+    rFull.same === false && rFull.coverage.ok === true, 'diff=' + rFull.diff)
+
+  // 坏例：当前侧框被缩到 31 行 ⇒ 丢基准 573 行
+  const gShrunk = { cssWidth: 1426, rect: { x0: 515, x1: 1085, y0: 74, y1: 105 }, masks: [] }
+  const rShrunk = compareStableImages(A, B, '03-settings-studio', gFull, gShrunk, { expectCompared: { width: 570, height: 604 } })
+  ok('★ 缩水 ⇒ coverage.ok=false（不再静默判一致）', rShrunk.coverage.ok === false,
+    'reason=' + (rShrunk.coverage.reason || ''))
+  ok('★ 缩水 ⇒ same=false（不会输出"一致"）', rShrunk.same === false, 'same=' + rShrunk.same)
+  ok('★ 缩水原因里写明了高度差与录制尺寸',
+    /高度/.test(rShrunk.coverage.reason || '') && /604/.test(rShrunk.coverage.reason || ''),
+    rShrunk.coverage.reason)
+
+  // 坏例②：两侧**一起**缩水（上面那条查不出来）⇒ 靠"与录制尺寸比"兜住
+  const rBoth = compareStableImages(A, B, '03-settings-studio', gShrunk, gShrunk, { expectCompared: { width: 570, height: 604 } })
+  ok('★ 两侧一起缩水 ⇒ 仍被判覆盖不足（与录制尺寸不符）',
+    rBoth.coverage.ok === false && /录制时 604/.test(rBoth.coverage.reason || ''),
+    rBoth.coverage.reason)
 }
 
 console.log('\n几何回归：' + pass + ' 通过 / ' + fail + ' 失败')

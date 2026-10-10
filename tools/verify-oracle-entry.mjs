@@ -333,6 +333,12 @@ await scenario('S11', { renderWrong: true }, async (port) => {
   ok('S11 钉图未渲染 ⇒ 拒绝录基准（exit 4）', r.code === 4, 'exit=' + r.code)
 })
 
+// ⚠️ 场景抛错时原本会跳过下面的清理 ⇒ 临时基准目录残留在 baselines/ 里（实测漏了 10 个）。
+//    挂一个进程退出钩子，把清理变成"无论怎么退出都执行"。
+const cleanupAll = () => { for (const d of made) { try { cleanupDir(d) } catch { /* noop */ } } }
+process.on('exit', cleanupAll)
+process.on('uncaughtException', (e) => { console.error('  ✗ 未预期异常：' + (e && e.message)); cleanupAll(); process.exit(1) })
+
 for (const d of made) cleanupDir(d)
 
 console.log('\n入口级回归：' + pass + ' 通过 / ' + fail + ' 失败')

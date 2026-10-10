@@ -172,54 +172,128 @@ export function cssScale(img, cssWidth = REF_CSS_WIDTH) {
 /**
  * **纯函数**：从实测锚点推导这一次的比较几何（可离线单测，不依赖页面）。
  *
- * 规则（与真机踩过的坑一一对应）：
- *  · cssWidth = 实测 innerWidth（**不是**写死的 REF_CSS_WIDTH）
- *  · 03：矩形由面板实测矩形推导（左 −6、右 +4、上 −4），
- *        下沿 = min(面板底, 对话框底) − 7（宿主裁剪边的取整碎行，实测 127px/Δ2 全在那两行）
- *        屏蔽框 = .bga-hero 实测矩形 ±2（43MP 预览图跨刷新重采样不稳）
- *  · 01/02：右边界 = **随时间变那一列**（时间/日期标签）的最左 − 1，且不超过侧栏右 − 8；
- *        下沿 = innerHeight − 156（再往下是宿主状态栏实时计数）
- *    ⚠️ volatile 标签的文本实测是 "6分钟"（**没有"前"字**）。调用方按"X天前"匹配会漏掉整列，
- *        于是回落到"侧栏右 − 8"，把时间列圈进比较区 ⇒ "6分钟"→"7分钟" 报 397 像素假回归。
- *  · 锚点缺失 ⇒ 返回 null，由调用方**大声失败**，绝不静默回落到常量去比错地方。
+ * ⚠️ 核心设计（审核方第十轮两条漏检的根因都在这里）：
+ *   **裁剪框必须锚在"宿主容器"上，不能锚在插件自己身上。**
+ *   锚在插件上会发生这种事：视口与宿主对话框都没动、只有插件自己横移 12px ⇒
+ *   两边的裁剪框各自跟着插件走 ⇒ 内容被重新对齐 ⇒ **same=true、diff=0（漏检）**。
+ *   离线复现：跟着插件锚点 diff=0；把框钉在宿主上、同一份图 diff=338400。
+ *
+ *   所以规则是：
+ *     · `rect` = 宿主锚点（对话框 / 左侧栏列）四边**按 rel 内缩**；`rel` 在录制时定下并记进基准；
+ *     · 插件自己的位置/尺寸**不参与裁剪**，而是当作**断言对象**（见 assertLayoutContract）。
+ *   这样"宿主随窗口移动"被 rel 吸收（可迁移成立），"插件自身布局错了"会露成像素差异 +
+ *   布局契约报错，两条都不会被静默吃掉。
+ *
+ * 另：锚点缺失 ⇒ 返回 null，由调用方大声失败，绝不静默回落到常量去比错地方。
+ *
+ * @param stateName 状态名
+ * @param a         本次实测锚点 {w,h,dlg,studio,hero,sidebar,volatile,plugin}
+ * @param rel       **基准录制时**记下的内缩量（比对时传它；录制时传 undefined）
+ *                  形状 {left,top,right,bottom,masks}，masks 是相对裁剪框左上角的 CSS 偏移
  */
-export function deriveGeom(stateName, a) {
+export function deriveGeom(stateName, a, rel) {
   if (!a || !(a.w > 0)) return null
   const cssWidth = a.w
   if (stateName === '03-settings-studio') {
-    if (!a.studio || !a.dlg) return null
+    if (!a.dlg) return null
+    const host = a.dlg
+    if (rel) {
+      return {
+        cssWidth, hostKind: 'dialog', host, rel,
+        rect: { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom },
+        masks: rel.masks || [],
+      }
+    }
+    // 录制：在对话框内缩 6/4/6/7 —— bottom 那 7px 是宿主裁剪边的取整碎行
+    //（实测 127 个 Δ≤2 差异全落在 min(面板底,对话框底) 那两行，属宿主几何边界、非插件内容）
+    const rect = { x0: host.l + 6, y0: host.t + 4, x1: host.r - 6, y1: host.b - 7 }
+    // 屏蔽框 = **壁纸位图表面**（大图预览 hero + 图库缩略图）。
+    // 为什么必须屏蔽：它们把几 MP~43MP 的原图缩到几百 px，**跨刷新重采样不完全可复现** ——
+    // 实测 hero 刷新后 diff=11618/Δ3；图库缩略图带 diff=2185/Δ≤7。这属于浏览器缩放位图的
+    // 非确定性，不是插件逻辑（插件逻辑的变化是几十~几万像素、Δ 常常 >20）。
+    // ⚠️ 这是**明确的盲区**，必须记进文档：屏蔽区内的变化看不见（要覆盖只能另加稳定状态）。
+    const absMasks = []
+    if (a.hero) absMasks.push([a.hero.l - 2, a.hero.t - 2, a.hero.r + 2, a.hero.b + 2])
+    for (const s of (Array.isArray(a.imgSurfaces) ? a.imgSurfaces : [])) {
+      absMasks.push([s.l, s.t, s.r, s.b])
+    }
+    // 屏蔽框存成**相对裁剪框**的偏移 ⇒ 宿主移动时它跟着走，不会因为绝对坐标漂移而遮错地方
+    const relMasks = absMasks.map(([x0, y0, x1, y1]) => [x0 - rect.x0, y0 - rect.y0, x1 - rect.x0, y1 - rect.y0])
     return {
-      cssWidth,
-      rect: {
-        x0: a.studio.l - 6, x1: a.studio.r + 4,
-        y0: a.studio.t - 4, y1: Math.min(a.studio.b, a.dlg.b) - 7,
-      },
-      masks: a.hero ? [[a.hero.l - 2, a.hero.t - 2, a.hero.r + 2, a.hero.b + 2]] : [],
+      cssWidth, hostKind: 'dialog', host, rect, masks: relMasks,
+      rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, masks: relMasks },
     }
   }
+  // 01/02：宿主锚点 = 左侧栏列
+  if (!a.sidebar) return null
+  const host = a.sidebar
+  if (rel) {
+    return {
+      cssWidth, hostKind: 'sidebar', host, rel,
+      rect: { x0: host.l + rel.left, y0: host.t + rel.top, x1: host.r - rel.right, y1: host.b - rel.bottom },
+      masks: rel.masks || [],
+    }
+  }
+  // 录制：右边界要避开**随时间变**的那一列
+  // ⚠️ volatile 标签实测文本是 "6分钟"（**没有"前"字**）。按"X天前"匹配会漏掉整列，
+  //    回落到"侧栏右−8"就会把时间列圈进比较区 ⇒ "6分钟"→"7分钟" 报 397 像素假回归。
   const vol = Array.isArray(a.volatile) ? a.volatile : []
   const volLeft = vol.length ? Math.min(...vol.map((v) => v.l)) : null
-  const bySidebar = a.sidebar ? a.sidebar.r - 8 : null
-  const x1 = Math.min(volLeft != null ? volLeft - 1 : Infinity, bySidebar != null ? bySidebar : Infinity)
-  if (!Number.isFinite(x1)) return null
-  // 纵向：**以插件自己画出来的元素为锚**（orb / dock 特效），上下各留 24px 让周围被染色/
-  // 透出壁纸的区域也参与。
-  // ⚠️ 以前这里写成"0 到 innerHeight-156"，纯粹按视口高度切 —— 结果插件的 orb（实测
-  //   CSS y724–751）落在区域**之外**，01/02 比的全是宿主装饰，插件一个像素都没比到。
-  //   而且会话行的"进行中"旋转指示器（宿主 SVG 动画）会被圈进来，每轮报 ~130px 假差异。
+  const x1 = volLeft != null ? Math.min(volLeft - 1, host.r - 8) : host.r - 8
+  // 纵向覆盖到插件自己画的东西（orb / dock 特效），上下各留 24px 把周围透出壁纸的区域也带上。
+  // ⚠️ 以前按视口高度切 y0..h-156 ⇒ 插件 orb（实测 CSS y724–751）整个落在区域**之外**，
+  //    那两张状态比的全是宿主装饰（审核方第九/十轮都点到这个覆盖问题）。
+  //    注意：这里用插件元素**决定覆盖范围**，但**比对时**框由 rel 重建 —— 覆盖范围不是锚点。
   const plug = Array.isArray(a.plugin) ? a.plugin : []
   if (!plug.length) return null
   const pTop = Math.min(...plug.map((p) => p.t))
   const pBot = Math.max(...plug.map((p) => p.b))
-  const y0 = Math.max(0, pTop - 24)
-  const y1 = Math.min(Math.max(a.h - 8, pBot + 2), pBot + 24)
-  if (y1 - y0 < 8) return null
-  return {
-    cssWidth,
-    rect: { x0: 0, x1: Math.max(40, Math.round(x1)), y0: Math.round(y0), y1: Math.round(y1) },
-    masks: [],
-    pluginAnchored: true,
+  const rect = {
+    x0: host.l, x1: Math.max(host.l + 40, Math.round(x1)),
+    y0: Math.max(0, pTop - 24), y1: Math.min(host.b, pBot + 24),
   }
+  if (rect.y1 - rect.y0 < 8) return null
+  return {
+    cssWidth, hostKind: 'sidebar', host, rect, masks: [],
+    rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, masks: [] },
+  }
+}
+
+/**
+ * 把"插件自己"的矩形换算成**相对宿主**的量（尺寸 + 左/上/下偏移）——布局契约的断言对象。
+ * pluginKind='studio' 用对话框作宿主；'sidebar' 用侧栏列。
+ */
+export function pluginRectRel(pluginKind, a) {
+  const host = pluginKind === 'studio' ? a.dlg : a.sidebar
+  if (!host) return null
+  if (pluginKind === 'studio') {
+    if (!a.studio) return null
+    return {
+      w: a.studio.r - a.studio.l, h: a.studio.b - a.studio.t,
+      left: a.studio.l - host.l, top: a.studio.t - host.t, bottom: host.b - a.studio.b,
+    }
+  }
+  const plug = Array.isArray(a.plugin) ? a.plugin : []
+  if (!plug.length) return null
+  const l = Math.min(...plug.map((p) => p.l)), r = Math.max(...plug.map((p) => p.r))
+  const t = Math.min(...plug.map((p) => p.t)), b = Math.max(...plug.map((p) => p.b))
+  return { w: r - l, h: b - t, left: l - host.l, top: t - host.t, bottom: host.b - b }
+}
+
+/**
+ * 布局契约断言：插件自己相对宿主的偏移与录制时相比不许漂（容差 tol CSS px）。
+ * 返回 null=通过；字符串=失败原因（带数字，便于定位）。
+ * 这条是"可迁移性不许把真错误吃掉"的另一半：rel 负责吸收宿主移动，本函数负责抓住插件移动。
+ */
+export function assertLayoutContract(recorded, current, tol = 3) {
+  if (!current) return '当前测不到插件自己的元素，无法核对布局契约'
+  if (!recorded) return null   // 旧基准没记 ⇒ 不因此失败（调用方另行提示）
+  const bad = []
+  for (const k of ['w', 'h', 'left', 'top', 'bottom']) {
+    const d = (current[k] ?? 0) - (recorded[k] ?? 0)
+    if (Math.abs(d) > tol) bad.push(`${k} ${recorded[k]}→${current[k]}（Δ${d > 0 ? '+' : ''}${d}）`)
+  }
+  return bad.length ? `插件相对宿主的布局漂移：${bad.join('、')}` : null
 }
 
 /** 取本次比对用的几何：调用方实测的 geom 优先，表里常量兜底。 */
@@ -293,7 +367,19 @@ export function stableFrom(file, stateName, geom) {
  *
  * 接受**内存里的图像对象**（不是文件），这样调用方可以先改像素再比 —— 审计脚本要植入变化。
  */
-export function compareStableImages(imgA, imgB, stateName, geomA, geomB) {
+/**
+ * 跨 DPI / 跨窗口比对。
+ *
+ * ⚠️ **覆盖不许静默缩水**（审核方第十轮第二条漏检）：
+ *   上一版直接 `w=min(boxA.w,boxB.w), h=min(boxA.h,boxB.h)` 拿交集比，
+ *   且没有任何下限 ⇒ 把当前比较高度缩到 31 个截图像素、丢掉基准 789 行之后，
+ *   原本能检出的 1600 像素变化变成 **diff=0、same=true**，还照样宣称"一致"。
+ *   离线复现：正常范围 diff=1600（检出）；缩到 31 行 diff=0（漏检），dropped 记了 573 行却没人看。
+ *
+ *   现在：两侧框不齐 ⇒ 直接判 `coverage.ok=false` 并**列出缺在哪**；
+ *   再由调用方把"覆盖不足"当**失败**报出去（非零退出），而不是当"一致"。
+ */
+export function compareStableImages(imgA, imgB, stateName, geomA, geomB, opts2 = {}) {
   const opts = { tolerance: PIXEL_TOLERANCE, maxDiffRatio: 0, allowScale: false }
   const gA = resolveGeom(stateName, geomA)
   const gB = resolveGeom(stateName, geomB)
@@ -308,26 +394,49 @@ export function compareStableImages(imgA, imgB, stateName, geomA, geomB) {
     B = resizePixels(imgB, Math.max(1, Math.round(gB.cssWidth * S)), Math.max(1, Math.round(imgB.height * S / scB)))
     resampled = true
   }
-  // 各自按**自己的实测锚点**取框。窗口尺寸不同会让两个框差 ≤2px ⇒ 取交集比，
-  // 放弃的只是右/下边缘一两条线（在结果里如实报 dropped，不藏着）。
   const boxA = deviceBox(A, gA.rect, gA.cssWidth)
   const boxB = deviceBox(B, gB.rect, gB.cssWidth)
-  const w = Math.min(boxA.w, boxB.w), h = Math.min(boxA.h, boxB.h)
+
+  // —— 覆盖校验（三条，任何一条不过就是"覆盖不足"，不是"一致"）——
+  const COVER_TOL = Number(opts2.coverTol || 2)          // 允许的像素级抖动
+  const problems = []
+  if (Math.abs(boxA.w - boxB.w) > COVER_TOL) problems.push(`宽度 ${boxA.w} vs ${boxB.w}`)
+  if (Math.abs(boxA.h - boxB.h) > COVER_TOL) problems.push(`高度 ${boxA.h} vs ${boxB.h}`)
+  // 与基准**录制时记下的**比较尺寸比（防止两侧一起缩水 —— 那种情况上面两条查不出来）
+  const exp = opts2.expectCompared
+  if (exp && exp.width > 0 && exp.height > 0) {
+    if (Math.abs(boxA.w - exp.width) > COVER_TOL) problems.push(`基准侧宽度 ${boxA.w} ≠ 录制时 ${exp.width}`)
+    if (Math.abs(boxA.h - exp.height) > COVER_TOL) problems.push(`基准侧高度 ${boxA.h} ≠ 录制时 ${exp.height}`)
+  }
+  if (problems.length) {
+    return {
+      same: false, diff: -1, total: -1, ratio: 0, maxChannelDelta: 0,
+      resampled, tolerance: PIXEL_TOLERANCE,
+      coverage: { ok: false, reason: problems.join('；'), boxA, boxB, expected: exp || null },
+      compared: { width: Math.min(boxA.w, boxB.w), height: Math.min(boxA.h, boxB.h) },
+      dropped: { a: { w: boxA.w - Math.min(boxA.w, boxB.w), h: boxA.h - Math.min(boxA.h, boxB.h) },
+                 b: { w: boxB.w - Math.min(boxA.w, boxB.w), h: boxB.h - Math.min(boxA.h, boxB.h) } },
+      sizedFrom: { a: { width: imgA.width, height: imgA.height }, b: { width: imgB.width, height: imgB.height } },
+    }
+  }
+
+  const w = boxA.w, h = boxA.h
   const cropA = extract(A, { x0: boxA.x0, y0: boxA.y0, w, h }, gA.masks, gA.cssWidth)
   const cropB = extract(B, { x0: boxB.x0, y0: boxB.y0, w, h }, gB.masks, gB.cssWidth)
   const cmp = comparePngEither(encodePng(cropA), encodePng(cropB), opts)
   return {
     ...cmp, resampled, tolerance: PIXEL_TOLERANCE,
+    coverage: { ok: true, boxA, boxB, expected: exp || null },
     compared: { width: w, height: h },
-    dropped: { a: { w: boxA.w - w, h: boxA.h - h }, b: { w: boxB.w - w, h: boxB.h - h } },
+    dropped: { a: { w: 0, h: 0 }, b: { w: 0, h: 0 } },
     sizedFrom: { a: { width: imgA.width, height: imgA.height }, b: { width: imgB.width, height: imgB.height } },
   }
 }
 
 /** 便捷：直接吃两个文件路径。geomA/geomB 分别是**各自那一次运行**实测出的几何。 */
-export function compareStableFiles(baseFile, nowFile, stateName, geomA, geomB) {
+export function compareStableFiles(baseFile, nowFile, stateName, geomA, geomB, opts2) {
   return compareStableImages(
-    decodePng(fs.readFileSync(baseFile)), decodePng(fs.readFileSync(nowFile)), stateName, geomA, geomB)
+    decodePng(fs.readFileSync(baseFile)), decodePng(fs.readFileSync(nowFile)), stateName, geomA, geomB, opts2)
 }
 
 /** 在图上涂一块纯色（审计用来"植入一个已知变化"）。 */

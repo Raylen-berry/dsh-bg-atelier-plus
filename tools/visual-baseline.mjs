@@ -250,13 +250,14 @@ async function readState(expr) {
 // 现在两边都 import 同一份，不再有第二份实现。
 import {
   STABLE_RECT_BY_STATE, MASK_RECTS, REF_CSS_WIDTH, PIXEL_TOLERANCE, EXPECT_GEOMETRY,
-  compareStableFiles, compareStableImages, paint, cssScale, deriveGeom,
+  compareStableFiles, compareStableImages, paint, cssScale, deriveGeom, cropStable,
+  pluginRectRel, assertLayoutContract,
   rotationRestoreNeed, judgeRotationRestore, isValidSettings,
 } from './oracle-compare.mjs'
 
 // 本文件内部沿用旧名字，避免大改调用点
-function compareStable(baseFile, nowFile, stateName, geomBase, geomNow) {
-  return compareStableFiles(baseFile, nowFile, stateName, geomBase, geomNow)
+function compareStable(baseFile, nowFile, stateName, geomBase, geomNow, opts2) {
+  return compareStableFiles(baseFile, nowFile, stateName, geomBase, geomNow, opts2)
 }
 /** 关掉 dsh-browser-live 的观察窗（它实时镜像页面，是不确定性的主源）。 */
 async function closeObserver(log) {
@@ -655,6 +656,15 @@ async function cleanupEnvironment(log) {
   return true
 }
 
+/** 这次**实际参与比较**的设备像素尺寸（录制时算一次存进基准，比对时用来查覆盖缩水）。 */
+function comparedBoxOf(geom, pngBase64, stateName) {
+  try {
+    const img = decodePng(Buffer.from(pngBase64, 'base64'))
+    const c = cropStable(img, stateName, geom)
+    return { width: c.width, height: c.height }
+  } catch { return null }
+}
+
 /**
  * 在**运行时**从实测锚点导出这一次比对的几何（CSS 矩形 + 屏蔽框 + CSS 视口宽）。
  *
@@ -670,7 +680,7 @@ async function cleanupEnvironment(log) {
  *     下沿 = innerHeight − 156（再往下是宿主状态栏的实时计数），都相对实测视口推导
  *   锚点拿不到 ⇒ 返回 null，由调用方**大声失败**，绝不回落到写死常量去比错地方。
  */
-async function measureLiveGeom(stateName, log) {
+async function measureLiveGeom(stateName, log, rel) {
   const raw = await readState(`(()=>{
     const R=(e)=>{ if(!e) return null; const b=e.getBoundingClientRect();
       return {l:Math.round(b.left),t:Math.round(b.top),r:Math.round(b.right),b:Math.round(b.bottom)} };
@@ -713,28 +723,52 @@ async function measureLiveGeom(stateName, log) {
         });
         return out.slice(0, 40);
       })(),
+      // **壁纸位图表面**：大图预览 + 图库缩略图。它们是把几 MP~43MP 的原图缩到几百 px，
+      // 跨刷新（我们会 reload）重采样结果不完全一致 —— 实测：hero 刷新后 diff=11618/Δ3；
+      // 图库缩略图带 diff=2185/Δ≤7。属"浏览器缩放同一张位图不完全可复现"，不是插件逻辑。
+      // 记下它们的矩形（**裁到对话框内**），由 deriveGeom 转成屏蔽框 —— 与 hero 的处理同源。
+      imgSurfaces: (()=>{
+        const dlg=document.querySelector('[role="dialog"]');
+        const db=dlg?dlg.getBoundingClientRect():null;
+        const out=[];
+        document.querySelectorAll('.bga-hero-image,.bga-picture-image').forEach(e=>{
+          const b=e.getBoundingClientRect(); const cs=getComputedStyle(e);
+          if(b.width<4||b.height<4) return;
+          if(cs.display==='none'||cs.visibility==='hidden') return;
+          let l=b.left,t=b.top,r=b.right,bo=b.bottom;
+          if(db){ l=Math.max(l,db.left); t=Math.max(t,db.top); r=Math.min(r,db.right); bo=Math.min(bo,db.bottom); }
+          if(r-l<4||bo-t<4) return;                       // 被对话框裁得看不见就不算
+          out.push({l:Math.round(l),t:Math.round(t),r:Math.round(r),b:Math.round(bo)});
+        });
+        return out.slice(0, 60);
+      })(),
     });
   })()`)
   let a = null
   try { a = JSON.parse(raw) } catch { a = null }
-  // 规则本身是**纯函数** deriveGeom()（在 oracle-compare.mjs，可离线单测）；
-  // 这里只负责把锚点量回来。
-  const g = deriveGeom(stateName, a)
+  // 规则本身是**纯函数** deriveGeom()（在 oracle-compare.mjs，可离线单测）；这里只负责量锚点。
+  // ⚠️ `rel` = **基准录制时**记下的"框相对宿主的内缩量"。
+  //    录制时传 undefined（由 deriveGeom 按当前局面定下并回传 rel）；
+  //    比对时传基准的 rel ⇒ 框钉在**宿主**上，插件自己挪位不会把差异对齐掉。
+  const g = deriveGeom(stateName, a, rel || undefined)
   if (!g) {
     console.error('  ✗ ' + stateName + '：实测几何推不出来（锚点缺失：'
-      + 'studio=' + JSON.stringify(a && a.studio) + ' dlg=' + JSON.stringify(a && a.dlg)
-      + ' sidebar=' + JSON.stringify(a && a.sidebar) + '）—— 本次不比对，'
-      + '绝不回落到写死常量去裁错地方。')
+      + 'dlg=' + JSON.stringify(a && a.dlg) + ' sidebar=' + JSON.stringify(a && a.sidebar)
+      + ' studio=' + JSON.stringify(a && a.studio) + ' plugin=' + ((a && a.plugin) || []).length + '个'
+      + '）—— 本次不比对，绝不回落到写死常量去裁错地方。')
     return null
   }
   g.volatileCount = (a.volatile || []).length
+  // 插件自己相对宿主的量 —— 布局契约的断言对象（比对时与基准记的那份比）
+  g.pluginRel = pluginRectRel(stateName === '03-settings-studio' ? 'studio' : 'sidebar', a)
   if (stateName !== '03-settings-studio' && g.volatileCount === 0) {
     console.log('     ⚠️ 这页没探测到随时间变的时间/日期标签 ⇒ 右边界取"侧栏右−8"；'
       + '若之后这类标签被圈进比较区会报假回归（实测踩过："6分钟"→"7分钟" 差 397 像素）')
   }
   if (log) {
     console.log('     实测几何: css宽=' + g.cssWidth + ' 矩形=' + JSON.stringify(g.rect)
-      + ' 屏蔽框=' + g.masks.length + ' 时间标签=' + g.volatileCount + ' 个')
+      + ' 屏蔽框=' + g.masks.length + ' 时间标签=' + g.volatileCount + ' 个'
+      + ' 插件相对宿主=' + JSON.stringify(g.pluginRel))
   }
   return g
 }
@@ -766,7 +800,7 @@ async function assertGeometry(s, log) {
   return true
 }
 
-async function prepareState(s, log) {
+async function prepareState(s, log, rel, basePluginRel) {
   // 为什么必须做：上一次状态可能开着面板，不复位的话后面的状态会**继承**它 ——
   // 实测踩到过：三个状态全都带着同一个面板，基准之间只差 0.05%，等于没区分开。
   // 关掉 dsh-browser-live 的观察窗：它**实时镜像当前页面**（截出来的图里能看到 FPS 计数与
@@ -808,12 +842,20 @@ async function prepareState(s, log) {
     console.error('  ✗ 对话框垫底未生效（backdrop=' + env.backdrop + '）—— 面板像素会被背后会话内容污染，'
       + '这次画面不可信，不参与比对。')
   }
-  // 几何：**运行时从实测锚点推导**（见 measureLiveGeom 注释，可迁移、不写死）
-  const geom = await measureLiveGeom(s.name, log)
+  // 几何：**运行时从实测锚点推导**（见 measureLiveGeom 注释，可迁移、不写死）。
+  // 比对时把基准录下的 rel 传进去 ⇒ 框钉在**宿主**上（插件自己挪位不会被对齐掉）。
+  const geom = await measureLiveGeom(s.name, log, rel || undefined)
   // 环境核对：确认插件元素还在（宽度契约）。失败 ⇒ 后续裁剪无意义。
   const geomOk = await assertGeometry(s, log)
   if (!geom) {
     console.error('  ✗ ' + s.name + '：实测几何拿不到 ⇒ 本次不比对（绝不回落到写死常量去比错地方）。')
+  }
+  // 布局契约：插件**自己**相对宿主的偏移与基准相比不许漂（这条专门抓"插件自己挪了"，
+  // 因为裁剪框钉在宿主上时，插件挪位会变成像素差异 —— 但契约能给出带数字的明确原因）。
+  let layoutDrift = null
+  if (geom && basePluginRel) {
+    layoutDrift = assertLayoutContract(basePluginRel, geom.pluginRel)
+    if (layoutDrift) console.error('  ✗ ' + s.name + ' ' + layoutDrift)
   }
   return {
     imagesReady: ready,
@@ -821,6 +863,7 @@ async function prepareState(s, log) {
     backdropOk,
     envApplied: env.applied,
     geom,
+    layoutDrift,
   }
 }
 
@@ -1024,7 +1067,12 @@ if (mode === 'capture') {
       name: s.name, note: s.note, probe: probeValue, file: path.basename(file), bytes: fs.statSync(file).size,
       // ⚠️ 记下**这一次实测出的几何**：compare 时基准那张图必须用"它自己录制时的几何"裁剪，
       // 当前这张用"现在实测的几何"裁剪 —— 两边各自换算才能对齐（可迁移的关键）。
+      // geom 里同时含 rel（框相对宿主的内缩量，供比对时钉在宿主上）与 pluginRel
+      //（插件相对宿主的位置，布局契约的基准值）。
       geom: prep ? prep.geom : null,
+      // 覆盖基准：这次**实际参与比较的设备像素尺寸**。比对时若当前侧与之不符（哪怕两侧
+      // 一起缩水），一律判"覆盖不足" —— 不许静默比交集（审核方第十轮第二条）。
+      expectCompared: prep ? comparedBoxOf(prep.geom, shot.data, s.name) : null,
     })
     console.log('  ✅ ' + s.name + '  ' + fs.statSync(file).size + ' 字节')
     console.log('     探针: ' + String(probeValue).slice(0, 160))
@@ -1213,7 +1261,10 @@ if (mode === 'capture') {
     const baseFile = path.join(baseDir, s.file)
     const state = STATES.find((x) => x.name === s.name)
     let prep = null
-    if (state) prep = await prepareState(state, false)
+    // 把基准录下的 rel（框相对宿主的内缩量）与 pluginRel（插件相对宿主的位置）传进去：
+    // 前者让裁剪框钉在宿主上，后者用来抓"插件自己挪了"。
+    const baseGeom = s.geom || null
+    if (state) prep = await prepareState(state, false, baseGeom && baseGeom.rel, baseGeom && baseGeom.pluginRel)
     else await sleep(2000)
     // 图片没就绪 ⇒ **本次比对不算数**，记为"就绪失败"而不是"有回归"。
     // 两者必须分开：混在一起会把"图没加载完"误报成视觉回归（审核方指出的缺陷）。
@@ -1233,6 +1284,13 @@ if (mode === 'capture') {
       console.log('  ⚠️  ' + s.name + '  对话框垫底未生效，本次跳过（画面会被宿主透光污染，结果无意义）')
       continue
     }
+    // 布局契约：插件自己相对宿主漂了 ⇒ **这是真错误**（不是"未就绪"），计为差异并给出数字。
+    // 审核方第十轮第一条：视口与宿主都不动、插件自己横移 12px，旧实现会被自动对齐吃掉。
+    if (prep && prep.layoutDrift) {
+      diff++
+      console.log('  ❌ ' + s.name + '  ' + prep.layoutDrift + ' —— 插件自身布局错误（宿主没动）')
+      continue
+    }
     const probeNow = await readState(state ? state.probe : 'null')
     const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
     const nowFile = path.join(baseDir, s.name + '.after.png')
@@ -1242,7 +1300,18 @@ if (mode === 'capture') {
     // 两边的几何**各自实测**：基准用录下来那份，当前用这一次量出来的那份
     // ⇒ 窗口尺寸/浏览器换了也能对上同一块内容（可迁移），而不是拿旧坐标裁新图。
     const geomBase = s.geom || null
-    const cmp = compareStable(baseFile, nowFile, s.name, geomBase, prep ? prep.geom : null)
+    // 把**基准录制时的比较尺寸**传进去：覆盖缩水必须报"覆盖不足"，不能静默比交集
+    // （审核方第十轮第二条：缩到 31 行丢掉基准 789 行后，1600 像素变化变 diff=0）
+    const cmp = compareStable(baseFile, nowFile, s.name, geomBase, prep ? prep.geom : null,
+      { expectCompared: s.expectCompared || null })
+
+    // 覆盖不足 ⇒ **显式失败**，绝不当"一致"（这正是审核方要求的口径）
+    if (cmp.coverage && cmp.coverage.ok === false) {
+      diff++
+      console.log('  ❌ ' + s.name + '  **覆盖不足**：' + cmp.coverage.reason
+        + '（本次没有比到基准的完整范围，不能宣称一致）')
+      continue
+    }
 
     const probeSame = String(probeNow) === String(s.probe)
     if (!probeSame) probeDiffs.push({ name: s.name, before: s.probe, after: probeNow })
