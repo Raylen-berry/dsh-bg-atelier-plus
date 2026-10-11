@@ -461,9 +461,12 @@ async function verify() {
  * 任何一步失败都记下来，最后统一给结论与非零退出码；收尾写在 finally 里，异常也不跳过。
  */
 async function run() {
-  const steps = (opt('steps', 'selftest'))          // 逗号分隔：selftest,capture,compare,mutate,audit
   const baseline = opt('baseline', 'iso-auto')
   const viewport = opt('viewport', '1426x807@1.1666666269302368')
+  // 默认跑**完整**验收（含变异与覆盖审计）；`--steps` 可裁剪。
+  const steps = opt('steps', 'selftest,compare,mutate,audit')
+  // `--repeat N`：把 compare 在**同一个环境里**连跑 N 次（稳定性证据：只跑过单次的部分）。
+  const repeat = Math.max(1, Number(opt('repeat', '1')) || 1)
   const want = new Set(steps.split(',').map((s) => s.trim()).filter(Boolean))
   const results = []
   const note = (n, okv, extra = '') => { results.push({ n, ok: okv, extra }); console.log('  ' + (okv ? '✅' : '❌') + ' ' + n + (extra ? '  [' + String(extra).slice(0, 120) + ']' : '')) }
@@ -548,7 +551,12 @@ async function run() {
     if (needCapture) await runStep('装标记图（隔离库）', [path.join(HERE, 'make-marker-wallpaper.mjs')], env, note)
     if (want.has('selftest')) await runStep('selftest', [path.join(HERE, 'visual-baseline.mjs'), 'selftest'], env, note)
     if (needCapture) await runStep('capture ' + baseline, [path.join(HERE, 'visual-baseline.mjs'), 'capture', baseline], env, note)
-    if (want.has('compare')) await runStep('compare ' + baseline, [path.join(HERE, 'visual-baseline.mjs'), 'compare', baseline], env, note)
+    if (want.has('compare')) {
+      for (let i = 1; i <= repeat; i++) {
+        await runStep('compare ' + baseline + (repeat > 1 ? ' #' + i + '/' + repeat : ''),
+          [path.join(HERE, 'visual-baseline.mjs'), 'compare', baseline], env, note)
+      }
+    }
     if (want.has('mutate')) await runStep('A 级变异', [path.join(HERE, 'mutate-real-style.mjs'), baseline], env, note)
     if (want.has('audit')) await runStep('覆盖审计', [path.join(HERE, 'audit-oracle-coverage.mjs'), baseline], env, note)
   } catch (e) {
@@ -615,4 +623,4 @@ else if (cmd === 'run') await run()
 else if (cmd === 'up') await up()
 else if (cmd === 'down') down()
 else if (cmd === 'status') await status()
-else { console.error('用法: node tools/iso-instance.mjs run|prepare|verify|up|down|status [--name poc1] [--browser] [--port 19402] [--cdp 19502]'); process.exit(2) }
+else { console.error('用法: node tools/iso-instance.mjs run|prepare|verify|up|down|status [--name poc1] [--root D:\\dsh-iso\\poc1] [--port 19402] [--cdp 19502] [--baseline iso-auto] [--steps selftest,compare,mutate,audit] [--repeat N] [--viewport 1426x807@DPR] [--browser]'); process.exit(2) }

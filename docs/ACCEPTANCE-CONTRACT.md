@@ -174,6 +174,9 @@ VB_PLUGIN_DIR=<root>/plugin/dsh-bg-atelier-official   # A 级变异只改副本
 node tools/iso-instance.mjs run --name poc4 --root D:\DeepSeek\dsh-iso\poc4 \
   --port 19410 --cdp 19510 --baseline iso-auto --steps selftest,capture,compare,audit,mutate
 ```
+
+**默认步骤**：`selftest,compare,mutate,audit`（`compare` 在基准不存在时会自动先 `capture`）；
+`--repeat N` 让 **compare 在同一环境里连跑 N 次**（基线稳定性证据）。
 宿主作为**本进程的直接子进程**（不 detach、不经 PowerShell），流水线在同一次调用内跑完：
 准备 → 起宿主 → 等端口 → **隔离证明（不成立就中止）** → 设测试底图 → 起隔离浏览器 →
 装标记图（进隔离库）→ selftest → capture → compare → A 级变异 → 覆盖审计 →
@@ -181,6 +184,14 @@ node tools/iso-instance.mjs run --name poc4 --root D:\DeepSeek\dsh-iso\poc4 \
 
 **全新根 poc4 实测：16 通过 / 0 失败**（selftest 15/15、compare `8 一致 / 0 差异`、
 A 级变异 12/12、覆盖审计 38/38，生产 `settings.json` 与生产插件代码哈希不变、隔离端口已关）。
+
+**基线稳定性（此前只有单次，现已补上）**：全新根 poc5 一次命令内录基准后 **compare 连跑 3 次**，
+三次全部 `视觉回归：8 一致 / 0 有差异 / 0 尺寸不符`（含各自的字节级边界核对），
+汇总 **18 通过 / 0 失败**。命令：
+```
+node tools/iso-instance.mjs run --name poc5 --root D:\DeepSeek\dsh-iso\poc5 \
+  --port 19412 --cdp 19512 --baseline iso-r2 --repeat 3
+```
 
 **⚠️ 更正我上一轮的一个错误结论**：我上一版把 `up`/`verify` 起不来归因为"Windows Job 回收宿主"。
 **这个结论没有被证明，而且大部分现象的真因是另一件事**：探活函数先请求 CDP 专用路径
