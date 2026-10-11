@@ -294,6 +294,11 @@ try {
   }
 }
 
+// ★ 用户状态字节级边界：**在改动任何东西之前**先快照。
+//   收尾核对时会证明"settings.json 与图库逐字节未变"（派生缓存允许新增，单独列出）。
+//   selftest 只量几何、不写设置，但照样快照 —— 统一口径，少一个例外。
+const stateSnap = boundaryBegin(true)
+
 /**
  * 开工前的自检：页面的 fetch 通道还活着吗？
  *
@@ -372,6 +377,10 @@ import {
   pluginRectRel, assertLayoutContract,
   rotationRestoreNeed, judgeRotationRestore, isValidSettings,
 } from './oracle-compare.mjs'
+// 用户状态的**字节级边界**：开跑前快照用户数据树，收尾核对是否逐字节未变。
+// 为什么要有（审核方第十五轮）：字段级还原只能证明"我们打算还原的那几个字段写回去了"；
+// "用户状态受到保护"需要**可证明** —— 跑完之后 settings.json 与图库逐字节一致。
+import { boundaryBegin, boundaryVerify } from './state-boundary.mjs'
 
 // 本文件内部沿用旧名字，避免大改调用点
 function compareStable(baseFile, nowFile, stateName, geomBase, geomNow, opts2) {
@@ -1675,6 +1684,8 @@ if (mode === 'capture') {
 
   console.log('\n自检：' + stPass + ' 通过 / ' + stFail + ' 失败')
   if (stFail > 0) exitCode = 1
+  const bSelf = boundaryVerify(stateSnap, true)
+  if (!bSelf.clean) { console.error('  ✗ selftest 期间用户数据被改动 —— 退出码 6'); exitCode = 6 }
   try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }) } catch {}
   cdp.close()
   process.exit(exitCode)
@@ -1840,6 +1851,15 @@ if (mode === 'capture') {
       exitCode = 1
       console.error('  ✗ 未预期异常：' + String(e && e.message || e).slice(0, 120))
     }
+  }
+  // ★ 收尾的**字节级**核对：证明这次运行没有改动用户数据。
+  //   只看用户数据（settings.json / 图库）；派生缓存允许新增并单独列出。
+  //   不干净 ⇒ 按"清理失败"处理（退出码 6），不允许静默通过。
+  const boundary = boundaryVerify(stateSnap, true)
+  if (!boundary.clean) {
+    console.error('  ✗ 用户数据未完整恢复 —— 按清理失败处理（退出码 6）。'
+      + '请检查上面的清单，必要时手工还原。')
+    exitCode = 6
   }
   try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }) } catch {}
   cdp.close()

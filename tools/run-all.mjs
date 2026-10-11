@@ -77,6 +77,7 @@ const EXCLUDED = [
   ['tools/visual-baseline.mjs', '视觉 oracle：需要 GUI 在 127.0.0.1:19387 跑着 + 已连接的浏览器（走 CDP）⇒ 不是纯离线测试，本机手动跑 capture/compare'],
   ['tools/verify-viewport-matrix.mjs', '迁移适配真机矩阵：需要 GUI + 浏览器（用 CDP Emulation 改视口/DPR），且依赖已录基准 audit-r26 ⇒ 本机手动跑 `node tools/verify-viewport-matrix.mjs`'],
   ['tools/verify-switching-behavior.mjs', '第 6 项「切换与动效」功能层真机验收：需要 GUI + 浏览器（走 CDP），会改设置并还原；轮播那段要等约 70 秒 ⇒ 本机手动跑 node tools/verify-switching-behavior.mjs [--skip-rotation]'],
+  ['tools/state-boundary.mjs', '用户状态的**字节级边界**（快照/核对）：本机手动跑 egin <名字> / erify <名字>；capture/compare/selftest 已内联同一实现'],
   ['tools/make-marker-wallpaper.mjs', '生成"中等尺寸标记图"并装到用户底图目录（04 状态的前置）⇒ 有副作用、不是测试；本机按需跑 `node tools/make-marker-wallpaper.mjs [--remove]`'],
 ]
 
