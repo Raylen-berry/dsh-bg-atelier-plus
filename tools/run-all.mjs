@@ -54,6 +54,10 @@ const SUITES = [
   // 而写死绝对常量的旧口径会裁歪（反证 diff=219784）。7 项，纯离线无需浏览器。
   'tools/verify-oracle-geometry.mjs',
   'tools/verify-settings.mjs',
+  // 宿主设置读写的**接口语义**（审核方第十五轮点名 index.js:318）：读取失败/首次安装/
+  // 合法空设置必须可区分；写入必须原子（不留半截、失败不破坏已有内容）。
+  // 从 index.js 源码切函数、在临时目录上跑真实 IO —— 离线自足，CI 可跑。
+  'tools/verify-host-settings-io.mjs',
   'tools/test-playlists.mjs',
   // 底图去重（贝利尔两对：同内容两个名字 → 硬链接）。离线自足：清单校验那几项在 CI 照跑，
   // 只有"读真图"的 ①②③ 在没有 wallpapers/ 时打 SKIP（图片不进 git）。

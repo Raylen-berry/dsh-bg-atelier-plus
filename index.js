@@ -315,18 +315,78 @@ function readBody(req) {
   })
 }
 
-async function readSettings() {
-  try {
-    const parsed = JSON.parse(await fs.readFile(SETTINGS_FILE, 'utf8'))
-    return parsed && typeof parsed === 'object' ? parsed : {}
-  } catch {
-    return {}
-  }
+/**
+ * 读设置 —— **必须区分四种情况**，不能都返回 `{}`。
+ *
+ * 审核方第十五轮点名这里的实现：原来 `catch { return {} }` 让
+ * **读取失败 / 首次安装 / 合法空设置**三者不可区分，于是验收工具只能在脚本层
+ * 加 `isValidSettings` 之类的补丁去猜"这个 {} 到底是什么意思"。
+ * 那是接口语义缺失，不是测试脚本的问题 ⇒ 在这里补齐，脚本层的猜测就可以退场。
+ *
+ * @returns {{status:'ok'|'missing'|'corrupt'|'io-error', value:object|null, detail?:string}}
+ *   ok       读到了合法对象
+ *   missing  文件不存在（首次安装 —— 唯一一种"空设置"是正常的）
+ *   corrupt  文件在、但解析失败或不是对象（**危险**：此时任何写入都会把原文件覆盖掉）
+ *   io-error 文件在、但读不了（权限/占用等）
+ */
+async function readSettingsResult() {
+  return readSettingsResultAt(SETTINGS_FILE)
 }
 
+/**
+ * 按路径读 —— 参数化是为了**能离线测**（本仓库的测试缝是"从源码里切函数"，
+ * 见 tools/verify-host-settings-io.mjs）。依赖只有 `fs`，所以切出来就能在临时目录上跑。
+ */
+async function readSettingsResultAt(file) {
+  let raw
+  try {
+    raw = await fs.readFile(file, 'utf8')
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return { status: 'missing', value: {} }
+    return { status: 'io-error', value: null, detail: String((err && err.code) || err).slice(0, 80) }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch (err) {
+    return { status: 'corrupt', value: null, detail: 'JSON 解析失败：' + String((err && err.message) || err).slice(0, 80) }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { status: 'corrupt', value: null, detail: 'JSON 不是对象' }
+  }
+  return { status: 'ok', value: parsed }
+}
+
+/** 兼容读法：返回对象。读不到时返回 `{}` —— **调用方必须自己判断这时该不该写盘**。 */
+async function readSettings() {
+  const r = await readSettingsResult()
+  return r.value == null ? {} : r.value
+}
+
+/**
+ * 写设置 —— **临时文件 + 原子替换**。
+ *
+ * 原来直接 `fs.writeFile(SETTINGS_FILE, …)`：写到一半进程被杀 / 断电，
+ * 用户设置文件就被**截断成半截 JSON**（下一次读取变成 corrupt，全部设置丢失）。
+ * 这是数据丢失风险，与验收无关也该修。
+ * 同目录写临时文件再 rename：同卷 rename 是原子的 ⇒ 读到的要么是旧内容、要么是新内容，
+ * 不会读到半截。（`.tmp` 名字带 pid，避免并发互踩。）
+ */
 async function writeSettings(obj) {
-  await fs.mkdir(SETTINGS_DIR, { recursive: true })
-  await fs.writeFile(SETTINGS_FILE, JSON.stringify(obj, null, 2), 'utf8')
+  return writeSettingsAt(SETTINGS_FILE, SETTINGS_DIR, obj)
+}
+
+/** 按路径写（同样为了离线测）。 */
+async function writeSettingsAt(file, dir, obj) {
+  await fs.mkdir(dir, { recursive: true })
+  const tmp = file + '.' + process.pid + '.tmp'
+  try {
+    await fs.writeFile(tmp, JSON.stringify(obj, null, 2), 'utf8')
+    await fs.rename(tmp, file)
+  } catch (err) {
+    try { await fs.unlink(tmp) } catch { /* 清理失败不影响主流程 */ }
+    throw err
+  }
 }
 
 // ---- 轻量占位图 (poster) 的磁盘落点: 一个文件夹, 文件名 = key 哈希, 命中即复用,
