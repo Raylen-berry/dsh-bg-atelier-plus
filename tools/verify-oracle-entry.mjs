@@ -233,6 +233,10 @@ function makeServer(cfg) {
             studio: { l: 525, t: 78, r: 1085, b: 1419 },
             hero: { l: 545, t: 148, r: 1059, b: 360 },
             sidebar: { l: 0, t: 0, r: 280, b: 807 },
+            // 宿主"主体表面" [data-composer-card]：07/08 与**动效状态 02** 都锚在它上
+            // （实测：动效画布 .bga-dockfx 与它完全重合）。这个套件跳过了 07/08，
+            // 但 02 没跳过 ⇒ 不给 surface 的话 02 会判"锚点缺失"⇒ 全场景 exit=4。
+            surface: { l: 467, t: 679, r: 1233, b: 777 },
             volatile: [{ l: 234, r: 261, t: '6分钟' }],
             // 侧栏纵向以**插件自己的元素**为锚（实测 .bga-orb 在 y724–751）
             plugin: [{ l: 12, t: 724, r: 40, b: 751 }],
@@ -248,6 +252,18 @@ function makeServer(cfg) {
         if (/hasStudio/.test(e)) {
           return val(JSON.stringify({ hasStudio: true, studioSize: [560, 1341], heading: '底图工坊', saveState: '已保存' }))
         }
+        // 动效状态（02-fx-nodes）新增两条表达式，桩必须给**有意义**的答复：
+        //  ① pinAnimations（含 getAnimations）：不回报"钉住了动画"的话，该状态判
+        //     "动效层没挂载"而拒绝参与比较 ⇒ 全场景 exit=4（实测：本套件 10 通过 / 10 失败）。
+        //  ② openRealClick 的目标坐标（真实鼠标点击用）。
+        //  ③ requireSelector 的验证（!!document.querySelector(".bga-dockfx")）。
+        if (/getAnimations/.test(e)) {
+          return val(JSON.stringify({ total: 3, pinned: 3, fail: 0 }))
+        }
+        if (/sessionRow/.test(e)) {
+          return val(JSON.stringify({ x: 120, y: 260, t: '会话' }))
+        }
+        if (/!!document\.querySelector\("\.bga-dockfx"\)/.test(e)) return val('true')
         if (/EXPECT_GEOMETRY|Math\.round\(r\.left\),t:Math\.round\(r\.top\),r:Math\.round\(r\.right\)/.test(e)) {
           // 几何核对现在只看**与窗口无关的量**（元素自己的宽度），所以桩要给 w
           return val(JSON.stringify({ l: 525, t: 78, r: 1085, w: cfg.studioWidth || 560, h: 1341 }))
@@ -301,6 +317,13 @@ const dir1 = freshDir(); made.push(dir1)
 await scenario('S1', {}, async (port, state) => {
   const r = await runScript('capture', dir1, port)
   ok('S1 capture 正常 ⇒ exit 0', r.code === 0, 'exit=' + r.code)
+  // 失败时把子进程输出尾部打出来 —— 只看退出码不知道**哪个状态、为什么**拒绝
+  // （本轮就这样查了两轮：先猜 getAnimations，其实还有别的原因）。
+  if (r.code !== 0) {
+    for (const l of String(r.out || '').split(/\r?\n/).filter((x) => x.trim()).slice(-12)) {
+      console.log('        | ' + l.trim().slice(0, 150))
+    }
+  }
   let man = null
   try { man = JSON.parse(fs.readFileSync(path.join(OUT_ROOT, dir1, 'manifest.json'), 'utf8')) } catch { /* noop */ }
   ok('S1 manifest 写了 pinnedWallpaper（非 null）', !!(man && man.pinnedWallpaper), JSON.stringify(man && man.pinnedWallpaper))
