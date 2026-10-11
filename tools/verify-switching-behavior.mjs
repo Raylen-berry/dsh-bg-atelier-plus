@@ -14,6 +14,7 @@
 // 用法：node tools/verify-switching-behavior.mjs [--skip-rotation]
 //   轮播那一段按插件最小间隔 1 分钟验证，会等约 70 秒；--skip-rotation 可跳过。
 import { readFileSync } from 'node:fs'
+import { openConversation } from './lib/conversation.mjs'
 
 const SKIP_ROTATION = process.argv.includes('--skip-rotation')
 
@@ -25,10 +26,20 @@ const ok = (name, cond, extra = '') => {
 }
 
 // ------------------------------------------------------------------ CDP
-const st = JSON.parse(readFileSync(process.env.DSH_HOME + '/dsh-browser-live/state.json', 'utf8'))
-const list = await (await fetch('http://127.0.0.1:' + st.port + '/json/list')).json()
-const page = list.find((t) => String(t.url || '').includes('127.0.0.1:19387'))
-if (!page) { console.error('没找到 GUI 标签页'); process.exit(3) }
+// 目标实例**可迁移**：优先用 VB_CDP_PORT / VB_GUI_HOST（与 visual-baseline.mjs 同一套约定，
+// 隔离实例就用它绑定）；没给才回退到读 $DSH_HOME/dsh-browser-live/state.json。
+// ⚠️ 原来无条件读那个 state.json ⇒ 在隔离实例里直接 ENOENT 崩掉（实测：换 DSH_HOME 就挂）。
+const GUI_HOST = process.env.VB_GUI_HOST || '127.0.0.1:19387'
+const cdpPort = Number(process.env.VB_CDP_PORT || 0) || (() => {
+  try { return JSON.parse(readFileSync(process.env.DSH_HOME + '/dsh-browser-live/state.json', 'utf8')).port }
+  catch {
+    console.error('✗ 拿不到 CDP 端口：既没有 VB_CDP_PORT，也读不到 $DSH_HOME/dsh-browser-live/state.json')
+    process.exit(2)
+  }
+})()
+const list = await (await fetch('http://127.0.0.1:' + cdpPort + '/json/list')).json()
+const page = list.find((t) => String(t.url || '').includes(GUI_HOST))
+if (!page) { console.error('没找到 GUI 标签页（VB_GUI_HOST=' + GUI_HOST + '，CDP ' + cdpPort + '）'); process.exit(3) }
 const ws = new WebSocket(page.webSocketDebuggerUrl)
 await new Promise((r, j) => { ws.onopen = r; ws.onerror = () => j(new Error('ws open 失败')) })
 let id = 0
@@ -125,18 +136,18 @@ async function fxCssPresent() {
  * 顺带跳过"新会话"（它没有时间标记，天然被排除）。
  */
 async function ensureConversationOpen() {
-  const has = await ev(`document.querySelectorAll('[class*="_bubble"]').length`)
-  if (typeof has === 'number' && has > 0) return 'already'
-  const clicked = await ev(`(()=>{
-    const TIME=/(刚刚|[0-9]+\\s*(秒|分钟|小时|天|周|月)前?)\\s*$/;
-    const items=[...document.querySelectorAll('[role="treeitem"]')];
-    const cand=items.find(e=>{const t=String(e.textContent||'').trim(); return t && t.length<80 && TIME.test(t)});
-    if(!cand) return 'no-session';
-    cand.click();
-    return 'clicked:'+String(cand.textContent||'').trim().slice(0,26)})()`)
-  await sleep(4200)
-  const now = await ev(`document.querySelectorAll('[class*="_bubble"]').length`)
-  return clicked + ' bubbles=' + now
+  // ★ 与 visual-baseline 的动效状态共用同一份判据（tools/lib/conversation.mjs）：
+  //   结构锚为主 + 相对时间退路 + 展开回退 + **真实鼠标** + 打开后验证气泡。
+  //   原来这里只靠"文本带相对时间"并直接 `cand.click()`：
+  //   文案是**会走的**（"6分钟"→"1小时"→某天变日期），跑几十分钟后就匹配不到（实测踩过）；
+  //   合成 click 在本应用里对部分元素也不生效。
+  const mouseClick = async (x, y) => {
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1, buttons: type === 'mousePressed' ? 1 : 0 })
+    }
+  }
+  const r = await openConversation({ ev, click: mouseClick, sleep })
+  return r.ok ? (r.how + ' bubbles=' + r.bubbles) : r.how
 }
 /** 记录用户当前在看的那个条目（可能就是「新会话」页），收尾还原用。 */
 async function selectedTreeItemText() {

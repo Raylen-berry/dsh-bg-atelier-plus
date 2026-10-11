@@ -588,7 +588,12 @@ async function run() {
     const extra = opt('extra-script', '')
     if (extra) {
       console.log('  --- 诊断脚本 ' + path.basename(extra) + '（输出直通） ---')
-      const rr = spawnSync(process.execPath, [path.resolve(extra)], { env, cwd: REPO, stdio: 'inherit' })
+      // 用 pipe 捕获后**显式打印两个流**：`stdio:'inherit'` 在外层还有管道时会把内容丢掉
+      // （实测：脚本 exit 1，却一行输出都看不到）。
+      const rr = spawnSync(process.execPath, [path.resolve(extra)], { env, cwd: REPO, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+      const so = String(rr.stdout || ''), se = String(rr.stderr || '')
+      if (so.trim()) for (const l of so.split(/\r?\n/)) console.log('    ' + l)
+      if (se.trim()) for (const l of se.split(/\r?\n/)) console.error('    [err] ' + l)
       note('诊断脚本 ' + path.basename(extra), rr.status === 0, 'exit ' + rr.status)
     }
 

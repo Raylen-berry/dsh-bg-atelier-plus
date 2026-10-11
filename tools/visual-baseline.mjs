@@ -89,18 +89,9 @@ export const STATES = [
     settleMs: 2500,
     pinAnimMs: 1200,
     requireSelector: '.bga-dockfx',
+    openConversation: true,
     // 展开回退：找不到会话行时先点工作区节点把它展开（resetToCleanHome 之后常是收起的）
-    expandClick: `document.querySelectorAll('[role="treeitem"]')[0] || null`,
-    // ⚠️ 别只靠"刚刚/N分钟前"这类**相对时间文案**：会话列表里的时间是会走的（"6分钟"→"1小时"
-    //    → 某天就变成日期），实测跑了几十分钟后这个正则就匹配不到 ⇒ 状态直接"不参与比较"。
-    //    主判据改成**结构锚**：应用给会话行加了含 `sessionRow` 的类（与哈希前缀无关的那截），
-    //    并排除那条空的"新会话"；相对时间正则只作退路。
-    openRealClick: `(()=>{
-      const items=[...document.querySelectorAll('[role="treeitem"]')];
-      let cand=items.filter(e=>/sessionRow/.test(String(e.className))||e.querySelector('[class*="sessionRow"]'));
-      if(!cand.length) cand=items.filter(e=>/刚刚|[0-9]+\\s*(秒|分钟|小时|天|周|月)前?/.test(String(e.textContent||'')));
-      cand=cand.filter(e=>!String(e.textContent||'').trim().startsWith('新会话'));
-      return cand[0]||null})()`,
+    // 判据（结构锚为主、相对时间退路、展开回退、真实鼠标、点完验证）都在 tools/lib/conversation.mjs
     // 探针要能**证伪"动效节点在位"**：直接数画布里的真实节点，而不是列一遍 bga 类名。
     probe: `(()=>{const dock=document.querySelector('.bga-dockfx');
       const c={}; if(dock) for(const e of dock.querySelectorAll('*')){const k=String(e.className).split(/\\s+/)[0]; c[k]=(c[k]||0)+1}
@@ -441,6 +432,7 @@ import {
 // 为什么要有（审核方第十五轮）：字段级还原只能证明"我们打算还原的那几个字段写回去了"；
 // "用户状态受到保护"需要**可证明** —— 跑完之后 settings.json 与图库逐字节一致。
 import { boundaryBegin, boundaryVerify } from './state-boundary.mjs'
+import { openConversation } from './lib/conversation.mjs'
 
 // 本文件内部沿用旧名字，避免大改调用点
 function compareStable(baseFile, nowFile, stateName, geomBase, geomNow, opts2) {
@@ -922,7 +914,7 @@ async function prepareEnvironment(log, opts = {}) {
       //    里面有个会闪的光标 ⇒ 抓图时正好一个是亮点、一个是底色，
       //    表现为 CSS x471、y412-430 的 **1px×19px 竖线、Δ183**（连跑 3 次都复现）。
       //    这是"宿主自己的动效"，与上面停插件动画同源；停掉它不隐藏插件的任何输出。
-      'input,textarea{caret-color:transparent!important}',
+      'input,textarea,[contenteditable]{caret-color:transparent!important}',
     ].join('\\n');
     document.head.appendChild(st2);
     let backdrop = 0;
@@ -1469,80 +1461,33 @@ async function prepareState(s, log, rel, basePluginRel, recordedPageState) {  //
     if (log) console.log('     打开②: ' + r2)
     await sleep(800)
   }
-  // 「真实鼠标点击」打开（**合成 .click() 在本应用里不生效** —— 实测：合成 click / 合成
-  // KeyboardEvent 都打不开会话，只有走 CDP Input 的真实指针事件才行）。
-  // `s.openRealClick` 是一段 JS，返回目标元素；工具取它的中心坐标后用真实鼠标事件点。
-  if (s.openRealClick) {
-    // 真实鼠标点击（合成 .click() 在本应用里不生效，实测）。
-    // `s.requireSelector`：点完**必须验证**目标真出现了 —— 侧栏树可能是收起的（点到的
-    // "默认工作区"会把会话列表收起来），所以先按原样点一次，不成立就**展开工作区再点一次**。
-    // 不验证的话，后面 pinAnimations 会拿到 0 个动画，报出来的原因是"相位固定失败"，
-    // 与真因（会话没打开）对不上号。
-    const clickTarget = async () => {
-      const armed = await readState(`(()=>{const el=(${s.openRealClick}); if(!el) return null;
-        const r=el.getBoundingClientRect(); return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),t:String(el.textContent||'').trim().slice(0,24)})})()`).catch(() => null)
-      if (!armed) return null
-      const p = JSON.parse(armed)
+  // 打开一个**真会话**（动效层只在有会话时才挂载）。
+  // 逻辑本身抽在 `tools/lib/conversation.mjs`（与 verify-switching-behavior 共用同一判据）：
+  //   · **真实鼠标**点会话行（合成 click / 合成 KeyboardEvent 在本应用里都不生效，实测）；
+  //   · 判据以**结构锚** `*sessionRow*` 为主、相对时间文案只作退路（只靠文案，跑几十分钟后
+  //     文案一变就匹配不到，整轮报"未就绪跳过" —— 实测踩过）；
+  //   · 找不到会话行就先点工作区分组行把树展开再找（`resetToCleanHome` 之后常是收起的）；
+  //   · 点完**验证** `s.requireSelector`（不验证的话，后面 pinAnimations 拿到 0 个动画，
+  //     报出来的原因是"相位固定失败"，与真因"会话没打开"对不上号）。
+  if (s.openConversation) {
+    const mouseClick = async (x, y) => {
       for (const type of ['mousePressed', 'mouseReleased']) {
-        await cdp.send('Input.dispatchMouseEvent', { type, x: p.x, y: p.y, button: 'left', clickCount: 1, buttons: type === 'mousePressed' ? 1 : 0 })
+        await cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1, buttons: type === 'mousePressed' ? 1 : 0 })
       }
-      return p
     }
-    const p1 = await clickTarget()
-    if (!p1) {
-      // ⚠️ 找不到会话树项**未必是没会话**：`resetToCleanHome` 之后工作区节点可能是**收起的**，
-      //    会话行压根没渲染（实测：treeitems 只剩"默认工作区"）。所以先把它展开再找。
-      if (s.expandClick) {
-        const exp = await readState(`(()=>{const el=(${s.expandClick}); if(!el) return null;
-          const r=el.getBoundingClientRect(); return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),t:String(el.textContent||'').trim().slice(0,20)})})()`).catch(() => null)
-        if (exp) {
-          const q = JSON.parse(exp)
-          for (const type of ['mousePressed', 'mouseReleased']) {
-            await cdp.send('Input.dispatchMouseEvent', { type, x: q.x, y: q.y, button: 'left', clickCount: 1, buttons: type === 'mousePressed' ? 1 : 0 })
-          }
-          if (log) console.log('     ' + s.name + '：先展开「' + q.t + '」（找不到会话树项）')
-          await sleep(2000)
-          const retry = await clickTarget()
-          if (retry) {
-            if (log) console.log('     打开（真实鼠标·展开后）: @' + retry.x + ',' + retry.y + '  "' + retry.t + '"')
-            await sleep(s.openSettleMs || 4000)
-          } else {
-            console.error('  ✗ ' + s.name + '：展开后仍找不到会话树项 ⇒ 这个状态本次不参与比较')
-            return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
-          }
-        } else {
-          console.error('  ✗ ' + s.name + '：openRealClick 没找到目标元素、expandClick 也没有 ⇒ 本次不参与比较')
-          return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
-        }
-      } else {
-        console.error('  ✗ ' + s.name + '：openRealClick 没找到目标元素 ⇒ 这个状态本次不参与比较')
-        return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
-      }
-    } else {
-      if (log) console.log('     打开（真实鼠标）: @' + p1.x + ',' + p1.y + '  "' + p1.t + '"')
-      await sleep(s.openSettleMs || 4000)
-    }
+    const r = await openConversation({
+      ev: (expr) => readState(expr),
+      click: mouseClick,
+      sleep,
+      log: (m) => { if (log) console.log('     ' + s.name + '：' + m.trim()) },
+    })
+    if (log) console.log('     打开会话: ' + r.how + (r.bubbles !== undefined ? '（气泡 ' + r.bubbles + '）' : ''))
     if (s.requireSelector) {
       const sel = JSON.stringify(s.requireSelector)
-      let has = await readState(`!!document.querySelector(${sel})`).catch(() => false)
+      const has = await readState(`!!document.querySelector(${sel})`).catch(() => false)
       if (!has) {
-        if (log) console.log('     ' + s.requireSelector + ' 还没出现 ⇒ 展开工作区后再点一次')
-        const exp = await readState(`(()=>{const t=document.querySelectorAll('[role="treeitem"]')[0]; if(!t) return null;
-          const r=t.getBoundingClientRect(); return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()`).catch(() => null)
-        if (exp) {
-          const q = JSON.parse(exp)
-          for (const type of ['mousePressed', 'mouseReleased']) {
-            await cdp.send('Input.dispatchMouseEvent', { type, x: q.x, y: q.y, button: 'left', clickCount: 1, buttons: type === 'mousePressed' ? 1 : 0 })
-          }
-          await sleep(1800)
-          const p2 = await clickTarget()
-          if (log && p2) console.log('     重试（真实鼠标）: @' + p2.x + ',' + p2.y + '  "' + p2.t + '"')
-          await sleep(s.openSettleMs || 4000)
-          has = await readState(`!!document.querySelector(${sel})`).catch(() => false)
-        }
-      }
-      if (!has) {
-        console.error('  ✗ ' + s.name + '：点了会话树项但 ' + s.requireSelector + ' 仍不在位 ⇒ 这个状态本次不参与比较')
+        console.error('  ✗ ' + s.name + '：会话没能打开（' + r.how + '）⇒ ' + s.requireSelector
+          + ' 不在位 ⇒ 这个状态本次不参与比较')
         return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
       }
       if (log) console.log('     已确认 ' + s.requireSelector + ' 在位')
