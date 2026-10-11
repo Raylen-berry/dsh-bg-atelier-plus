@@ -546,16 +546,30 @@ async function run() {
     if (!cdpUp) throw new Error('浏览器 CDP 没起来')
     await sleep(6000)   // 等应用首屏与客户端状态落定，再去截图/比图
 
-    // ★ 首次运行引导要 API Key 才能建会话；而 `DockFx` 挂在 `conversation.composer.dock`
-    //   （`client.js:3133`）—— 没有会话 ⇒ 动效节点根本不在位（实测探针只有 bga-orb）。
+    // ★ 首次运行引导要凭据才能建会话；而 `DockFx` 挂在 `conversation.composer.dock`
+    //   （`client.js:3133`）—— 没有会话 ⇒ 动效节点不在位，`02-fx-nodes` 会被跳过。
     //   密钥**只经环境变量传入、只由应用写进隔离 home**（仓库外、不入 git）；脚本只打印掩码。
-    if (process.env.VB_ISO_API_KEY) {
-      const r = await submitApiKey(process.env.VB_ISO_API_KEY)
+    // ★ 但**只在真的需要时才要密钥**：隔离 home 里已由应用存过凭据、或引导已过时，
+    //   就不该再要环境变量、更不该把它记成失败 —— 否则"一条命令复现整套验收"会被一个
+    //   无关的缺失卡成 ❌（实测就是这么误报的）。
+    const key = process.env.VB_ISO_API_KEY
+    if (key) {
+      const r = await submitApiKey(key)
       note('向隔离实例提交 API Key（只打印掩码）', r === 'saved' || r === 'already',
-        '结果=' + r + '  key=' + process.env.VB_ISO_API_KEY.slice(0, 6) + '…')
+        '结果=' + r + '  key=' + key.slice(0, 6) + '…')
     } else {
-      note('未提供 VB_ISO_API_KEY ⇒ 隔离实例建不了会话，动效节点不会挂载', false, '设这个环境变量可解锁')
+      const probe = await submitApiKey('', true)     // 只探测，不填任何东西
+      if (probe === 'already') note('隔离实例已存过凭据（无需 VB_ISO_API_KEY）', true, '引导未出现')
+      else note('隔离实例仍要凭据、但没给 VB_ISO_API_KEY ⇒ 建不了会话，动效状态会被跳过', false, probe)
     }
+    // 会话是否存在（动效状态的前提）。**信息性**：没有也不算这一步失败 ——
+    // 真正的判定在 02-fx-nodes 自己（它会大声拒绝参与比较）。
+    try {
+      const sdir = path.join(ROOT, 'home', 'sessions')
+      const n = existsSync(sdir)
+        ? readdirSync(sdir).reduce((a, d) => a + readdirSync(path.join(sdir, d)).length, 0) : 0
+      note('隔离实例已有会话（动效状态的前提）', n > 0, n + ' 个' + (n ? '' : ' ⇒ 需先在隔离实例里建一个会话'))
+    } catch { /* 数不出来不影响流程 */ }
 
 
 
@@ -622,7 +636,7 @@ async function fetchJson(url, ms = 8000) {
  * 返回 'saved' | 'already' | 'no-dialog' | 'no-input' | 'failed:<原因>'。
  * ⚠️ 只打印掩码；密钥本身由应用写进隔离 home 的 .credentials.yaml（仓库外、不入 git）。
  */
-async function submitApiKey(key) {
+async function submitApiKey(key, dryRun = false) {
   const list = await (await fetch('http://127.0.0.1:' + CDP + '/json/list')).json()
   const page = list.find((t) => t.type === 'page' && String(t.url).includes('127.0.0.1:' + PORT))
   if (!page) return 'no-page'
@@ -637,6 +651,7 @@ async function submitApiKey(key) {
     // 已经配置过就别再填（避免把同一把钥匙反复写）
     const hasDialog = await ev(`!![...document.querySelectorAll('button')].find(b=>String(b.textContent||'').trim()==='保存并继续')`)
     if (!hasDialog) return 'already'
+    if (dryRun) return 'needs-key'    // 只探测：不填、不点
     const wrote = await ev(`(()=>{
       const btns=[...document.querySelectorAll('button')];
       const save=btns.find(b=>String(b.textContent||'').trim()==='保存并继续'); if(!save) return 'no-save-btn';
