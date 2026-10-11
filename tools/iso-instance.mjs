@@ -546,6 +546,17 @@ async function run() {
     if (!cdpUp) throw new Error('浏览器 CDP 没起来')
     await sleep(6000)   // 等应用首屏与客户端状态落定，再去截图/比图
 
+    // ★ 首次运行引导要 API Key 才能建会话；而 `DockFx` 挂在 `conversation.composer.dock`
+    //   （`client.js:3133`）—— 没有会话 ⇒ 动效节点根本不在位（实测探针只有 bga-orb）。
+    //   密钥**只经环境变量传入、只由应用写进隔离 home**（仓库外、不入 git）；脚本只打印掩码。
+    if (process.env.VB_ISO_API_KEY) {
+      const r = await submitApiKey(process.env.VB_ISO_API_KEY)
+      note('向隔离实例提交 API Key（只打印掩码）', r === 'saved' || r === 'already',
+        '结果=' + r + '  key=' + process.env.VB_ISO_API_KEY.slice(0, 6) + '…')
+    } else {
+      note('未提供 VB_ISO_API_KEY ⇒ 隔离实例建不了会话，动效节点不会挂载', false, '设这个环境变量可解锁')
+    }
+
 
 
     // ⑦ 跑验收步骤（显式绑定到本实例）
@@ -558,6 +569,15 @@ async function run() {
       VB_SKIP_ONBOARDING: '1',
       VB_PLUGIN_DIR: path.join(ROOT, 'plugin', 'dsh-bg-atelier-official'),
     }
+    // 通用逃生口：把任意诊断脚本放进**已绑定好的环境**里跑（诊断用，不参与判定）。
+    // 用 stdio:'inherit' 让输出**原样打出来** —— 诊断脚本的价值就在输出本身。
+    const extra = opt('extra-script', '')
+    if (extra) {
+      console.log('  --- 诊断脚本 ' + path.basename(extra) + '（输出直通） ---')
+      const rr = spawnSync(process.execPath, [path.resolve(extra)], { env, cwd: REPO, stdio: 'inherit' })
+      note('诊断脚本 ' + path.basename(extra), rr.status === 0, 'exit ' + rr.status)
+    }
+
     const baseDir = path.join(REPO, 'baselines', baseline)
     // 04 状态要用「标记图」；装进**隔离图库**（脚本用的是隔离 DSH_HOME，不碰用户图库）
     const needCapture = want.has('capture') || (want.has('compare') && !existsSync(path.join(baseDir, 'manifest.json')))
@@ -595,6 +615,51 @@ async function run() {
 /** 取 JSON（带超时，避免没有 AbortSignal 时挂死）。 */
 async function fetchJson(url, ms = 8000) {
   try { const r = await fetch(url, { signal: AbortSignal.timeout(ms) }); return await r.json() } catch { return null }
+}
+
+/**
+ * 把 API Key 填进首次运行引导（若在），让隔离实例能建会话。
+ * 返回 'saved' | 'already' | 'no-dialog' | 'no-input' | 'failed:<原因>'。
+ * ⚠️ 只打印掩码；密钥本身由应用写进隔离 home 的 .credentials.yaml（仓库外、不入 git）。
+ */
+async function submitApiKey(key) {
+  const list = await (await fetch('http://127.0.0.1:' + CDP + '/json/list')).json()
+  const page = list.find((t) => t.type === 'page' && String(t.url).includes('127.0.0.1:' + PORT))
+  if (!page) return 'no-page'
+  const ws = new WebSocket(page.webSocketDebuggerUrl)
+  await new Promise((r, j) => { ws.onopen = r; ws.onerror = () => j(new Error('ws')) })
+  let id = 0
+  const pend = new Map()
+  ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id) } }
+  const send = (m, p = {}) => new Promise((res) => { const i = ++id; pend.set(i, res); ws.send(JSON.stringify({ id: i, method: m, params: p })) })
+  const ev = async (x) => (await send('Runtime.evaluate', { expression: x, returnByValue: true, awaitPromise: true }))?.result?.result?.value
+  try {
+    // 已经配置过就别再填（避免把同一把钥匙反复写）
+    const hasDialog = await ev(`!![...document.querySelectorAll('button')].find(b=>String(b.textContent||'').trim()==='保存并继续')`)
+    if (!hasDialog) return 'already'
+    const wrote = await ev(`(()=>{
+      const btns=[...document.querySelectorAll('button')];
+      const save=btns.find(b=>String(b.textContent||'').trim()==='保存并继续'); if(!save) return 'no-save-btn';
+      const dlg=save.closest('[role="dialog"]')||document;
+      const inp=[...dlg.querySelectorAll('input')].find(i=>i.type==='password'||/api|密钥|key/i.test(i.placeholder||i.name||i.getAttribute('aria-label')||''))
+        ||[...dlg.querySelectorAll('input')][0];
+      if(!inp) return 'no-input';
+      const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+      set.call(inp, ${JSON.stringify(key)});
+      inp.dispatchEvent(new Event('input',{bubbles:true}));
+      inp.dispatchEvent(new Event('change',{bubbles:true}));
+      return 'filled:'+inp.type})()`)
+    if (String(wrote).startsWith('no-')) return wrote
+    await sleep(1200)
+    const clicked = await ev(`(()=>{const b=[...document.querySelectorAll('button')].find(x=>String(x.textContent||'').trim()==='保存并继续');if(!b)return 'gone';b.click();return 'clicked'})()`)
+    await sleep(4000)
+    const after = await ev(`(()=>{const b=[...document.querySelectorAll('button')].find(x=>String(x.textContent||'').trim()==='保存并继续');
+      return JSON.stringify({stillAsking:!!b, url:location.href.replace(/token=.*/,'***'), text:String(document.body.innerText||'').replace(/\\s+/g,' ').slice(0,120)})})()`)
+    console.log('    引导提交: ' + wrote + ' → ' + clicked + ' → ' + after)
+    return /"stillAsking":false/.test(String(after)) ? 'saved' : 'failed:仍在要求密钥'
+  } catch (e) {
+    return 'failed:' + String(e && e.message || e).slice(0, 60)
+  } finally { try { ws.close() } catch { /* noop */ } }
 }
 
 /**
