@@ -516,9 +516,9 @@ async function run() {
     //    ⚠️ 顺序不能反：页面首载时客户端会做一次 load/save，若那时磁盘上还没有底图，
     //    它就用默认值（无底图）存盘、把我们后来 PUT 的冲掉 ⇒ selftest 报"图片未就绪"、
     //    而且客户端那次存盘还会让字节级边界报"用户数据被改动"。实测踩过。
-    await bootstrapWallpaper(wpRes)
+    await bootstrapWallpaper(wpRes, baseline)
     note('已给隔离实例设一张测试底图（先于浏览器）', true,
-      wpRes && wpRes.categories[0] && wpRes.categories[0].items[0] && wpRes.categories[0].items[0].name)
+      '基准钉图或首张非标记图')
 
     // ⑥ 起隔离浏览器（独立 profile + CDP）
     const authUrl = (readFileSync(outf, 'utf8').match(/http:\/\/127\.0\.0\.1:\d+\/\?token=\S+/) || [null])[0]
@@ -584,14 +584,38 @@ async function fetchJson(url, ms = 8000) {
   try { const r = await fetch(url, { signal: AbortSignal.timeout(ms) }); return await r.json() } catch { return null }
 }
 
-/** 给全新 home 设一张测试底图（并把页面刷成加载到它）。 */
-async function bootstrapWallpaper(wp) {
-  const cat = wp && wp.categories && wp.categories[0]
-  const it = cat && cat.items && cat.items[0]
-  if (!it) return
+/**
+ * 给实例设一张底图（**必须确定**）。
+ *
+ * ⚠️ 踩过的坑：原来按"图库第一个分类的第一张"取 —— 而图库内容会变（装标记图后
+ * `_验收标记图` 排到 `测试图` 前面），于是**录基准时设的是 iso-A、空转对照时设的是
+ * marker**，同一份基准跨实例重启比出 `0 一致 / 8 有差异`（每态 1.2~1.5% 差异）。
+ * 那是**我自己 harness 的不确定性**，不是产品回归。
+ * 现在的优先级：① 基准里记的 `pinnedWallpaper`（保证与录基准时同一张）；
+ * ② 否则挑**非** `_验收标记图` 分类里字典序最小的那张（仍然确定，不随枚举顺序漂）。
+ */
+async function bootstrapWallpaper(wp, baseline) {
+  let chosen = null
+  try {
+    const mf = baseline && path.join(REPO, 'baselines', baseline, 'manifest.json')
+    if (mf && existsSync(mf)) {
+      const pin = JSON.parse(readFileSync(mf, 'utf8')).pinnedWallpaper
+      if (pin && pin.file) chosen = { cat: pin.cat, file: pin.file, name: pin.name, url: pin.url, hd: pin.hd, tags: pin.tags, no: pin.no, size: pin.size, id: pin.id }
+    }
+  } catch { /* 读不到就退到 ② */ }
+  if (!chosen) {
+    const cats = (wp && wp.categories ? wp.categories.slice() : [])
+      .filter((c) => c.name !== '_验收标记图')
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+    const cat = cats[0]
+    const items = cat && cat.items ? cat.items.slice().sort((a, b) => String(a.name).localeCompare(String(b.name))) : []
+    const it = items[0]
+    if (it) chosen = { cat: cat.name, file: it.name, name: it.base, url: it.url, hd: !!it.hd, tags: it.tags, no: it.no, size: it.size, id: cat.name + '\u0000' + it.name }
+  }
+  if (!chosen) return
   const body = {
     autoOn: false, autoMin: 30, zoom: 1, focus: '50% 50%', effect: 'firefly',
-    wallpaper: { id: cat.name + '\u0000' + it.name, cat: cat.name, file: it.name, name: it.base, url: it.url, hd: !!it.hd, tags: it.tags, no: it.no, size: it.size },
+    wallpaper: chosen,
   }
   try {
     await fetch('http://127.0.0.1:' + PORT + '/bga/settings.json', {
