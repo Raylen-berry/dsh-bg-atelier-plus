@@ -139,5 +139,43 @@ console.log('\n— ④ 连续写：任何时刻读到的都是"完整的某一�
   ok('★ 30 次连写，每次读到的都是合法对象（没有一次读到半截）', seen.size === 30, '见到 ' + seen.size + ' 个版本')
 }
 
+console.log('\n— ⑤ 覆盖写必须 fail closed（纯函数，服务端与客户端共用同一判据） —')
+{
+  const refuse = (() => {
+    const code = `
+${sliceFn('function refuseOverwriteReason(')}
+return refuseOverwriteReason;
+`
+    return new Function(code)()
+  })()
+  ok('状态 ok ⇒ 允许写', refuse('ok', undefined) === null)
+  ok('状态 missing（首次安装）⇒ 允许写', refuse('missing', undefined) === null)
+  ok('★ 状态 corrupt ⇒ **拒绝写**（默认不覆盖坏文件）', refuse('corrupt', undefined) === 'corrupt')
+  ok('★ 状态 io-error ⇒ **拒绝写**', refuse('io-error', undefined) === 'io-error')
+  ok('★ 显式带上 allow-overwrite=1 才放行（给"用户明确要重建"留出口）',
+    refuse('corrupt', '1') === null && refuse('io-error', '1') === null)
+  ok('★ 任何其它值（含 "true"/空串）都不等于放行 —— 只认精确的 "1"',
+    refuse('corrupt', 'true') === 'corrupt' && refuse('corrupt', '') === 'corrupt'
+    && refuse('corrupt', '01') === 'corrupt')
+}
+
+console.log('\n— ⑥ 客户端在"读到坏文件"时必须不开写闸 —')
+{
+  // 从 client.js 切出 load 的两段判定太脆（依赖 fetch/React）⇒ 这里只钉**判据本身**：
+  // 客户端与服务端必须用同一组"危险状态"，漏一个就会留下"坏文件被默认值覆盖"的路径。
+  const clientSrc = readFileSync(path.join(HERE, '..', 'client.js'), 'utf8')
+  ok('★ client.js 里对 corrupt/io-error 有明确处理（不是只处理 ok）',
+    /settingsReadStatus\s*===\s*'corrupt'/.test(clientSrc) && /settingsReadStatus\s*===\s*'io-error'/.test(clientSrc))
+  ok('★ client.js 读到危险状态时**不开写闸**（stateLoaded 不被置真）',
+    /res\.status === 'corrupt' \|\| res\.status === 'io-error'\) \{[\s\S]{0,240}?STORE\.saveStatus = 'protected'[\s\S]{0,120}?return/.test(clientSrc))
+  ok('★ save() 里有第二道显式闸（不依赖 stateLoaded 的开闸条件）',
+    /settingsReadStatus === 'corrupt' \|\| settingsReadStatus === 'io-error'\) return/.test(clientSrc))
+  const hostSrc = readFileSync(path.join(HERE, '..', 'index.js'), 'utf8')
+  ok('★ index.js 用响应头把读取状态告诉客户端',
+    /x-bga-settings-status/.test(hostSrc))
+  ok('★ index.js 的 PUT 在危险状态下返回 409（不是 200 假装成功）',
+    /refuseOverwriteReason\(cur\.status[\s\S]{0,240}?send\(409/.test(hostSrc))
+}
+
 console.log('\n宿主设置 IO：' + pass + ' 通过 / ' + fail + ' 失败')
 process.exit(fail === 0 ? 0 : 1)

@@ -116,6 +116,9 @@ var FOCI = [
 
 // 是否成功从 host 读到过设置（模块级、**不落盘**）：save() 的写盘闸，见 save/load 里的注释。
 var stateLoaded = false
+// 上一次读取时服务端报的状态（ok/missing/corrupt/io-error/unknown）。
+// 只有 ok/missing 才允许写盘；corrupt/io-error 时**不开闸**，避免把坏文件用默认值覆盖掉。
+var settingsReadStatus = 'unknown'
 
 var STORE = {
   state: {
@@ -191,6 +194,10 @@ var STORE = {
     // 整份 PUT 覆盖掉你的真实配置 —— 这正是"底图 / 特效突然全没了"的成因之一。
     // dsh-cache-control 早就有这道闸（它 state 里的 loaded），本插件一直缺。
     if (!stateLoaded) return
+    // 第二道闸（显式）：服务端报"文件坏了/读不了"时也绝不写盘。
+    // stateLoaded 在这种情况下本来就不会开，这里再写一遍是为了**意图明确** ——
+    // 将来别人改动 stateLoaded 的开闸条件时，这道闸还在。
+    if (settingsReadStatus === 'corrupt' || settingsReadStatus === 'io-error') return
     STORE.saveStatus = 'saving'
     STORE._savePending = true
     if (STORE._saveTimer) { clearTimeout(STORE._saveTimer); STORE._saveTimer = null }
@@ -217,9 +224,28 @@ var STORE = {
   },
   load: function () {
     return fetch('/bga/settings.json', { cache: 'no-store' })
-      .then(function (r) { if (!r.ok) throw new Error('settings unavailable'); return r.json() })
-      .then(function (saved) {
+      .then(function (r) {
+        if (!r.ok) throw new Error('settings unavailable')
+        // ⚠️ 服务端用响应头告诉我们"这次到底读到了什么"（审核方第十五轮点名：原来服务端
+        //    读失败也返回 {}，客户端分不清"新安装的空设置"与"文件坏了"）。
+        //    读不到这个头（老宿主）就当 unknown，行为与以前一致。
+        var st = ''
+        try { st = String(r.headers.get('x-bga-settings-status') || '') } catch (e) { st = '' }
+        return r.json().then(function (saved) { return { saved: saved, status: st || 'unknown' } })
+      })
+      .then(function (res) {
+        var saved = res.saved
         if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw new Error('invalid settings')
+        // ★ 文件损坏 / 读不了 ⇒ **绝不开写闸**。少了这一条：服务端把坏文件映射成 {}
+        //   ⇒ 客户端以为是新安装 ⇒ 随手点一下任何开关就把用户原来的整份配置覆盖掉（不可恢复）。
+        //   服务端也默认拒绝覆盖写（第二道闸），这里是不让用户无意间走到那一步。
+        if (res.status === 'corrupt' || res.status === 'io-error') {
+          settingsReadStatus = res.status
+          STORE.saveStatus = 'protected'
+          STORE.touch()
+          return
+        }
+        settingsReadStatus = res.status
         var patch = {}
         for (var k in STORE.state) if (k in saved) patch[k] = saved[k]
         // 一份"真设置"至少要能对上我们认识的一个字段；对不上就是 {} / 路由没就绪
@@ -2243,9 +2269,11 @@ function SettingsPage() {
             activeList?h('button',{type:'button',className:'bga-btn',onClick:function(){browse('all')}},'去图库选图'):null),
       h(LibraryTools,{refresh:refresh,loading:loading})))
   if(!stateLoaded) return h('div',{className:'bga-page bga-studio'},h('div',{className:'bga-empty',role:'status'},
-    h('b',null,STORE.saveStatus==='load-error'?'暂时无法读取设置':'正在打开底图工坊…'),
+    h('b',null,STORE.saveStatus==='protected'?'设置文件读取异常，已停止写入以保护你的配置'
+      :STORE.saveStatus==='load-error'?'暂时无法读取设置':'正在打开底图工坊…'),
+    STORE.saveStatus==='protected'?h('p',null,'检测到设置文件损坏或无法读取。为避免用默认值把它整份覆盖（那样原来的配置就找不回来了），底图工坊**不会写入**；你的界面仍可用默认外观。修好或移走该文件后点「重新读取」。'):null,
     STORE.saveStatus==='load-error'?h('p',null,'连接恢复后即可整理图单，现有设置会保留。'):null,
-    STORE.saveStatus==='load-error'?h('button',{type:'button',className:'bga-btn',onClick:function(){STORE.saveStatus='loading';STORE.touch();STORE.load()}},'重新连接'):null))
+    (STORE.saveStatus==='load-error'||STORE.saveStatus==='protected')?h('button',{type:'button',className:'bga-btn',onClick:function(){STORE.saveStatus='loading';STORE.touch();STORE.load()}},'重新读取'):null))
   return h('div',{className:'bga-page bga-studio'},
     h('header',{className:'bga-studio-heading'},h('div',null,h('h2',null,'底图工坊'),h('p',{className:'bga-muted'},'收藏画面，编成你的图单。')),
       h('span',{className:'bga-save-state',role:'status'},STORE.saveStatus==='error'?'保存失败':STORE.saveStatus==='saving'?'正在保存…':stateLoaded?'已保存':'正在连接…'),

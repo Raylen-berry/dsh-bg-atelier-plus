@@ -316,6 +316,22 @@ function readBody(req) {
 }
 
 /**
+ * 这次 PUT 该不该被拒绝（**纯函数 ⇒ 可离线测**）。
+ *
+ * 为什么必须有服务端这道闸（不只靠客户端）：客户端在"读到损坏文件"时看到的是一份
+ * 被映射成 `{}` 的响应，它会以为这是**新安装**，于是随手改一个开关就把用户原来的
+ * 配置整份覆盖掉 —— 不可恢复。客户端已经按响应头拒绝写盘（第一道闸），
+ * 但"写入方都可能出错"，服务端**默认不覆盖坏文件**才叫 fail closed。
+ *
+ * @returns {string|null} null=允许；否则返回当时的状态名（'corrupt' | 'io-error'）
+ */
+function refuseOverwriteReason(curStatus, allowHeader) {
+  if (curStatus === 'ok' || curStatus === 'missing') return null
+  if (String(allowHeader == null ? '' : allowHeader) === '1') return null
+  return curStatus
+}
+
+/**
  * 读设置 —— **必须区分四种情况**，不能都返回 `{}`。
  *
  * 审核方第十五轮点名这里的实现：原来 `catch { return {} }` 让
@@ -645,8 +661,30 @@ export async function apply(ctx) {
     path: SETTINGS_PATH,
     handler: async (req, res) => {
       const send = (status, obj) => sendJson(res, status, obj)
-      if (req.method === 'GET') { send(200, await readSettings()); return }
+      const cur = await readSettingsResult()
+      // 把"这次到底读到了什么"如实告诉客户端（**响应头**，不动 body：
+      // 客户端/工具链都需要它来判断"这个 {} 是新安装还是文件坏了"）。
+      try {
+        res.setHeader('x-bga-settings-status', cur.status)
+        if (cur.detail) res.setHeader('x-bga-settings-detail', encodeURIComponent(cur.detail.slice(0, 160)))
+      } catch { /* 头部不可设也不影响主流程 */ }
+      if (req.method === 'GET') {
+        if (cur.status === 'corrupt' || cur.status === 'io-error') {
+          console.error('[dsh-bg-atelier] 设置文件读取异常（' + cur.status + '）：' + String(cur.detail || '')
+            + ' —— 返回空对象并已用响应头告知客户端；**已阻止覆盖写**以免把原配置冲掉。')
+        }
+        send(200, cur.value == null ? {} : cur.value)
+        return
+      }
       if (req.method === 'PUT' || req.method === 'POST') {
+        // fail closed：文件坏了/读不了时**默认不覆盖**（客户端可显式带 allow-overwrite 头，
+        // 但它自己按状态头拒绝写盘了 ⇒ 正常路径根本不会走到这里）。
+        const refuse = refuseOverwriteReason(cur.status, req.headers && req.headers['x-bga-allow-overwrite'])
+        if (refuse) {
+          console.error('[dsh-bg-atelier] 拒绝覆盖写：设置文件当前状态 ' + refuse + '（' + String(cur.detail || '') + '）')
+          send(409, { ok: false, status: refuse, error: 'settings file is ' + refuse + '; refusing to overwrite it' })
+          return
+        }
         try {
           const parsed = JSON.parse(await readBody(req))
           if (!parsed || typeof parsed !== 'object') { send(400, { ok: false, error: 'invalid body' }); return }
