@@ -244,12 +244,45 @@ node tools/iso-instance.mjs run --name poc5 --root D:\DeepSeek\dsh-iso\poc5 \
   `.bga-studio` 位移 Δ+12、浅色面板 alpha 变化 **35.99%**、`.bga-orb` 位移 Δ+6
   ⇒ 稳定性**不是**靠消除输出换来的。
 - **要求 1**：关闭特效未作为方案（这条根因里根本用不到它）。
-- **要求 2（动效覆盖）—— 未完成，如实记**：`02-fx-nodes` 的 `note` 写的是"特效节点是否在位
-  （bga-orb / bga-dockfx / bga-ptl）"，但**实际探针是 `{"count":2,"nodes":["bga-orb","bga-orb-core"]}`
-  —— `bga-dockfx` / `bga-ptl` 根本不在位**。这个状态的**声明超过了它实际覆盖的范围**，
-  我此前把它算作"能验"属过度声明，**撤回**。要做的是：让该状态**真的挂载**动效节点
-  （需要确定性地打开一个会话，动效层在 composer dock 槽里）、在**固定时间点**采样，
-  并另测运动/开关/清理；随后加一条"动效节点缺失"的坏例，必须被检出。
+- **要求 2（动效覆盖）—— 本轮已完成**：`02-fx-nodes` 已重做成**真覆盖**（见本文件
+  「零之五之四」一节）。此前它的 `note` 声称覆盖 `bga-dockfx`/`bga-ptl`，而实际探针只有
+  `{"count":2,"nodes":["bga-orb","bga-orb-core"]}` —— **声明超出实际覆盖**；
+  我把它算作"能验"属过度声明，已撤回并由实测重建。
+
+## 零之五之四、`02-fx-nodes` 重做：真挂载 + 固定时间点采样（已完成，全绿）
+
+**为什么以前是假覆盖**：`DockFx` 注册在 **`conversation.composer.dock`**（`client.js:3133`）
+—— **没有会话就不挂载**；隔离实例首屏是"空的「新会话」"（hero 页）。更早那版还是 01 的复制
+（同一侧栏裁剪框 317×87），**即使挂载也不在比较框内**。双重缺口。
+
+**现在它做什么**（`tools/visual-baseline.mjs` 的 `02-fx-nodes`）：
+1. **真实鼠标**点侧栏会话行把会话打开（合成 `.click()` / 合成 `KeyboardEvent` 在本应用里
+   **都不生效**，实测）；找不到会话行就先点工作区展开再找（`resetToCleanHome` 之后常是收起的）。
+   选择器以**结构锚** `*sessionRow*` 为主、相对时间正则只作退路 —— 只靠"6分钟前"这类文案，
+   时间一走就匹配不到（实测跑几十分钟后整轮报"1 未就绪跳过"）。点完**验证** `.bga-dockfx`
+   在位，否则该状态大声拒绝参与比较。
+2. 裁剪框锚到**宿主自己的** `[data-composer-card]`：实测动效画布与它**完全重合**
+   （`dock{l:467,t:679,r:1233,b:777}` == `composerCard` 同值）⇒ 新增 `hostKind:'fx'`
+   （**不屏蔽内部**：粒子就画在卡片里；`pluginRectRel` 返回 null）。
+3. **不关特效**，改成**固定时间点采样**（`pinAnimMs: 1200`）：CSS `animation-play-state:paused`
+   ＋ `document.getAnimations()` 把每个动画的 `currentTime` 钉在同一绝对 t（含 delay 的时间轴
+   ⇒ 各粒子保持相对错位）＋ 强制一次布局提交与两帧 rAF。
+   ⚠️ 顺序有坑：采样必须在 `prepareEnvironment` **之后**，否则上一状态残留的 `#vb-env`
+   （`animation:none`）还在 ⇒ `getAnimations()` 返回 0，而报出来的原因却是"相位固定失败"。
+4. 探针改成**能证伪**：直接数画布里的真实节点
+   `{hasDock, hasIn, fly, star, meteor, dockSize}`（firefly 实测 19 fly / 14 star / 2 meteor）。
+
+**验证**：
+- `capture iso-r9` ✅ → **三次完整重启**（宿主+浏览器各起）各自 compare：
+  **8 一致 / 0 有差异 / 0 尺寸不符**，未测为 0，失败不自动重录基准；
+- **A 级坏例全过**，含新增 **`fx-nodes-missing`**（让 `DockFx` 直接 return null）：
+  oracle **必须失败** ✅（`6 一致 / 1 有差异 / 1 未就绪跳过`，探针状态变了），副本按 sha256 还原；
+- 覆盖审计 **38/38**。
+
+**顺带修掉的两处基础设施抖动**（都不是渲染差异，但都会污染结论）：
+· 页面表达式里用到 Node 侧变量时必须**插值成字面量**（否则页面 ReferenceError）；
+· `Page.captureScreenshot` **偶发 CDP 超时**：实测把"8 一致"的整轮冲成 exit 1 —— 已加 3 次重试，
+  仍失败照旧抛出（不吞、不把失败当通过）。
 
 做了两件事：① 用同一份基准 `iso-r2` 在**重起的同一实例**上空转 compare（不改任何东西）；
 ② 在同根同配置下**另起一次会话再录一份** `iso-r3`，两份基准逐状态比字节。

@@ -74,11 +74,39 @@ export const STATES = [
   },
   {
     name: '02-fx-nodes',
-    hostKind: 'sidebar',
-    note: '特效节点是否在位（bga-orb / bga-dockfx / bga-ptl）',
-    settleMs: 1500,
-    probe: `(()=>{const n=[...document.querySelectorAll('[class*="bga"]')].map(e=>e.className);
-      return JSON.stringify({count:n.length, nodes:n})})()`,
+    // ★ 2026-10-11 重做：此前这个状态是 01 的复制（同一侧栏裁剪框 317×87），而它声称覆盖的
+    //   `bga-dockfx` / `bga-ptl` **根本不在位** —— 声明超出实际覆盖（审核方指出，已确认）。
+    //   查明的挂载条件：`DockFx` 注册在 **conversation.composer.dock**（client.js:3133）
+    //   ⇒ **必须有会话**；而隔离实例首屏是"空的「新会话」"（hero 页）⇒ dock 不挂载。
+    //   现在的做法：
+    //     · 用**真实鼠标**点侧栏那条带"刚刚/N分钟前"的**会话**树项把会话打开
+    //       （合成 .click() / 合成 KeyboardEvent 在本应用里都不生效，实测）；
+    //     · 裁剪框锚到**宿主自己的** composer 卡片 `[data-composer-card]`：动效画布与它完全重合
+    //       （实测 dock{l:467,t:679,r:1233,b:777} == composerCard{l:467,t:679,r:1233,b:777}）；
+    //     · **不关特效**，改成把整条动画时间线钉在固定 t 采样（pinAnimations）。
+    hostKind: 'fx',
+    note: '动效画布的真实节点与外观（打开会话 → 锚在宿主 composer 卡片 → 固定 t=1200ms 采样）',
+    settleMs: 2500,
+    pinAnimMs: 1200,
+    requireSelector: '.bga-dockfx',
+    // 展开回退：找不到会话行时先点工作区节点把它展开（resetToCleanHome 之后常是收起的）
+    expandClick: `document.querySelectorAll('[role="treeitem"]')[0] || null`,
+    // ⚠️ 别只靠"刚刚/N分钟前"这类**相对时间文案**：会话列表里的时间是会走的（"6分钟"→"1小时"
+    //    → 某天就变成日期），实测跑了几十分钟后这个正则就匹配不到 ⇒ 状态直接"不参与比较"。
+    //    主判据改成**结构锚**：应用给会话行加了含 `sessionRow` 的类（与哈希前缀无关的那截），
+    //    并排除那条空的"新会话"；相对时间正则只作退路。
+    openRealClick: `(()=>{
+      const items=[...document.querySelectorAll('[role="treeitem"]')];
+      let cand=items.filter(e=>/sessionRow/.test(String(e.className))||e.querySelector('[class*="sessionRow"]'));
+      if(!cand.length) cand=items.filter(e=>/刚刚|[0-9]+\\s*(秒|分钟|小时|天|周|月)前?/.test(String(e.textContent||'')));
+      cand=cand.filter(e=>!String(e.textContent||'').trim().startsWith('新会话'));
+      return cand[0]||null})()`,
+    // 探针要能**证伪"动效节点在位"**：直接数画布里的真实节点，而不是列一遍 bga 类名。
+    probe: `(()=>{const dock=document.querySelector('.bga-dockfx');
+      const c={}; if(dock) for(const e of dock.querySelectorAll('*')){const k=String(e.className).split(/\\s+/)[0]; c[k]=(c[k]||0)+1}
+      return JSON.stringify({hasDock:!!dock, hasIn:!!document.querySelector('.bga-dockfx-in'),
+        fly:c['bga-fly']||0, star:c['bga-star']||0, meteor:c['bga-meteor']||0,
+        dockSize:dock?[dock.offsetWidth,dock.offsetHeight]:null})})()`,
   },
   {
     name: '03-settings-studio',
@@ -802,11 +830,62 @@ async function resetToCleanHome(log) {
  * 和"放宽容差"的区别：容差会把"整屏偏色"一起放过（审核方已证）；这里是**冻结一个连续变化的
  * 装饰层**，静态部分的灵敏度一点没降（容差仍为 0）。
  */
-async function prepareEnvironment(log) {
+/**
+ * 在**固定时间点**采样动效（审核方要求：动效状态不许靠关特效换稳定）。
+ *
+ * 做法：`document.getAnimations()` 拿到页面上所有 CSS 动画，把每个的 `currentTime` 设成同一个
+ * 绝对时间 T 再 `pause()`。`currentTime` 是**含 delay 的时间轴**，所以各粒子按各自声明的
+ * `animation-delay` 保持**相对错位**，只是整条时间线被钉在 T —— 这正是"固定时间点采样"，
+ * 而且纯 CSS 动画（client.js:1854 注释确认）都覆盖得到。
+ * 返回 false 表示一个动画都没拿到（那说明动效层没挂载）⇒ 调用方判该状态不可信。
+ */
+async function pinAnimations(ms, log) {
+  const r = await readState(`(()=>{
+    // ① CSS 层先停：currentTime 只改 Web Animations 的时间，**合成器上的动画**可能仍按自己的
+    //    时间线绘制（Chromium 已知行为）⇒ 必须再显式 pause，两道一起才真的定住。
+    let st=document.getElementById('vb-fxpin');
+    if(!st){ st=document.createElement('style'); st.id='vb-fxpin'; document.head.appendChild(st) }
+    st.textContent = '[class*="bga"]{animation-play-state:paused!important}[class*="bga"] *{animation-play-state:paused!important}';
+    // ② 时间线钉在同一个绝对 t（含 delay 的时间轴 ⇒ 各粒子保持相对错位）
+    const as=document.getAnimations(); let n=0, fail=0;
+    for(const a of as){ try{ a.currentTime=${ms}; a.pause() }catch(e){ fail++ } n++ }
+    // ③ 强制一次样式/布局提交 + 两帧 rAF，让暂停后的画面**真的**被光栅化
+    void document.body.offsetHeight;
+    return new Promise((res)=>requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      res(JSON.stringify({total:as.length, pinned:n, fail}))})));
+  })()`).catch(() => null)
+  if (log) console.log('     动效相位: 固定在 t=' + ms + 'ms  ' + r)
+  if (!r) return false
+  const j = JSON.parse(r)
+  return j.total > 0 && j.pinned > 0
+}
+
+/**
+ * 截图（带重试）。实测偶发 `CDP 超时: Page.captureScreenshot` —— 是**截图通道抖动**，不是渲染差异：
+ * 有一次它把"8 一致"的整轮冲成 exit 1（异常路径），与真回归混在一起难以分辨。
+ * 重试 3 次；仍失败就照旧抛出（**不吞**，也不把失败当成通过）。
+ */
+async function screenshot(what = '') {
+  let last = null
+  for (let i = 1; i <= 3; i++) {
+    try { return await cdp.send('Page.captureScreenshot', { format: 'png' }) } catch (e) {
+      last = e
+      console.error('     ⚠️ 截图失败（第 ' + i + '/3 次' + (what ? '，' + what : '') + '）：' + String(e && e.message || e).slice(0, 70))
+      await sleep(1200)
+    }
+  }
+  throw last
+}
+async function prepareEnvironment(log, opts = {}) {
+  // ⚠️ opts 是 **Node 侧**变量，页面表达式里看不到它 —— 必须插值成字面量再传进去。
+  //    踩过：直接写 opts.noAnimFreeze ⇒ 页面里 ReferenceError: opts is not defined（capture exit 1）。
+  const NO_ANIM = opts.noAnimFreeze ? 'true' : 'false'
   const r = await readState(`(()=>{
     let st=document.getElementById('vb-env');
     if(!st){ st=document.createElement('style'); st.id='vb-env'; document.head.appendChild(st) }
-    st.textContent = [
+    // ⚠️ 动效状态（opts.noAnimFreeze）**不注入** animation:none —— 那等于把动效层消除掉，
+    //    用"没有输出"换稳定（审核方明确不接受）。它改为在固定时间点采样（pinAnimations）。
+    st.textContent = ${NO_ANIM} ? '' : [
       // ② 停掉插件的动画装饰层（bga-fly / bga-star / bga-meteor）——见上方说明
       '[class*="bga"]{animation:none!important}',
       '[class*="bga"] *{animation:none!important}',
@@ -832,8 +911,12 @@ async function prepareEnvironment(log) {
     }
     const st2 = document.createElement('style'); st2.id = 'vb-env';
     st2.textContent = [
-      '[class*="bga"]{animation:none!important}',
-      '[class*="bga"] *{animation:none!important}',
+      // 动效状态（NO_ANIM=true）**不注入** animation:none：那等于消除动效输出换稳定，
+      // 审核方明确不接受；它改为在固定时间点采样（pinAnimations）。
+      ...(${NO_ANIM} ? [] : [
+        '[class*="bga"]{animation:none!important}',
+        '[class*="bga"] *{animation:none!important}',
+      ]),
       // ③ 停掉**输入框光标**（宿主 UI，不是插件输出）。
       //    实测：07/08 锚在宿主主体表面 [data-composer-card]，首页那个是"新会话"输入框，
       //    里面有个会闪的光标 ⇒ 抓图时正好一个是亮点、一个是底色，
@@ -1386,6 +1469,85 @@ async function prepareState(s, log, rel, basePluginRel, recordedPageState) {  //
     if (log) console.log('     打开②: ' + r2)
     await sleep(800)
   }
+  // 「真实鼠标点击」打开（**合成 .click() 在本应用里不生效** —— 实测：合成 click / 合成
+  // KeyboardEvent 都打不开会话，只有走 CDP Input 的真实指针事件才行）。
+  // `s.openRealClick` 是一段 JS，返回目标元素；工具取它的中心坐标后用真实鼠标事件点。
+  if (s.openRealClick) {
+    // 真实鼠标点击（合成 .click() 在本应用里不生效，实测）。
+    // `s.requireSelector`：点完**必须验证**目标真出现了 —— 侧栏树可能是收起的（点到的
+    // "默认工作区"会把会话列表收起来），所以先按原样点一次，不成立就**展开工作区再点一次**。
+    // 不验证的话，后面 pinAnimations 会拿到 0 个动画，报出来的原因是"相位固定失败"，
+    // 与真因（会话没打开）对不上号。
+    const clickTarget = async () => {
+      const armed = await readState(`(()=>{const el=(${s.openRealClick}); if(!el) return null;
+        const r=el.getBoundingClientRect(); return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),t:String(el.textContent||'').trim().slice(0,24)})})()`).catch(() => null)
+      if (!armed) return null
+      const p = JSON.parse(armed)
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await cdp.send('Input.dispatchMouseEvent', { type, x: p.x, y: p.y, button: 'left', clickCount: 1, buttons: type === 'mousePressed' ? 1 : 0 })
+      }
+      return p
+    }
+    const p1 = await clickTarget()
+    if (!p1) {
+      // ⚠️ 找不到会话树项**未必是没会话**：`resetToCleanHome` 之后工作区节点可能是**收起的**，
+      //    会话行压根没渲染（实测：treeitems 只剩"默认工作区"）。所以先把它展开再找。
+      if (s.expandClick) {
+        const exp = await readState(`(()=>{const el=(${s.expandClick}); if(!el) return null;
+          const r=el.getBoundingClientRect(); return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),t:String(el.textContent||'').trim().slice(0,20)})})()`).catch(() => null)
+        if (exp) {
+          const q = JSON.parse(exp)
+          for (const type of ['mousePressed', 'mouseReleased']) {
+            await cdp.send('Input.dispatchMouseEvent', { type, x: q.x, y: q.y, button: 'left', clickCount: 1, buttons: type === 'mousePressed' ? 1 : 0 })
+          }
+          if (log) console.log('     ' + s.name + '：先展开「' + q.t + '」（找不到会话树项）')
+          await sleep(2000)
+          const retry = await clickTarget()
+          if (retry) {
+            if (log) console.log('     打开（真实鼠标·展开后）: @' + retry.x + ',' + retry.y + '  "' + retry.t + '"')
+            await sleep(s.openSettleMs || 4000)
+          } else {
+            console.error('  ✗ ' + s.name + '：展开后仍找不到会话树项 ⇒ 这个状态本次不参与比较')
+            return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
+          }
+        } else {
+          console.error('  ✗ ' + s.name + '：openRealClick 没找到目标元素、expandClick 也没有 ⇒ 本次不参与比较')
+          return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
+        }
+      } else {
+        console.error('  ✗ ' + s.name + '：openRealClick 没找到目标元素 ⇒ 这个状态本次不参与比较')
+        return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
+      }
+    } else {
+      if (log) console.log('     打开（真实鼠标）: @' + p1.x + ',' + p1.y + '  "' + p1.t + '"')
+      await sleep(s.openSettleMs || 4000)
+    }
+    if (s.requireSelector) {
+      const sel = JSON.stringify(s.requireSelector)
+      let has = await readState(`!!document.querySelector(${sel})`).catch(() => false)
+      if (!has) {
+        if (log) console.log('     ' + s.requireSelector + ' 还没出现 ⇒ 展开工作区后再点一次')
+        const exp = await readState(`(()=>{const t=document.querySelectorAll('[role="treeitem"]')[0]; if(!t) return null;
+          const r=t.getBoundingClientRect(); return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()`).catch(() => null)
+        if (exp) {
+          const q = JSON.parse(exp)
+          for (const type of ['mousePressed', 'mouseReleased']) {
+            await cdp.send('Input.dispatchMouseEvent', { type, x: q.x, y: q.y, button: 'left', clickCount: 1, buttons: type === 'mousePressed' ? 1 : 0 })
+          }
+          await sleep(1800)
+          const p2 = await clickTarget()
+          if (log && p2) console.log('     重试（真实鼠标）: @' + p2.x + ',' + p2.y + '  "' + p2.t + '"')
+          await sleep(s.openSettleMs || 4000)
+          has = await readState(`!!document.querySelector(${sel})`).catch(() => false)
+        }
+      }
+      if (!has) {
+        console.error('  ✗ ' + s.name + '：点了会话树项但 ' + s.requireSelector + ' 仍不在位 ⇒ 这个状态本次不参与比较')
+        return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
+      }
+      if (log) console.log('     已确认 ' + s.requireSelector + ' 在位')
+    }
+  }
   await sleep(s.settleMs)
   // **等图片真的解码完**，而不是靠固定时长赌。
   // 实测踩到：页面刚重载（冷缓存）时，设置页里的底图预览要现解一张几 MB 的图，
@@ -1397,7 +1559,19 @@ async function prepareState(s, log, rel, basePluginRel, recordedPageState) {  //
   const ready = await waitImagesReady(log, s.expectHero === true)
   // 环境准备（见 prepareEnvironment 注释）：对话框背后垫固定底 + 停插件动画。
   // **必须在截图前**，且捕获与比对两次都执行，两边才看到同一种确定性画面。
-  const env = await prepareEnvironment(log)
+  const env = await prepareEnvironment(log, { noAnimFreeze: !!s.pinAnimMs })
+  // 动效状态：**不冻结动画**，改成"在固定时间点采样"（见 pinAnimations 注释）。
+  // ⚠️ 必须在 `prepareEnvironment` **之后**：那个函数负责把上一状态残留的 `#vb-env`
+  //   （里面是 `animation:none`）先删掉再重建；顺序反了的话，采样时动画仍被禁用 ⇒
+  //   `document.getAnimations()` 返回 0（实测就是这个原因，报出来的却是"相位固定失败"）。
+  if (s.pinAnimMs) {
+    const pin = await pinAnimations(s.pinAnimMs, log)
+    if (!pin) {
+      console.error('  ✗ ' + s.name + '：动效相位固定失败（getAnimations 拿不到动画 ⇒ 动效层没挂载）'
+        + ' ⇒ 这个状态本次不参与比较')
+      return { imagesReady: false, geometryOk: false, backdropOk: false, geom: null, layoutDrift: null }
+    }
+  }
   // ⚠️ 开着对话框的状态（03）**必须**拿到垫底，否则宿主 3% 透光会把会话内容透进面板，
   //   表现成**静默的 0.57% 假回归**（实测）—— 比大声失败坏得多，所以这里判为不可信。
   const needsBackdrop = s.expectHero === true
@@ -1650,7 +1824,7 @@ if (mode === 'capture') {
       throw new Error('垫底未生效：' + s.name)
     }
     const probeValue = await readState(s.probe)
-    const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
+    const shot = await screenshot()
     const file = path.join(baseDir, s.name + '.png')
     fs.writeFileSync(file, Buffer.from(shot.data, 'base64'))
     manifest.states.push({
@@ -1734,7 +1908,7 @@ if (mode === 'capture') {
       stOk('插件元素几何核对', false, '几何与基准记录不符 ⇒ 裁剪区域失准（详见上方错误）')
     } else { stOk('插件元素几何核对', true) }
 
-    const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
+    const shot = await screenshot()
     const raw = decodePng(Buffer.from(shot.data, 'base64'))
     const sc = cssScale(raw, prep && prep.geom ? prep.geom.cssWidth : REF_CSS_WIDTH)
     // 用**实测导出的几何**（不是写死常量）—— 否则 selftest 在别的窗口尺寸下会验到错的块
@@ -1878,7 +2052,7 @@ if (mode === 'capture') {
       continue
     }
     const probeNow = await readState(state ? state.probe : 'null')
-    const shot = await cdp.send('Page.captureScreenshot', { format: 'png' })
+    const shot = await screenshot()
     const nowFile = path.join(baseDir, s.name + '.after.png')
     fs.writeFileSync(nowFile, Buffer.from(shot.data, 'base64'))
     // 裁稳定区 →（尺寸不同时）跨 DPI 归一 → 逐像素比。

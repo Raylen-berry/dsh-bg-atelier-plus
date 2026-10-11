@@ -74,6 +74,17 @@ const MUTATIONS = [
     to: "'.bga-orb{border:none;background:none;padding:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;margin-left:6px}'",
     expectAny: ['布局漂移', '像素差异'],
   },
+  {
+    // 审核方要求 4 的动效那一半：**动效节点缺失必须被检出**。
+    // 这条只在"真的挂载了动效节点"的前提下才有意义 —— 正是本轮把 02-fx-nodes 重做成了这样。
+    // 两条路径都会响：状态探针（hasDock/fly/star 计数归零）与像素（画布上什么都不画）。
+    name: 'fx-nodes-missing',
+    desc: '让 DockFx 直接返回 null —— 动效画布与全部粒子节点消失（真实功能回归）',
+    file: 'client.js',
+    from: 'function DockFx() {',
+    to: 'function DockFx() {\n  return null   // A 级坏例：动效层整体消失',
+    expectAny: ['探针', '像素差异', '动效'],
+  },
 ]
 
 async function clearCacheAndReload() {

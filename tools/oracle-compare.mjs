@@ -295,6 +295,28 @@ export function deriveGeom(hostKind, a, rel) {
       rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, w: rect.x1 - rect.x0, h: rect.y1 - rect.y0, masks: relMasks },
     }
   }
+  // 'fx'：动效画布状态。锚点仍是**宿主自己的** composer 卡片（[data-composer-card]），
+  // 因为实测 `.bga-dockfx` 与它**完全重合**（dock{l:467,t:679,r:1233,b:777} == card 同值）。
+  // ⚠️ 与 'surface' 的区别：**不屏蔽内部** —— 粒子就画在卡片内部；而 'surface' 屏蔽内文是因为
+  //    那里只有宿主的输入框文字（会随会话变化）。动效状态必须在打开**同一个会话**的前提下比，
+  //    否则宿主文字变化会带进假回归（这一条写进状态的 openRealClick：固定打开最近会话）。
+  if (hostKind === 'fx') {
+    if (!a.surface) return null
+    const host = a.surface
+    if (rel) {
+      const rect = rectFromRel(host, rel)
+      return {
+        cssWidth, hostKind: 'fx', host, rel, rect,
+        masks: (rel.masks || []).map(([x0, y0, x1, y1]) =>
+          [rect.x0 + x0, rect.y0 + y0, rect.x0 + x1, rect.y0 + y1]),
+      }
+    }
+    const rect = { x0: host.l, y0: host.t, x1: host.r, y1: host.b }
+    return {
+      cssWidth, hostKind: 'fx', host, rect, masks: [],
+      rel: { left: 0, top: 0, right: 0, bottom: 0, w: rect.x1 - rect.x0, h: rect.y1 - rect.y0, masks: [] },
+    }
+  }
   // 'surface'：宿主"主体表面"节点（由调用方传入 a.surface，例如 [data-composer-card]）。
   // 用途见下面的主题/透明度状态：插件会按深浅主题改这个宿主节点的底色
   //（client.js 的 `body[data-ds-dark-theme] [data-composer-card]{background:…}`），
@@ -371,7 +393,7 @@ export function deriveGeom(hostKind, a, rel) {
 export function pluginRectRel(pluginKind, a) {
   // 'surface'（主题/透明度状态锚在宿主主体表面上）没有"插件自己的元素"可断言 ⇒ 返回 null，
   // 调用方据此跳过布局契约（不是失败）。
-  if (pluginKind === 'surface') return null
+  if (pluginKind === 'surface' || pluginKind === 'fx') return null
   const host = pluginKind === 'studio' ? a.dlg : a.sidebar
   if (!host) return null
   if (pluginKind === 'studio') {

@@ -716,6 +716,18 @@ async function runStep(label, argv, env, note) {
   const fails = (r.out.match(/❌[^\n]*/g) || []).slice(0, 3).map((s) => s.trim().slice(0, 110))
   note(label + ' ⇒ exit ' + r.code, r.code === 0, verdict)
   for (const f of fails) console.log('        ' + f)
+  // 失败时把**输出尾部**打出来 —— 有些失败走的是 ✗/拒绝 路径、不带 ❌，只看 ❌ 会两眼一抹黑。
+  // 同时把**完整输出存盘**：只印尾部会丢掉"哪个状态未就绪/为什么"这类关键中间行
+  // （踩过：4 次连续失败都是"1 未就绪跳过"，但日志里查不出是哪个状态）。
+  if (r.code !== 0) {
+    for (const l of r.out.split(/\r?\n/).filter((x) => x.trim()).slice(-14)) console.log('        | ' + l.trim().slice(0, 150))
+    try {
+      const dir = path.join(ROOT, 'logs'); mkdirSync(dir, { recursive: true })
+      const f = path.join(dir, label.replace(/[^\w.-]+/g, '_') + '.log')
+      writeFileSync(f, r.out, 'utf8')
+      console.log('        完整输出: ' + f)
+    } catch { /* 存盘失败不影响判定 */ }
+  }
   return r
 }
 
