@@ -525,8 +525,21 @@ async function run() {
     if (!authUrl) note('拿到带 token 的认证 URL', false, 'stdout 里没找到；浏览器可能 401')
     const bprof = path.join(ROOT, 'browser-profile')
     mkdirSync(bprof, { recursive: true })
+    // ★ 确定性渲染参数（**单变量定位出来的根因**，不是猜的）：
+    //   同一根、同一配置、不改代码，两次独立会话录制，8/8 状态 PNG 字节都不同；
+    //   空转 compare 得 0 一致 / 8 有差异（每态 1.2~1.5%，通道差 ±1 为主、边缘到 ~32）。
+    //   逐项对照后排除了：底图取错（改确定性取图后数字不变）、缓存差异（隔离 home 无缓存目录）、
+    //   布局/状态/探针差异（两份基准的 geom/pageState/probe 8/8 完全相同）。
+    //   **只加 `--force-color-profile=srgb`** 再跑两次独立会话 ⇒ **8/8 状态字节完全相同、框内差异 0**。
+    //   ⇒ 根因是浏览器启动时对显示器色彩配置的采样，与插件/动效无关。
+    //   所以这里把"渲染环境确定"做成**默认**，而不是靠关特效或缩小比较区去换稳定性。
+    //   （`--chrome-flags` 只能**追加**诊断参数；`--hide-scrollbars` 之类会改布局的不要加——
+    //     实测它会改几何导致 capture 被拒。）
+    const extraFlags = String(opt('chrome-flags', '')).split(/\s+/).filter(Boolean)
+    const chromeFlags = ['--force-color-profile=srgb', ...extraFlags]
+    if (extraFlags.length) console.log('  [诊断] Chrome 额外启动参数: ' + extraFlags.join(' '))
     browser = spawn(CHROME, ['--user-data-dir=' + bprof, '--remote-debugging-port=' + String(CDP),
-      '--no-first-run', '--no-default-browser-check', authUrl || ('http://127.0.0.1:' + PORT + '/')],
+      '--no-first-run', '--no-default-browser-check', ...chromeFlags, authUrl || ('http://127.0.0.1:' + PORT + '/')],
       { stdio: 'ignore', windowsHide: true })
     const cdpUp = await waitPort(CDP, 60000)
     note('隔离浏览器 CDP ' + CDP + ' 就绪', cdpUp, browser ? 'PID ' + browser.pid : '')
