@@ -281,6 +281,38 @@ try {
   console.error('  ⚠️ 无法启用 focus 模拟（' + String(e && e.message || e).slice(0, 60) + '）⇒ 若标签页在后台，画面确认可能失败')
 }
 
+/**
+ * **视口必须由本脚本钉住**（`VB_VIEWPORT=宽x高@DPR`，如 `1426x807@1.1666666269302368`）。
+ *
+ * 为什么不能靠浏览器窗口：
+ *  ① `Emulation.setDeviceMetricsOverride` 只作用于**设置它的那个 CDP 会话** ——
+ *     实测：在另一个进程里设过，本进程连上来时视口又回到窗口自然尺寸（隔离实例上量到 1068×1122），
+ *     于是所有几何都变了、面板布局也不同（`.bga-studio` 560×977 vs 560×1341）。
+ *  ② 契约要求"报告绑定视口" —— 那就得由验收动作本身把视口设成记录的那个，而不是"但愿窗口没变"。
+ * 不传就沿用页面当前视口（并在日志里如实报出来，便于发现不一致）。
+ */
+const viewportSpec = process.env.VB_VIEWPORT
+if (viewportSpec) {
+  const m = /^(\d+)x(\d+)@([\d.]+)$/.exec(viewportSpec)
+  if (!m) {
+    console.error('  ✗ VB_VIEWPORT 格式不对（应为 宽x高@DPR，如 1426x807@1.1666666269302368）：' + viewportSpec)
+    process.exit(2)
+  }
+  try {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: Number(m[1]), height: Number(m[2]), deviceScaleFactor: Number(m[3]), mobile: false,
+    })
+    console.log('  视口: 已钉为 ' + m[1] + 'x' + m[2] + ' @DPR' + m[3] + '（VB_VIEWPORT）')
+  } catch (e) {
+    console.error('  ✗ 设置视口失败：' + String(e && e.message || e).slice(0, 80))
+    process.exit(4)
+  }
+}
+{
+  const vp = await readState(`JSON.stringify({w:innerWidth,h:innerHeight,dpr:devicePixelRatio})`).catch(() => null)
+  console.log('  视口实测: ' + (vp || '读不到') + (viewportSpec ? '' : '（未传 VB_VIEWPORT ⇒ 用的是页面当前视口）'))
+}
+
 // 开工前先探页面网络通道（见 preflightPageFetch 注释：挂了的话后面会以一个看不懂的超时崩）
 {
   const probe = await preflightPageFetch()
@@ -649,7 +681,10 @@ async function restoreRotation(before, log) {
       method:'PUT', headers:{'content-type':'application/json'},
       body: ${JSON.stringify(JSON.stringify(merged))},
     });
-    return res.ok ? 'autoOn=true 已写盘（字段 ' + ${Object.keys(merged).length} + ' 个）' : 'PUT failed ' + res.status;
+    // ⚠️ 日志必须写**实际**写入的值。原来这里硬编码 'autoOn=true'，而还原的目标值
+    //    可能是 false（冻结点原本就是关的）—— 实测日志显示 true、磁盘是 false，
+    //    这种"日志与事实不符"和假绿一样坏：报告里会留下错误的还原证据。
+    return res.ok ? 'autoOn=' + ${JSON.stringify(String(wantAutoOn))} + ' 已写盘（字段 ' + ${Object.keys(merged).length} + ' 个）' : 'PUT failed ' + res.status;
   })()`)
   if (log) console.log('     轮播还原·写盘: ' + r)
 
@@ -924,8 +959,9 @@ async function finalizeAll(autoBefore) {
     console.error('  ✗ 边界核对抛错：' + String(e && e.message || e).slice(0, 90) + ' —— 按失败处理（6）')
     bump(6, '边界核对抛错')
   }
-  // ④ 关掉 focus 模拟（不依赖上面任何一步）
+  // ④ 关掉 focus 模拟 + 清掉本脚本设的视口覆盖（不依赖上面任何一步）
   try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }) } catch { /* 关不掉不影响退出码 */ }
+  try { await cdp.send('Emulation.clearDeviceMetricsOverride') } catch { /* 同上 */ }
 }
 
 /** 这次**实际参与比较**的设备像素尺寸（录制时算一次存进基准，比对时用来查覆盖缩水）。 */
@@ -1277,8 +1313,32 @@ async function switchWallpaperTo(ident, log) {
   return true
 }
 
-async function prepareState(s, log, rel, basePluginRel, recordedPageState) {
-  // 为什么必须做：上一次状态可能开着面板，不复位的话后面的状态会**继承**它 ——
+/**
+ * 若页面上有"首次运行引导"对话框，用应用自己的按钮过掉它。
+ * 只认几个**应用自有**的按钮文案；找不到就什么都不做（返回 'none'）——
+ * 绝不猜、绝不瞎点。返回 'none' | 'clicked:<文案>' | 'still-blocked'。
+ */
+async function dismissOnboardingIfPresent(maxRounds = 3) {
+  const texts = ['稍后配置', '保存并继续', '继续', '跳过']
+  for (let round = 0; round < maxRounds; round++) {
+    const r = await readState(`(()=>{
+      const d=document.querySelector('[role="dialog"]'); if(!d) return 'no-dialog';
+      const want=${JSON.stringify(texts)};
+      const btns=[...d.querySelectorAll('button,[role="button"]')];
+      // 只有"看起来是引导"的对话框才动：它里面出现这些按钮且**没有**插件导航项
+      const hasNav=[...d.querySelectorAll('*')].some(e=>e.children.length===0&&String(e.textContent||'').trim()==='底图工坊');
+      if(hasNav) return 'has-nav';
+      for(const t of want){ const b=btns.find(x=>String(x.textContent||'').trim()===t); if(b){ b.click(); return 'clicked:'+t } }
+      return 'still-blocked'})()`).catch(() => 'read-failed')
+    if (r === 'clicked:' + r.slice(8)) { await sleep(1200); continue }
+    if (r === 'has-nav' || r === 'no-dialog') return 'none'
+    if (r === 'read-failed') return 'read-failed'
+    await sleep(1200)
+  }
+  return 'still-blocked'
+}
+
+async function prepareState(s, log, rel, basePluginRel, recordedPageState) {  // 为什么必须做：上一次状态可能开着面板，不复位的话后面的状态会**继承**它 ——
   // 实测踩到过：三个状态全都带着同一个面板，基准之间只差 0.05%，等于没区分开。
   // 关掉 dsh-browser-live 的观察窗：它**实时镜像当前页面**（截出来的图里能看到 FPS 计数与
   // 递归的自己），每帧都在变 ⇒ 天然不可复现。实测：不关它，零改动两次捕获差 0.231%；
@@ -1306,6 +1366,15 @@ async function prepareState(s, log, rel, basePluginRel, recordedPageState) {
 
   if (s.reset !== false) {
     await resetToCleanHome(log)
+  }
+  // 隔离实例专用：**全新 DSH_HOME 每次加载都会弹账号引导**，挡住设置对话框里的
+  // 「底图工坊」导航 ⇒ 03/04 永远打不开面板。用应用**自己的**「稍后配置」把它过掉。
+  // 必须显式开启（VB_SKIP_ONBOARDING=1）并**大声记录**：这是环境适配，不是产品行为，
+  // 不能让它在生产实例上悄悄生效、也不能静默改变被验收的画面。
+  // 替代方案（未采用）：把你 .credentials.yaml 里的真实密钥拷进测试 home —— 那要你明确同意。
+  if (process.env.VB_SKIP_ONBOARDING === '1') {
+    const dis = await dismissOnboardingIfPresent()
+    if (log && dis !== 'none') console.log('     引导: ' + dis + '（VB_SKIP_ONBOARDING=1）')
   }
   if (s.open) {
     const r1 = await readState(s.open)
