@@ -95,6 +95,19 @@ function buildProfile() {
   for (const f of ['.modules.yaml', '.pnpm-workspace-state-v1.json']) {
     if (existsSync(path.join(srcNm, f))) copyFileSync(path.join(srcNm, f), path.join(prof, 'node_modules', f))
   }
+  // ⚠️ `.pnpm` 目录也必须一起拷：漏了它，宿主**会加载完就退出**（插件日志正常打印
+  //    "host up" 与 token URL，但端口随后不再监听，表现为"60 秒内端口没起来"）。
+  //    实测：手工建的那份拷了 `.pnpm` 能长期存活；脚本第一版漏了它就不行。
+  if (existsSync(path.join(srcNm, '.pnpm'))) {
+    const copyDir = (s, d) => {
+      mkdirSync(d, { recursive: true })
+      for (const e of readdirSync(s, { withFileTypes: true })) {
+        if (e.isDirectory()) copyDir(path.join(s, e.name), path.join(d, e.name))
+        else copyFileSync(path.join(s, e.name), path.join(d, e.name))
+      }
+    }
+    copyDir(path.join(srcNm, '.pnpm'), path.join(prof, 'node_modules', '.pnpm'))
+  }
   // package.json：bundles 取最小集（base + web-app + 本插件），依赖指向**副本**
   writeFileSync(path.join(prof, 'package.json'), JSON.stringify({
     name: 'dsh-profile-iso-web', private: true,
@@ -214,12 +227,16 @@ async function up() {
     '$env:DSH_HOME=' + q(path.join(ROOT, 'home')),
     startProc,
     'Set-Content -Path ' + q(pidf2) + ' -Value $p.Id -Encoding ASCII',
-    '$p.Id',
   ].join('; ')
-  const r0 = spawnSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8' })
-  const pid = Number(String(r0.stdout || '').trim().split(/\r?\n/).filter(Boolean).pop())
+  // ⚠️ **必须 `stdio:'ignore'`**：`spawnSync` 会等子进程的 stdout 管道关闭，而
+  //    `Start-Process` 起的**孙子进程**（DSH 宿主）继承着那个管道 ⇒ 永远等不到 EOF，
+  //    脚本就卡在这次 spawnSync 上（实测：宿主已起来、端口与日志都对，脚本却停在
+  //    "测试图库: …" 之后一行都不输出）。改成不接管管道、只从文件读 PID。
+  spawnSync('powershell', ['-NoProfile', '-Command', ps], { stdio: 'ignore' })
+  let pid = 0
+  try { pid = Number(String(readFileSync(pidf2, 'utf8')).trim()) } catch { pid = 0 }
   if (!pid) {
-    console.error('  ✗ 启动失败：' + String((r0.stderr || r0.stdout || '')).slice(0, 200))
+    console.error('  ✗ 启动失败（没能从 ' + pidf2 + ' 读到 PID）')
     process.exit(1)
   }
   console.log('  已启动，PID = ' + pid)
@@ -270,16 +287,16 @@ async function up() {
   if (WITH_BROWSER) {
     const bprof = path.join(ROOT, 'browser-profile')
     mkdirSync(bprof, { recursive: true })
-    // 同宿主：用 Start-Process 起（node spawn detached 起的那个宿主会自己退出；
-    // 浏览器没单独试过 spawn，统一走已验证的路径，少一个变量）
-    // 同宿主：用 Start-Process 起（同样必须拼成**一个语句**）
+    // 同宿主：用 Start-Process 起（同样必须拼成**一个语句**、同样 stdio:'ignore' 免得等管道）
     const bArgs = ['--user-data-dir=' + bprof, '--remote-debugging-port=' + CDP,
       '--no-first-run', '--no-default-browser-check', authUrl || ('http://127.0.0.1:' + PORT + '/')]
+    const bpidf = path.join(ROOT, 'browser.pid')
     const bps = '$p = Start-Process -FilePath ' + q(CHROME)
       + ' -ArgumentList @(' + bArgs.map(arg).join(',') + ')'
-      + ' -PassThru -WindowStyle Minimized; $p.Id'
-    const br = spawnSync('powershell', ['-NoProfile', '-Command', bps], { encoding: 'utf8' })
-    browserPid = Number(String(br.stdout || '').trim().split(/\r?\n/).filter(Boolean).pop()) || null
+      + ' -PassThru -WindowStyle Minimized'
+      + '; Set-Content -Path ' + q(bpidf) + ' -Value $p.Id -Encoding ASCII'
+    spawnSync('powershell', ['-NoProfile', '-Command', bps], { stdio: 'ignore' })
+    try { browserPid = Number(String(readFileSync(bpidf, 'utf8')).trim()) || null } catch { browserPid = null }
     const okCdp = await waitPort(CDP, 40000)
     console.log('  ' + (okCdp ? '✅' : '❌') + ' 隔离浏览器 CDP 端口 ' + CDP + '（PID ' + browserPid + '）')
     if (!okCdp) { killRecorded(browserPid, 'CDP 起不来'); killRecorded(pid, '连带'); process.exit(1) }
@@ -320,7 +337,112 @@ async function status() {
   } catch (e) { console.log('    读 /bga/wallpapers.json 失败：' + String(e && e.message).slice(0, 80)) }
 }
 
-if (cmd === 'up') await up()
+/**
+ * `prepare`：只**准备**（插件副本 + profile + 测试图库），然后打印**在 shell 里**执行的启动命令。
+ *
+ * 为什么不在这里启动（实测结论，很重要）：从 Node 里经 `spawnSync(powershell → Start-Process)`
+ * 起的宿主会被 **Windows Job 对象**连坐回收 —— 宿主日志与端口都正常，几秒后进程就没了
+ * （harness 还报过 "Windows Job runner exited …"）。而**直接在 shell 里**跑同一句
+ * `Start-Process` 起的宿主能长期存活（POC 实例跑了一小时以上）。启动这一步交给 shell。
+ */
+function prepare() {
+  console.log('=== 准备隔离验收实例：' + NAME + ' ===')
+  console.log('  根目录: ' + ROOT)
+  mkdirSync(ROOT, { recursive: true })
+  const prodSettings = path.join(PROD_HOME, 'dsh-bg-atelier-plus', 'settings.json')
+  const prodHash = existsSync(prodSettings) ? sha(prodSettings) : '(无)'
+  const plugin = buildPluginCopy()
+  const prof = buildProfile()
+  const lib = buildTestLibrary()
+  console.log('  插件副本: ' + plugin)
+  console.log('  profile: ' + prof)
+  console.log('  测试图库: ' + lib)
+  console.log('  生产 settings.json 当前哈希（记下来，起停前后必须不变）: ' + prodHash.slice(0, 16))
+  const token = '<token 会打印在宿主 stdout>'
+  console.log('\n  ① 在 shell 里跑这一条起宿主（已含独立 DSH_HOME 与端口）：\n')
+  console.log('  $env:ELECTRON_RUN_AS_NODE="1"; $env:DSH_HOME="' + path.join(ROOT, 'home') + '"; '
+    + 'Start-Process -FilePath "' + EXE + '" -ArgumentList @('
+    // ⚠️ 参数里的路径必须带**内层双引号**：Start-Process 会把数组用空格拼再交给子进程，
+    //    不给含空格的项加引号 ⇒ `E:\DeepSeek Harness\...` 被拆成两个参数，子进程报
+    //    "Cannot find module 'E:\DeepSeek'"。POC1 当初能跑就是因为带了内层引号。
+    + hostArgs(PORT).map((a) => '\\"' + a + '\\"').join(', ')
+    + ') -PassThru -WindowStyle Hidden -RedirectStandardOutput "' + path.join(ROOT, '_run.out')
+    + '" -RedirectStandardError "' + path.join(ROOT, '_run.err') + '"')
+  console.log('\n  ② 等端口起来后跑：node tools/iso-instance.mjs verify --name ' + NAME + ' --root ' + ROOT + ' --port ' + PORT)
+  console.log('  ③ 起浏览器（可选）：加上 --browser 到 verify（会拉起独立 profile 的 Chrome 并等 CDP）')
+  console.log('\n  ' + token)
+}
+
+/** 宿主启动参数（cli.js 的 web 子命令）。 */
+function hostArgs(port) {
+  return ['--expose-internals', CLI, 'web', '--host', '127.0.0.1', '--port', String(port), '--no-open']
+}
+
+/** `verify`：对**已经起来**的实例做隔离证明 + 落 instance.json（证明不过就不写、返回失败）。 */
+async function verify() {
+  console.log('=== 隔离证明：' + NAME + ' @端口 ' + PORT + ' ===')
+  if (!await waitPort(PORT, 15000)) {
+    console.error('  ✗ 端口 ' + PORT + ' 没在听 ⇒ 宿主没起来（① 那条命令跑了吗？）')
+    process.exit(1)
+  }
+  const H = async (p, ms = 8000) => {
+    try { return await fetch('http://127.0.0.1:' + PORT + p, { signal: AbortSignal.timeout(ms) }) } catch { return null }
+  }
+  const sr = await H('/bga/settings.json')
+  const wr = await H('/bga/wallpapers.json')
+  const head = sr ? sr.headers.get('x-bga-settings-status') : null
+  let roots = null
+  try { roots = wr ? await wr.json() : null } catch { roots = null }
+  const prodSettings = path.join(PROD_HOME, 'dsh-bg-atelier-plus', 'settings.json')
+  const prodHash = existsSync(prodSettings) ? sha(prodSettings) : '(无)'
+  const inRoot = (p) => typeof p === 'string' && path.resolve(p).toLowerCase().startsWith(path.resolve(ROOT).toLowerCase())
+  const proof = [
+    ['插件接口活着（/bga/wallpapers.json 有响应）', !!roots, roots ? 'total=' + roots.total : '无响应'],
+    ['插件 writableDir 在隔离根下', !!roots && inRoot(roots.writableDir), roots && roots.writableDir],
+    ['插件图库 dir 在隔离根下', !!roots && inRoot(roots.dir), roots && roots.dir],
+    ['图库只看到测试分类', !!roots && roots.categories.every((c) => c.name === '测试图' || c.name === '_验收标记图'),
+      roots && roots.categories.map((c) => c.name).join(',')],
+    ['新接口状态头可用', head !== null, 'x-bga-settings-status=' + head],
+    ['生产 settings.json 哈希（本实例未改它）', true, prodHash.slice(0, 16)],
+  ]
+  let bad = 0
+  for (const [n, okv, extra] of proof) {
+    console.log('  ' + (okv ? '✅' : '❌') + ' ' + n + (extra ? '  [' + String(extra).slice(0, 90) + ']' : ''))
+    if (!okv) bad++
+  }
+  if (bad) { console.error('  ✗ 隔离无法证明 ⇒ 不算成立'); process.exit(1) }
+
+  let authUrl = null
+  try { authUrl = (readFileSync(path.join(ROOT, '_run.out'), 'utf8').match(/http:\/\/127\.0\.0\.1:\d+\/\?token=\S+/) || [null])[0] } catch { /* noop */ }
+  let hostPid = null
+  try { hostPid = Number(String(readFileSync(path.join(ROOT, 'instance.pid'), 'utf8')).trim()) || null } catch { /* noop */ }
+  let browserPid = null
+  if (WITH_BROWSER) {
+    const bprof = path.join(ROOT, 'browser-profile')
+    mkdirSync(bprof, { recursive: true })
+    const bArgs = ['--user-data-dir=' + bprof, '--remote-debugging-port=' + CDP,
+      '--no-first-run', '--no-default-browser-check', authUrl || ('http://127.0.0.1:' + PORT + '/')]
+    const bps = '$p = Start-Process -FilePath ' + q(CHROME) + ' -ArgumentList @(' + bArgs.map(arg).join(',') + ') -PassThru -WindowStyle Minimized'
+    spawnSync('powershell', ['-NoProfile', '-Command', bps], { stdio: 'ignore' })
+    browserPid = null
+    const okCdp = await waitPort(CDP, 40000)
+    console.log('  ' + (okCdp ? '✅' : '❌') + ' 隔离浏览器 CDP ' + CDP + (okCdp ? '' : '（没起来；可手起 Chrome）'))
+    if (!okCdp) bad++
+  }
+  if (bad) process.exit(1)
+  const inst = { name: NAME, root: ROOT, port: PORT, cdpPort: CDP, pid: hostPid, browserPid, home: path.join(ROOT, 'home'), plugin: path.join(ROOT, 'plugin', 'dsh-bg-atelier-official'), authUrl, startedAt: new Date().toISOString(), prodSettingsHashAtVerify: prodHash }
+  writeFileSync(INSTANCE_JSON, JSON.stringify(inst, null, 2), 'utf8')
+  console.log('  → 已写 ' + INSTANCE_JSON)
+  console.log('  绑定用：')
+  console.log('    DSH_HOME=' + inst.home)
+  console.log('    VB_GUI_HOST=127.0.0.1:' + PORT + '   VB_CDP_PORT=' + CDP)
+  console.log('    VB_VIEWPORT=1426x807@1.1666666269302368  VB_SKIP_ONBOARDING=1')
+  console.log('    VB_PLUGIN_DIR=' + inst.plugin)
+}
+
+if (cmd === 'prepare') prepare()
+else if (cmd === 'verify') await verify()
+else if (cmd === 'up') await up()
 else if (cmd === 'down') down()
 else if (cmd === 'status') await status()
-else { console.error('用法: node tools/iso-instance.mjs up|down|status [--name poc1] [--browser] [--port 19402] [--cdp 19502]'); process.exit(2) }
+else { console.error('用法: node tools/iso-instance.mjs prepare|verify|up|down|status [--name poc1] [--browser] [--port 19402] [--cdp 19502]'); process.exit(2) }
