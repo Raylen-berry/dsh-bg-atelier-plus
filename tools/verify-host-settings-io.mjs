@@ -42,13 +42,31 @@ const ok = (name, cond, extra = '') => {
 const fsMod = await import('node:fs')
 // ⚠️ 切出来的函数用的是 `await fs.readFile(...)` 这种 **promises** 用法，
 //    所以沙箱里的 `fs` 必须是 fs.promises（传整个模块会得到回调式 API ⇒ ERR_INVALID_ARG_TYPE）。
+/**
+ * 写入侧沙箱：必须把 `writeSettingsAt` **以及它的依赖**一起切进来。
+ * ⚠️ 踩过：加"同目标串行 + 独占临时名"之后，`writeSettingsAt` 依赖模块级的
+ * `writeChains`/`writeSeq` 与 `writeSettingsOnce` —— 只切它一个 ⇒ 沙箱里 ReferenceError。
+ * 切片名单必须跟着实现走（和 verify-oracle-flow 那次同一类问题）。
+ */
+function makeWriter() {
+  const code = `
+let writeSeq = 0
+const writeChains = new Map()
+${sliceFn('async function writeSettingsOnce(')}
+${sliceFn('async function writeSettingsAt(')}
+return { writeSettingsAt };
+`
+  return (fsImpl) => new Function('fs', 'process', code)(fsImpl, process)
+}
+
 const { readSettingsResultAt, writeSettingsAt } = (() => {
   const code = `
+${sliceFn('function isSettingsObject(')}
 ${sliceFn('async function readSettingsResultAt(')}
-${sliceFn('async function writeSettingsAt(')}
-return { readSettingsResultAt, writeSettingsAt };
+return { readSettingsResultAt };
 `
-  return new Function('fs', 'process', code)(fsMod.promises, process)
+  const r = new Function('fs', 'process', code)(fsMod.promises, process)
+  return { readSettingsResultAt: r.readSettingsResultAt, writeSettingsAt: makeWriter()(fsMod.promises).writeSettingsAt }
 })()
 
 const fs = fsMod.promises
@@ -175,6 +193,120 @@ console.log('\n— ⑥ 客户端在"读到坏文件"时必须不开写闸 —')
     /x-bga-settings-status/.test(hostSrc))
   ok('★ index.js 的 PUT 在危险状态下返回 409（不是 200 假装成功）',
     /refuseOverwriteReason\(cur\.status[\s\S]{0,240}?send\(409/.test(hostSrc))
+}
+
+console.log('\n— ⑦ 写合法值：读写同一判据（审核方第十六轮反例 2） —')
+{
+  const isObj = (() => {
+    const code = `
+${sliceFn('function isSettingsObject(')}
+return isSettingsObject;
+`
+    return new Function(code)()
+  })()
+  ok('对象 ⇒ 合法', isObj({ a: 1 }) === true && isObj({}) === true)
+  ok('★ 数组 ⇒ 不合法（原来 PUT 放行，读侧却判 corrupt ⇒ 接口自己写出自己读不了的文件）',
+    isObj([1, 2]) === false)
+  ok('★ 标量/null ⇒ 不合法', isObj(3) === false && isObj(null) === false
+    && isObj(undefined) === false && isObj('x') === false)
+  const src = readFileSync(path.join(HERE, '..', 'index.js'), 'utf8')
+  ok('★ 读侧与写侧**都**调这个判据（不是各写各的）',
+    (src.match(/isSettingsObject\(parsed\)/g) || []).length >= 2)
+}
+
+console.log('\n— ⑧ 并发写：独占临时名 + 同目标串行（审核方第十六轮反例 1/5） —')
+{
+  /** 切出真实的"一次性写 + 串行提交"两个函数（连带它们的模块级状态）。 */
+  const makeWriter = () => {
+    const code = `
+let writeSeq = 0
+const writeChains = new Map()
+${sliceFn('async function writeSettingsOnce(')}
+${sliceFn('async function writeSettingsAt(')}
+return { writeSettingsAt };
+`
+    return (fsImpl) => new Function('fs', 'process', code)(fsImpl, process)
+  }
+  const fsP = fsMod.promises
+
+  // ⑧a 并发多次写：全部成功、每次读到的都是"完整的某一版"、最终是某一版、无 .tmp 残留
+  {
+    const dir = mkdtempSync(path.join(tmpdir(), 'bga-cc-'))
+    const target = path.join(dir, 'settings.json')
+    const { writeSettingsAt: writer } = makeWriter()({ ...fsP })
+    const revisions = []
+    const tasks = []
+    for (let i = 0; i < 40; i++) {
+      revisions.push(i)
+      tasks.push(writer(target, dir, { rev: i, pad: 'y'.repeat(1024) }))
+    }
+    // 边写边读：任何一次成功读到的内容都必须是完整 JSON（不能是半截）
+    let reads = 0, bad = 0
+    const reader = (async () => {
+      for (let i = 0; i < 120; i++) {
+        try {
+          const t = readFileSync(target, 'utf8')
+          JSON.parse(t); reads++
+        } catch (e) { if (e.code !== 'ENOENT') bad++ }
+        await new Promise((r) => setImmediate(r))
+      }
+    })()
+    const results = await Promise.allSettled(tasks)
+    await reader
+    const okAll = results.every((r) => r.status === 'fulfilled')
+    const final = JSON.parse(readFileSync(target, 'utf8'))
+    const leftovers = readdirSync(dir).filter((f) => f.includes('.tmp'))
+    ok('★ 40 个并发写**全部成功**（没有 ENOENT/错乱）', okAll,
+      results.filter((r) => r.status !== 'fulfilled').slice(0, 3).map((r) => String(r.reason && r.reason.code)).join(',') || '全成功')
+    ok('★ 并发期间每次读到的都是完整 JSON（读到 ' + reads + ' 次，坏 ' + bad + ' 次）', bad === 0, 'bad=' + bad)
+    ok('★ 最终内容是**某一版完整的**（rev=' + final.rev + '）', revisions.includes(final.rev) && final.pad.length === 1024)
+    ok('★ 没有 .tmp 残留', leftovers.length === 0, leftovers.join(',') || '无')
+    rmSync(dir, { recursive: true, force: true })
+  }
+
+  // ⑧b 每次写用**独占**临时名（旧实现只带 PID ⇒ 同进程并发共用同一个临时文件）
+  {
+    const dir = mkdtempSync(path.join(tmpdir(), 'bga-tmp-'))
+    const target = path.join(dir, 'settings.json')
+    const seen = []
+    const { writeSettingsAt: writer } = makeWriter()({
+      mkdir: (...a) => fsP.mkdir(...a),
+      rename: (...a) => fsP.rename(...a),
+      unlink: (...a) => fsP.unlink(...a),
+      writeFile: async (file, bytes, enc) => { seen.push(file); return fsP.writeFile(file, bytes, enc) },
+    })
+    await writer(target, dir, { rev: 1 })
+    await writer(target, dir, { rev: 2 })
+    ok('★ 两次写的临时文件名**不同**（独占）', seen.length === 2 && seen[0] !== seen[1], seen.map((s) => s.split('\\').pop()).join(' | '))
+    rmSync(dir, { recursive: true, force: true })
+  }
+
+  // ⑧c 同一目标的提交**顺序 = 调用顺序**（串行化；旧实现两次 rename 交错）
+  {
+    const dir = mkdtempSync(path.join(tmpdir(), 'bga-seq-'))
+    const target = path.join(dir, 'settings.json')
+    const order = []
+    const revOfTmp = new Map()   // 临时名里有随机段 ⇒ 不能靠解析文件名，改为写入时登记
+    const { writeSettingsAt: writer } = makeWriter()({
+      mkdir: (...a) => fsP.mkdir(...a),
+      unlink: (...a) => fsP.unlink(...a),
+      writeFile: async (file, bytes, enc) => {
+        const rev = JSON.parse(bytes).rev
+        revOfTmp.set(file, rev)
+        await new Promise((r) => setTimeout(r, rev === 1 ? 60 : 5))   // 故意让先发起的那个更慢
+        await fsP.writeFile(file, bytes, enc)
+        order.push('write' + rev)
+      },
+      rename: async (a, b) => { order.push('rename' + revOfTmp.get(a)); return fsP.rename(a, b) },
+    })
+    const p1 = writer(target, dir, { rev: 1 })
+    const p2 = writer(target, dir, { rev: 2 })
+    await Promise.all([p1, p2])
+    ok('★ 先发起的先提交（晚发起的写不会插到前面）',
+      order.join(',').startsWith('write1,rename1,write2,rename2'), order.join(','))
+    ok('★ 最终内容是被串行执行的第二版', JSON.parse(readFileSync(target, 'utf8')).rev === 2)
+    rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 console.log('\n宿主设置 IO：' + pass + ' 通过 / ' + fail + ' 失败')

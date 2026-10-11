@@ -53,7 +53,39 @@
   顺带证明新的原子写（临时文件 + rename）**没有留下 `.tmp` 垃圾**（留了就会被算成新增文件）。
 
 **仍未做（阻塞项，见排除范围第 11 条）**：真正的**进程级隔离**（独立 DSH 实例 + 独立端口 +
-独立浏览器 profile）。它才是"测试不影响用户"的根因解，本轮没能确立启动方式。
+独立浏览器 profile）。它才是"测试不影响用户"的根因解。
+
+---
+
+## 零之四、被判据的**独立反例**打过并修掉（可复核）
+
+审核方第十六轮用 **6 个可执行反例**打这套判据，**我独立复跑：6/6 全部复现**
+（脚本 `D:\ChatGPT\review-r16-counterexamples.mjs`）。逐条修法与"钉住它的测试"如下 ——
+**判据要能被独立反例推翻才算判据；修完之后用同一个反例脚本复跑证明它不再复现。**
+
+| # | 反例 | 根因 | 修法 | 钉住它的测试 |
+|---|---|---|---|---|
+| 1 | 同进程并发写共用临时文件：A 报成功但磁盘是 B，B 报 ENOENT | 临时名只含 PID | 每次写**独占**临时名（pid+序号+时间+随机）＋**同目标串行提交**；另加 rename 在 Windows EPERM/EBUSY 上的重试 | `verify-host-settings-io.mjs` ⑧a/⑧b/⑧c（40 并发全成功、临时名不同、提交顺序=调用顺序） |
+| 2 | PUT `[1,2]` 返回 200，下一次读却判 corrupt | 读/写各写各的校验 | 抽出**唯一**判据 `isSettingsObject`，读写都调；数组/标量一律 400 | ⑦（含"读侧写侧都调它"的源码断言） |
+| 3a | 改 9 MiB 文件中段 + 更新时间 ⇒ 仍报 clean | 大文件只比首尾摘要；且 `compareTree` **连 size/mtime 都没比** | **全文件 sha256**（不抽样）＋ size/mtime/hash 三者都比；日志写明是"内容/大小/修改时间"哪个变了 | 审核方脚本 3a + 离线套件 |
+| 3b | 改图库里名为 `previews` 的**分类**下的原图 ⇒ 被当缓存 | 缓存分类按"路径里有没有该目录名" | 按**精确根目录 + 相对前缀**分类；图库下一律用户数据 | 同上 |
+| 3c | 改 `DSH_BG_ATELIER_SETTINGS_DIR` 指向目录里的设置 ⇒ 不在核对范围 | 写死两棵 `DSH_HOME` 目录 | **照抄 `index.js` 的根目录推导**（含"回退到原插件目录"那条），env 覆盖优先，两侧都核 | 同上 |
+| 3d | 让核对树无法枚举（ENOTDIR）⇒ 仍报 clean | `catch { continue }` 跳过 | 枚举/读取失败一律记为错误；**有错误即"核对不完整"，绝不出绿** | 同上 |
+| 4 | `capture` 没有收尾边界核对；selftest 的核对在 finally 之外 | 三个分支各写各的收尾 | 抽出 `finalizeAll`：**还原 → 清理 → 边界核对 → 关模拟**四步各自独立、互不阻断 | 真机 capture 路径已见边界核对输出 |
+
+**如实记两件不能算"修好"的事**：
+1. 反例 5（并发）在他们脚本里现在**报超时**（`controlled scheduling timeout`）——
+   串行化之后"第二个 writeFile 不会与第一个同时开始"，他们的受控调度模型与修复后的并发语义
+   不兼容。**我不把这当作"已修好"的证据**，只当我自己写的等价测试（⑧a/⑧b/⑧c）通过。
+   他们的脚本要接着跑这条，需按新语义改写（断言"串行且两者都成功"）。
+2. `compareTree` 现在把"**只改 mtime、内容与大小都没变**"识别为**原样重写**（信息性，不算失败）——
+   首次在真机 capture 路径上见到的正是这种情况（我们的还原把 `settings.json` 按原样写回）。
+   这不是放宽判据：hash/size 任一变化仍然判失败（3a 复跑证明）。
+
+**另：新保护尚未在真机生效** —— 只读查询 `127.0.0.1:19387/bga/settings.json` 仍是
+`HTTP 200` 且**没有** `x-bga-settings-status` 头。原因是宿主半（`index.js`）要 **DSH 重启**
+才会加载。所以"客户端兼容路径工作"已被真机证明，而"新保护已部署"**未**被证明 ——
+重启之前不得当作已生效。
 
 ---
 
@@ -144,16 +176,20 @@
     **当前口径**：录基准时钉一张**小图**（如标记图）可稳定复现；钉大图时该区域不可信。
     要真正修掉得让插件在"已升级到 large"的稳定态才开始比（等一个可观测的稳定信号），
     或把壁纸可见区域明示为盲区。**在此之前不要声称"大图下也 8/8"。**
-11. **进程级隔离未建立**（审核方第 1 条的根因解，本轮**未能确立**）。
+11. **进程级隔离仍未建立**（审核方第 1 条的根因解）。
     已核实：**插件本身不需要改** —— `index.js` 支持 `DSH_BG_ATELIER_SETTINGS_DIR` 与
     `DSH_BG_ATELIER_WALLPAPERS` 显式覆盖（注释里就写着"多实例"），默认值由 `DSH_HOME` 推出。
-    没能确立的是**怎么起第二个宿主**：DSH 是 Electron 应用（宿主是它拉起的
-    `app.asar/.../dsh-desktop-host/lib/index.js` 子进程），asar 内部普通 node 读不到、
-    PATH 上没有 CLI、`$DSH_HOME` 里也没有端口/多实例配置；盲试
-    `DeepSeek Harness.exe --expose-internals <入口>` 会在用户桌面**多开一个窗口**、
-    且可能撞单实例锁 ⇒ 不适合擅自试。
-    **需要的决定**：DSH 侧给出第二实例的启动方式（自定义 `DSH_HOME` + 端口 + 浏览器 profile），
-    或明确允许我按上面方式盲试。
+    **审核方第十六轮已找到启动入口**（我此前说"无法确立"是**过度结论**：没找到入口就当成不存在，
+    这点审核方是对的）。已知入口（**尚未按它启动过**）：
+    · 包内正式 CLI：`app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js`
+      （`package.json` 也声明 `dsh → lib/bin.js`）；
+    · 以 `ELECTRON_RUN_AS_NODE=1` + `DSH_HOME=<新建临时目录>` 运行
+      `DeepSeek Harness.exe --expose-internals <上面那个 cli.js>`（审核方实测 `--help` 退出 0、
+      临时 home 无文件、未启动第二宿主、**不必加载桌面 main、不必盲开窗口**）；
+    · `dsh-web-app/lib/startup.js` 提供 `--host / --no-open / --port`，`--port 0` 让系统分配端口；
+    · **不能**直接拿 `dsh-desktop-host/lib/index.js` 起第二宿主 —— 它写死 19387，会撞生产端口。
+    **仍需核对后才算隔离成立**：独立 profile、插件来源副本、实际数据目录、图库链接、派生缓存、
+    浏览器 user-data-dir/CDP 端口；并让验收脚本**显式绑定测试实例**而不是默认那个。
     替代（已做）：**字节级边界** —— 能证明"验收没动用户数据"，但**不能**阻止
     "运行期间用户正在用的界面被工具改动"。**A 级真行为坏例也等这一步**（用户已选"在隔离实例上做"）。
 12. **`_ref-elysia-wallpaper-engine` 已不存在**（旧备注过期）；`baselines/audit-r6`…`r13`
@@ -167,7 +203,7 @@
 cd E:\dsh-plugins\dsh-bg-atelier-official
 
 # 离线（无需浏览器，可在 CI 跑）
-npm test                                    # 语法门禁 18/18 + 套件 20/20
+npm test                                    # 语法门禁 18/18 + 套件 21/21
 node tools/verify-oracle-geometry.mjs        # 几何可迁移性 + 漏检/误判的正反例（48 项）
 node tools/verify-oracle-entry.mjs           # 入口级真退出码（20 项，含假 CDP 服务器）
 node tools/verify-oracle-flow.mjs            # 控制流（22 项，真函数装沙箱）
@@ -179,7 +215,8 @@ node tools/make-marker-wallpaper.mjs           # 装"中等尺寸标记图"（04
 node tools/visual-baseline.mjs capture <基准名>
 node tools/visual-baseline.mjs compare <基准名>
 node tools/visual-baseline.mjs selftest        # 用真实插件元素验证检出能力（15 项）
-node tools/audit-oracle-coverage.mjs <基准名>   # 覆盖边界审计（当前 23 项）
+node tools/audit-oracle-coverage.mjs <基准名>   # 覆盖边界审计（当前 40 项）
+node tools/state-boundary.mjs begin|verify <名>  # 用户状态字节级边界（capture/compare/selftest 已内联）
 node tools/make-marker-wallpaper.mjs --remove  # 验收后卸载标记图（恢复用户底图库）
 node tools/verify-viewport-matrix.mjs           # 迁移适配真机矩阵（换窗口尺寸/DPR，8 项）
 node tools/verify-switching-behavior.mjs        # 切换与动效功能层（含轮播，约 70 秒）

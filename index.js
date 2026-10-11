@@ -367,8 +367,8 @@ async function readSettingsResultAt(file) {
   } catch (err) {
     return { status: 'corrupt', value: null, detail: 'JSON 解析失败：' + String((err && err.message) || err).slice(0, 80) }
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { status: 'corrupt', value: null, detail: 'JSON 不是对象' }
+  if (!isSettingsObject(parsed)) {
+    return { status: 'corrupt', value: null, detail: '顶层不是对象（数组/标量都算损坏）' }
   }
   return { status: 'ok', value: parsed }
 }
@@ -380,27 +380,73 @@ async function readSettings() {
 }
 
 /**
- * 写设置 —— **临时文件 + 原子替换**。
+ * 设置的**合法值定义** —— 读与写必须用同一个判据。
  *
- * 原来直接 `fs.writeFile(SETTINGS_FILE, …)`：写到一半进程被杀 / 断电，
- * 用户设置文件就被**截断成半截 JSON**（下一次读取变成 corrupt，全部设置丢失）。
- * 这是数据丢失风险，与验收无关也该修。
- * 同目录写临时文件再 rename：同卷 rename 是原子的 ⇒ 读到的要么是旧内容、要么是新内容，
- * 不会读到半截。（`.tmp` 名字带 pid，避免并发互踩。）
+ * 审核方第十六轮的反例：PUT `[1,2]` 返回 200，而读取函数明确拒绝数组 ⇒
+ * **接口把一份"合法配置"写成了下一次读会判 corrupt 的文件**（自己的写产出了自己读不了的东西）。
+ * 根因是两处各写各的校验。现在只有这一个判据，读写都调它。
  */
+function isSettingsObject(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v)
+}
+
+/**
+ * 写设置 —— **唯一临时文件 + 同目标串行提交**。
+ *
+ * 两个坑都在审核方第十六轮被实测复现（我原来的实现两个都踩了）：
+ *  ① 临时文件名只带 PID ⇒ **同一宿主内两个并发请求共用同一个临时文件**：
+ *     A 写完暂停、B 覆盖同一临时文件、A 再 rename ⇒ A 报成功但磁盘是 B 的内容，
+ *     随后 B 的 rename 报 ENOENT。异常清理还可能删掉别人的临时文件。
+ *     ⇒ 每次写入用**独占**的临时名（pid + 计数 + 时间 + 随机）。
+ *  ② 没有串行化 ⇒ 两个 rename 的先后与内容不匹配。
+ *     ⇒ 对**同一个目标路径**排队（per-file promise 链），提交顺序 = 调用顺序。
+ *  原子替换本身仍然保留（写一半被杀不会把用户设置截断成损坏文件）。
+ */
+const writeChains = new Map()
+let writeSeq = 0
+
 async function writeSettings(obj) {
   return writeSettingsAt(SETTINGS_FILE, SETTINGS_DIR, obj)
 }
 
 /** 按路径写（同样为了离线测）。 */
 async function writeSettingsAt(file, dir, obj) {
+  // 同一目标串行：把这次写入接到该目标的队尾。前一次失败不阻断后一次（catch 掉）。
+  const key = String(file)
+  const prev = writeChains.get(key) || Promise.resolve()
+  const next = prev.catch(() => {}).then(() => writeSettingsOnce(file, dir, obj))
+  writeChains.set(key, next.catch(() => {}))
+  try {
+    return await next
+  } finally {
+    // 队尾就是自己时清掉，避免 Map 无限增长
+    if (writeChains.get(key) === next || writeChains.get(key) === undefined) writeChains.delete(key)
+  }
+}
+
+async function writeSettingsOnce(file, dir, obj) {
   await fs.mkdir(dir, { recursive: true })
-  const tmp = file + '.' + process.pid + '.tmp'
+  // 独占临时名：同进程并发、甚至跨进程都不会撞
+  const tmp = file + '.' + process.pid + '.' + (++writeSeq) + '.' + Date.now().toString(36)
+    + '.' + Math.random().toString(36).slice(2, 8) + '.tmp'
   try {
     await fs.writeFile(tmp, JSON.stringify(obj, null, 2), 'utf8')
-    await fs.rename(tmp, file)
+    // ⚠️ Windows 上"rename 覆盖一个正被别人打开读取的目标"会瞬时 **EPERM/EBUSY/EACCES**。
+    //    实测（40 个并发写 + 一个持续读取的读者）会撞到。重试几次即可 ——
+    //    reader 打开→读完→关闭的窗口很短；不重试的话用户会看到一次莫名的"保存失败"。
+    //    重试仍然失败就抛出（不静默）。
+    let lastErr = null
+    for (let i = 0; i < 6; i++) {
+      try { await fs.rename(tmp, file); lastErr = null; break } catch (err) {
+        lastErr = err
+        const c = err && err.code
+        if (c !== 'EPERM' && c !== 'EBUSY' && c !== 'EACCES') break
+        await new Promise((r) => setTimeout(r, 10 + i * 15))
+      }
+    }
+    if (lastErr) throw lastErr
   } catch (err) {
-    try { await fs.unlink(tmp) } catch { /* 清理失败不影响主流程 */ }
+    try { await fs.unlink(tmp) } catch { /* 清理失败不影响主流程；且只删自己这个独占名 */ }
     throw err
   }
 }
@@ -687,7 +733,9 @@ export async function apply(ctx) {
         }
         try {
           const parsed = JSON.parse(await readBody(req))
-          if (!parsed || typeof parsed !== 'object') { send(400, { ok: false, error: 'invalid body' }); return }
+          // ⚠️ 必须与读取侧**同一个判据**：只判 typeof === 'object' 会把数组放过去，
+          //    于是接口自己写出一份自己读不出来的文件（审核方第十六轮反例 2）。
+          if (!isSettingsObject(parsed)) { send(400, { ok: false, error: 'invalid body: 顶层必须是对象（不接受数组/标量）' }); return }
           await writeSettings(parsed)
           send(200, { ok: true })
         } catch (err) {

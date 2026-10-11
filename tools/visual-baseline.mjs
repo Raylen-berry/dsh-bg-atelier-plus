@@ -875,6 +875,59 @@ async function cleanupEnvironment(log) {
   return true
 }
 
+/**
+ * **统一的收尾**：还原 → 清理 → 用户数据字节级核对 → 关掉 focus 模拟。
+ *
+ * 为什么必须统一（审核方第十六轮第 4 条）：
+ *   ① `capture` 分支原来**根本没有收尾边界核对**（只有 selftest 与 compare 有），
+ *      录完基准直接退出 —— 而 capture 恰恰是改动最多的一路（钉图 + 换图 + 开面板）；
+ *   ② selftest 的核对写在最外层 finally **之外**，一旦上面抛异常就被跳过；
+ *   ③ 各步互相阻断：还原抛错 ⇒ 清理不跑（更早那轮修过一次，但只修了"还原/清理"这一对）。
+ * 现在四步**各自独立 try/catch**，任何一步失败都不阻断其余，失败累加到退出码：
+ *   还原失败/抛错 → 5；清理失败/核对不干净 → 6。
+ *
+ * ⚠️ 如实写清边界：这套收尾**不能**对抗 SIGKILL/断电（finally 根本不会执行），
+ *    也不能证明"过程中没有写入"（写完又改回去是查不出来的）。真正的边界是**进程级隔离**。
+ */
+async function finalizeAll(autoBefore) {
+  const bump = (code, why) => {
+    if (exitCode === 0) exitCode = code
+    else console.error('     （已有退出码 ' + exitCode + '，不再覆盖为 ' + code + '：' + why + '）')
+  }
+  // ① 还原（轮播 / 底图 / 主题）——只有 'failed' 才算失败；'restored'/'skipped' 都正常
+  try {
+    const outcome = await restoreRotation(autoBefore, true)
+    if (outcome === 'failed') {
+      console.error('  ✗ 轮播/底图还原失败 —— 用户设置可能仍是被改过的值。退出码按失败处理（5）。')
+      bump(5, '还原失败')
+    }
+  } catch (e) {
+    console.error('  ✗ 还原过程抛错：' + String(e && e.message || e).slice(0, 90) + ' —— 按失败处理（5）')
+    bump(5, '还原抛错')
+  }
+  // ② 注入物清理（不依赖①的结果）
+  try {
+    const cleaned = await cleanupEnvironment(true)
+    if (!cleaned) { console.error('  ✗ 环境清理未确认（退出码 6）'); bump(6, '清理失败') }
+  } catch (e) {
+    console.error('  ✗ 清理过程抛错：' + String(e && e.message || e).slice(0, 90) + ' —— 按失败处理（6）')
+    bump(6, '清理抛错')
+  }
+  // ③ 用户数据**字节级**核对（不依赖①②）
+  try {
+    const b = boundaryVerify(stateSnap, true)
+    if (!b.clean) {
+      console.error('  ✗ 用户数据未完整恢复 / 核对不完整 —— 按清理失败处理（退出码 6）。')
+      bump(6, '边界核对不干净')
+    }
+  } catch (e) {
+    console.error('  ✗ 边界核对抛错：' + String(e && e.message || e).slice(0, 90) + ' —— 按失败处理（6）')
+    bump(6, '边界核对抛错')
+  }
+  // ④ 关掉 focus 模拟（不依赖上面任何一步）
+  try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }) } catch { /* 关不掉不影响退出码 */ }
+}
+
 /** 这次**实际参与比较**的设备像素尺寸（录制时算一次存进基准，比对时用来查覆盖缩水）。 */
 function comparedBoxOf(geom, pngBase64, stateName) {
   try {
@@ -1551,26 +1604,9 @@ if (mode === 'capture') {
   console.log('\n基准已建立：' + manifest.states.length + ' 个状态 → ' + baseDir)
   console.log('重构后跑： node tools/visual-baseline.mjs compare ' + dir)
   } finally {
-    // ⚠️ 修缺陷一（审核方第七轮）：上一版把"还原"与"清理"写在**同一个 finally 里顺序执行**
-    //   ⇒ 还原一抛异常，后面的清理根本不执行（审核方让还原读取抛错，实测清理 0 次、
-    //   两个注入物都残留）。现在拆成嵌套 try/finally：**还原怎么炸都不影响清理**。
-    try {
-      // **只有 'failed' 才算失败**（三态契约见 restoreRotation 头注释）：
-      // 'restored' = 已还原或本来就不需要还原；'skipped' = 当初没冻结成功、无可还原。
-      // 原来写 `!== true` 会把"用户原本就关着轮播"误报成失败（审核方复现）。
-      const outcome = await restoreRotation(autoBefore, true)
-      if (outcome === 'failed') {
-        console.error('  ✗ 轮播还原失败 —— 用户的 autoOn 可能仍是被改过的值。退出码按失败处理（5）。')
-        if (exitCode === 0) exitCode = 5
-      }
-    } catch (e) {
-      console.error('  ✗ 轮播还原过程抛错：' + String(e && e.message || e).slice(0, 90) + ' —— 按失败处理（5）')
-      if (exitCode === 0) exitCode = 5
-    } finally {
-      // 清理在最内层 finally：无论还原成功/失败/抛错都会执行
-      const cleaned = await cleanupEnvironment(true)
-      if (!cleaned && exitCode === 0) exitCode = 6
-    }
+    // 统一收尾（还原 → 清理 → 字节级边界核对 → 关模拟），四步互不阻断。
+    // ⚠️ capture 原来**没有**边界核对（审核方第十六轮第 4 条）—— 而它改动最多。
+    await finalizeAll(autoBefore)
   }
   } catch (e) {
     // 主动拒绝（已置 exitCode）按原码退出；没置过码的意外异常才算 1
@@ -1684,9 +1720,10 @@ if (mode === 'capture') {
 
   console.log('\n自检：' + stPass + ' 通过 / ' + stFail + ' 失败')
   if (stFail > 0) exitCode = 1
-  const bSelf = boundaryVerify(stateSnap, true)
-  if (!bSelf.clean) { console.error('  ✗ selftest 期间用户数据被改动 —— 退出码 6'); exitCode = 6 }
-  try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }) } catch {}
+  // 走统一收尾：原来这里的边界核对写在最外层 finally **之外**，
+  // 一旦上面抛异常就被跳过（审核方第十六轮第 4 条）。selftest 不改设置，但口径要一致。
+  // 传 null：本分支不冻结轮播（restoreRotation 会走 'skip' 分支，不算失败）。
+  await finalizeAll(null)
   cdp.close()
   process.exit(exitCode)
 } else {
@@ -1852,16 +1889,9 @@ if (mode === 'capture') {
       console.error('  ✗ 未预期异常：' + String(e && e.message || e).slice(0, 120))
     }
   }
-  // ★ 收尾的**字节级**核对：证明这次运行没有改动用户数据。
-  //   只看用户数据（settings.json / 图库）；派生缓存允许新增并单独列出。
-  //   不干净 ⇒ 按"清理失败"处理（退出码 6），不允许静默通过。
-  const boundary = boundaryVerify(stateSnap, true)
-  if (!boundary.clean) {
-    console.error('  ✗ 用户数据未完整恢复 —— 按清理失败处理（退出码 6）。'
-      + '请检查上面的清单，必要时手工还原。')
-    exitCode = 6
-  }
-  try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }) } catch {}
+  // 收尾：用统一实现**再**跑一遍四步（还原/清理已在上面的 finally 做过，这里幂等；
+  // 关键是**字节级边界核对**必须无条件执行且不被上面的异常跳过，见审核方第十六轮第 4 条）。
+  await finalizeAll(autoBefore)
   cdp.close()
   process.exit(exitCode)
 }
