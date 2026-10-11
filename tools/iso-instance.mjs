@@ -46,9 +46,18 @@ const sha = (f) => createHash('sha256').update(readFileSync(f)).digest('hex')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const alive = (pid) => { try { process.kill(pid, 0); return true } catch { return false } }
 const listening = async (port) => {
-  try { const r = await fetch('http://127.0.0.1:' + port + '/json/version', { signal: AbortSignal.timeout(1500) }); return r.ok } catch {
-    try { const r = await fetch('http://127.0.0.1:' + port + '/', { signal: AbortSignal.timeout(1500) }); return r.status > 0 } catch { return false }
+  // ⚠️ 判活标准是"**有没有 HTTP 响应**"，不是"响应是否 ok"。
+  //    原来先请求 `/json/version`（CDP 专用路径），DSH web 端口对它返回 **404** ——
+  //    fetch 不抛异常，于是 `r.ok === false` 直接 return false，**永不回退到 `/`**。
+  //    后果：宿主明明起来了（日志有端口与 token），脚本却判"90 秒没起来"并把它杀掉。
+  //    现在两个路径都试，任何响应（200/401/404 都算）都判为在听。
+  for (const p of ['/json/version', '/']) {
+    try {
+      const r = await fetch('http://127.0.0.1:' + port + p, { signal: AbortSignal.timeout(1500) })
+      if (r.status > 0) return true
+    } catch { /* 试下一个 */ }
   }
+  return false
 }
 async function waitPort(port, ms) {
   const t0 = Date.now()
@@ -440,9 +449,170 @@ async function verify() {
   console.log('    VB_PLUGIN_DIR=' + inst.plugin)
 }
 
+/**
+ * `run`：**一条命令跑完整个隔离验收**。
+ *
+ * 为什么必须"一条命令"（实测结论）：宿主在同一次工具调用内能长期存活，但那次调用的
+ * **Windows Job 关闭时会被一起回收** —— 所以"先起宿主、下一条命令再验收"的两步式在本环境
+ * 不成立。这里把宿主作为**本进程的子进程**（不 detach、不交给 PowerShell），整条流水线在
+ * 同一次调用内完成：
+ *   准备 → 起宿主 → 等端口 → 隔离证明(不过就退) → 起隔离浏览器 → 引导/底图准备 →
+ *   selftest → capture/compare → A 级变异 → 覆盖审计 → 收尾(杀子进程) → 复核生产未被碰。
+ * 任何一步失败都记下来，最后统一给结论与非零退出码；收尾写在 finally 里，异常也不跳过。
+ */
+async function run() {
+  const steps = (opt('steps', 'selftest'))          // 逗号分隔：selftest,capture,compare,mutate,audit
+  const baseline = opt('baseline', 'iso-auto')
+  const viewport = opt('viewport', '1426x807@1.1666666269302368')
+  const want = new Set(steps.split(',').map((s) => s.trim()).filter(Boolean))
+  const results = []
+  const note = (n, okv, extra = '') => { results.push({ n, ok: okv, extra }); console.log('  ' + (okv ? '✅' : '❌') + ' ' + n + (extra ? '  [' + String(extra).slice(0, 120) + ']' : '')) }
+
+  const prodSettings = path.join(PROD_HOME, 'dsh-bg-atelier-plus', 'settings.json')
+  const prodHash0 = existsSync(prodSettings) ? sha(prodSettings) : '(无)'
+  const prodClientHash0 = sha(path.join(PROD_PLUGIN, 'client.js'))
+  let host = null, browser = null
+
+  try {
+    console.log('=== 隔离验收（一条命令跑完）：' + NAME + ' @' + PORT + ' ===')
+    // ① 准备（幂等：已有副本就不重建）
+    if (!existsSync(path.join(ROOT, 'plugin', 'dsh-bg-atelier-official', 'index.js'))) {
+      console.log('  [准备] 根目录不存在，先建 …')
+      buildPluginCopy(); buildProfile(); buildTestLibrary()
+    } else console.log('  [准备] 复用已有根目录 ' + ROOT)
+
+    // ② 起宿主：**本进程的直接子进程**（不 detach）
+    const outf = path.join(ROOT, '_run.out'), errf = path.join(ROOT, '_run.err')
+    rmSync(outf, { force: true }); rmSync(errf, { force: true })
+    const ofd = openSync(outf, 'a'), efd = openSync(errf, 'a')
+    host = spawn(EXE, hostArgs(PORT), {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: path.join(ROOT, 'home') },
+      stdio: ['ignore', ofd, efd], windowsHide: true,
+    })
+    closeSync(ofd); closeSync(efd)
+    host.on('error', (e) => console.error('  ✗ 宿主 spawn 失败：' + e.message))
+    note('宿主子进程已起（PID ' + host.pid + '）', true)
+
+    // ③ 等端口
+    const up = await waitPort(PORT, 90000)
+    note('宿主端口 ' + PORT + ' 就绪', up, up ? '' : '90 秒没起来（看 ' + errf + '）')
+    if (!up) throw new Error('宿主没起来')
+
+    // ④ 隔离证明（硬门槛）
+    const wpRes = await fetchJson('http://127.0.0.1:' + PORT + '/bga/wallpapers.json')
+    let head = null
+    try { head = (await fetch('http://127.0.0.1:' + PORT + '/bga/settings.json', { signal: AbortSignal.timeout(8000) })).headers.get('x-bga-settings-status') } catch { /* noop */ }
+    const inRoot = (p) => typeof p === 'string' && path.resolve(p).toLowerCase().startsWith(path.resolve(ROOT).toLowerCase())
+    note('插件数据落点在隔离根下', !!wpRes && inRoot(wpRes.writableDir), wpRes && wpRes.writableDir)
+    note('图库只看到测试分类', !!wpRes && wpRes.categories.every((c) => c.name === '测试图' || c.name === '_验收标记图'),
+      wpRes && wpRes.categories.map((c) => c.name).join(','))
+    note('新接口状态头可用', head !== null, 'x-bga-settings-status=' + head)
+    if (results.some((r) => !r.ok)) throw new Error('隔离证明不成立 ⇒ 拒绝继续')
+
+    // ⑤ 环境准备：**先**通过宿主 API 给全新 home 设一张测试底图，**再**起浏览器。
+    //    ⚠️ 顺序不能反：页面首载时客户端会做一次 load/save，若那时磁盘上还没有底图，
+    //    它就用默认值（无底图）存盘、把我们后来 PUT 的冲掉 ⇒ selftest 报"图片未就绪"、
+    //    而且客户端那次存盘还会让字节级边界报"用户数据被改动"。实测踩过。
+    await bootstrapWallpaper(wpRes)
+    note('已给隔离实例设一张测试底图（先于浏览器）', true,
+      wpRes && wpRes.categories[0] && wpRes.categories[0].items[0] && wpRes.categories[0].items[0].name)
+
+    // ⑥ 起隔离浏览器（独立 profile + CDP）
+    const authUrl = (readFileSync(outf, 'utf8').match(/http:\/\/127\.0\.0\.1:\d+\/\?token=\S+/) || [null])[0]
+    if (!authUrl) note('拿到带 token 的认证 URL', false, 'stdout 里没找到；浏览器可能 401')
+    const bprof = path.join(ROOT, 'browser-profile')
+    mkdirSync(bprof, { recursive: true })
+    browser = spawn(CHROME, ['--user-data-dir=' + bprof, '--remote-debugging-port=' + String(CDP),
+      '--no-first-run', '--no-default-browser-check', authUrl || ('http://127.0.0.1:' + PORT + '/')],
+      { stdio: 'ignore', windowsHide: true })
+    const cdpUp = await waitPort(CDP, 60000)
+    note('隔离浏览器 CDP ' + CDP + ' 就绪', cdpUp, browser ? 'PID ' + browser.pid : '')
+    if (!cdpUp) throw new Error('浏览器 CDP 没起来')
+    await sleep(6000)   // 等应用首屏与客户端状态落定，再去截图/比图
+
+
+
+    // ⑦ 跑验收步骤（显式绑定到本实例）
+    const env = {
+      ...process.env,
+      DSH_HOME: path.join(ROOT, 'home'),
+      VB_GUI_HOST: '127.0.0.1:' + PORT,
+      VB_CDP_PORT: String(CDP),
+      VB_VIEWPORT: viewport,
+      VB_SKIP_ONBOARDING: '1',
+      VB_PLUGIN_DIR: path.join(ROOT, 'plugin', 'dsh-bg-atelier-official'),
+    }
+    const baseDir = path.join(REPO, 'baselines', baseline)
+    // 04 状态要用「标记图」；装进**隔离图库**（脚本用的是隔离 DSH_HOME，不碰用户图库）
+    const needCapture = want.has('capture') || (want.has('compare') && !existsSync(path.join(baseDir, 'manifest.json')))
+    if (needCapture) await runStep('装标记图（隔离库）', [path.join(HERE, 'make-marker-wallpaper.mjs')], env, note)
+    if (want.has('selftest')) await runStep('selftest', [path.join(HERE, 'visual-baseline.mjs'), 'selftest'], env, note)
+    if (needCapture) await runStep('capture ' + baseline, [path.join(HERE, 'visual-baseline.mjs'), 'capture', baseline], env, note)
+    if (want.has('compare')) await runStep('compare ' + baseline, [path.join(HERE, 'visual-baseline.mjs'), 'compare', baseline], env, note)
+    if (want.has('mutate')) await runStep('A 级变异', [path.join(HERE, 'mutate-real-style.mjs'), baseline], env, note)
+    if (want.has('audit')) await runStep('覆盖审计', [path.join(HERE, 'audit-oracle-coverage.mjs'), baseline], env, note)
+  } catch (e) {
+    console.error('  ✗ 中止：' + String(e && e.message || e))
+  } finally {
+    // ⑧ 收尾：杀掉**自己起的**子进程（含树），再复核生产未被碰
+    console.log('  [收尾] 结束隔离宿主与浏览器')
+    if (browser && browser.pid) spawnSync('taskkill', ['/PID', String(browser.pid), '/T', '/F'], { stdio: 'ignore' })
+    if (host && host.pid) spawnSync('taskkill', ['/PID', String(host.pid), '/T', '/F'], { stdio: 'ignore' })
+    await sleep(2500)
+    const prodHash1 = existsSync(prodSettings) ? sha(prodSettings) : '(无)'
+    const prodClientHash1 = sha(path.join(PROD_PLUGIN, 'client.js'))
+    note('生产 settings.json 未被改动', prodHash0 === prodHash1, prodHash0.slice(0, 12) + ' → ' + prodHash1.slice(0, 12))
+    note('生产插件代码未被改动', prodClientHash0 === prodClientHash1, prodClientHash1.slice(0, 12))
+    note('隔离宿主端口已关闭', !(await listening(PORT)), '端口 ' + PORT)
+  }
+
+  const bad = results.filter((r) => !r.ok).length
+  console.log('\n隔离验收汇总：' + (results.length - bad) + ' 通过 / ' + bad + ' 失败')
+  process.exit(bad ? 1 : 0)
+}
+
+/** 取 JSON（带超时，避免没有 AbortSignal 时挂死）。 */
+async function fetchJson(url, ms = 8000) {
+  try { const r = await fetch(url, { signal: AbortSignal.timeout(ms) }); return await r.json() } catch { return null }
+}
+
+/** 给全新 home 设一张测试底图（并把页面刷成加载到它）。 */
+async function bootstrapWallpaper(wp) {
+  const cat = wp && wp.categories && wp.categories[0]
+  const it = cat && cat.items && cat.items[0]
+  if (!it) return
+  const body = {
+    autoOn: false, autoMin: 30, zoom: 1, focus: '50% 50%', effect: 'firefly',
+    wallpaper: { id: cat.name + '\u0000' + it.name, cat: cat.name, file: it.name, name: it.base, url: it.url, hd: !!it.hd, tags: it.tags, no: it.no, size: it.size },
+  }
+  try {
+    await fetch('http://127.0.0.1:' + PORT + '/bga/settings.json', {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000),
+    })
+  } catch { /* noop */ }
+}
+
+/** 跑一个验收脚本（子进程），用它的退出码与输出里的结论行判通过。 */
+async function runStep(label, argv, env, note) {
+  console.log('  --- ' + label + ' ---')
+  const r = await new Promise((resolve) => {
+    const c = spawn(process.execPath, argv, { env, cwd: REPO, stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    c.stdout.on('data', (d) => { out += d })
+    c.stderr.on('data', (d) => { out += d })
+    c.on('close', (code) => resolve({ code, out }))
+  })
+  const verdict = (r.out.match(/自检：.*|视觉回归：.*|A 级坏例：.*|覆盖审计：.*/) || [''])[0].trim()
+  const fails = (r.out.match(/❌[^\n]*/g) || []).slice(0, 3).map((s) => s.trim().slice(0, 110))
+  note(label + ' ⇒ exit ' + r.code, r.code === 0, verdict)
+  for (const f of fails) console.log('        ' + f)
+  return r
+}
+
 if (cmd === 'prepare') prepare()
 else if (cmd === 'verify') await verify()
+else if (cmd === 'run') await run()
 else if (cmd === 'up') await up()
 else if (cmd === 'down') down()
 else if (cmd === 'status') await status()
-else { console.error('用法: node tools/iso-instance.mjs prepare|verify|up|down|status [--name poc1] [--browser] [--port 19402] [--cdp 19502]'); process.exit(2) }
+else { console.error('用法: node tools/iso-instance.mjs run|prepare|verify|up|down|status [--name poc1] [--browser] [--port 19402] [--cdp 19502]'); process.exit(2) }

@@ -168,6 +168,32 @@ VB_PLUGIN_DIR=<root>/plugin/dsh-bg-atelier-official   # A 级变异只改副本
 另外打印启动命令时**参数必须带内层双引号**（`\"E:\DeepSeek Harness\…\cli.js\"`）：
 `Start-Process -ArgumentList` 会按空格重拼，不加引号就报 `Cannot find module 'E:\DeepSeek'`。
 
+### 零之五之二、`run`：一条命令跑完整个隔离验收（**已完成并全绿**）
+
+```
+node tools/iso-instance.mjs run --name poc4 --root D:\DeepSeek\dsh-iso\poc4 \
+  --port 19410 --cdp 19510 --baseline iso-auto --steps selftest,capture,compare,audit,mutate
+```
+宿主作为**本进程的直接子进程**（不 detach、不经 PowerShell），流水线在同一次调用内跑完：
+准备 → 起宿主 → 等端口 → **隔离证明（不成立就中止）** → 设测试底图 → 起隔离浏览器 →
+装标记图（进隔离库）→ selftest → capture → compare → A 级变异 → 覆盖审计 →
+收尾（杀子进程）→ 复核生产未被碰。
+
+**全新根 poc4 实测：16 通过 / 0 失败**（selftest 15/15、compare `8 一致 / 0 差异`、
+A 级变异 12/12、覆盖审计 38/38，生产 `settings.json` 与生产插件代码哈希不变、隔离端口已关）。
+
+**⚠️ 更正我上一轮的一个错误结论**：我上一版把 `up`/`verify` 起不来归因为"Windows Job 回收宿主"。
+**这个结论没有被证明，而且大部分现象的真因是另一件事**：探活函数先请求 CDP 专用路径
+`/json/version`，DSH web 端口对它返回 **404**；`fetch` 不抛异常 ⇒ `r.ok === false` 直接返回
+"没在听"，**永不回退到 `/`**。于是宿主明明起来了（日志已打印端口与 token），脚本却判"90 秒没起来"
+并**把它自己杀掉**。判活标准已改成"**有没有 HTTP 响应**"（200/401/404 都算）。
+教训：把"我的探针说没有"当成"它真的没有"，会得出一个听起来很硬的错误归因。
+
+其它两条已确认的 Windows 陷阱保留：
+· 写启动命令时参数必须带**内层双引号**（`\"E:\DeepSeek Harness\…\cli.js\"`）——
+  `Start-Process -ArgumentList` 按空格重拼，不加引号就报 `Cannot find module 'E:\DeepSeek'`；
+· `spawnSync` 会等 stdout 管道 EOF，而 `Start-Process` 起的孙子进程继承着管道 ⇒ 必须 `stdio:'ignore'`。
+
 ---
 
 ## 零之二、坏例分级：涂色只证明比较器，不证明系统
