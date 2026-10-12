@@ -1082,7 +1082,9 @@ async function measureLiveGeom(stateName, log, rel, hostKind) {
       const byClass=/(^|_|-)(time|date|ago|elapsed)$/.test(suffix)&&/[0-9]/.test(t);
       if(TIME_RE.test(t)||byClass){
         const b=e.getBoundingClientRect();
-        if(b.width>0&&b.left>=0&&b.right<=innerWidth) vol.push({l:Math.round(b.left),r:Math.round(b.right),t:t});
+        // 记 top/bottom，不只 l/r：右边界只用得上左沿，但**落在裁剪框内部**的时间文字
+        // 要靠完整矩形去屏蔽（会话列表里那几行日期会随时间变）。一律运行时实测、不写死。
+        if(b.width>0&&b.left>=0&&b.right<=innerWidth) vol.push({l:Math.round(b.left),r:Math.round(b.right),top:Math.round(b.top),bottom:Math.round(b.bottom),t:t});
       }
     });
     return JSON.stringify({
@@ -1870,7 +1872,10 @@ if (mode === 'capture') {
     }
     const rect = liveGeom ? liveGeom.rect : null
     const inRect = (r) => !!rect && r.l >= rect.x0 - 2 && r.r <= rect.x1 + 2 && r.t >= rect.y0 - 2 && r.b <= rect.y1 + 2
-    const masked = (liveGeom && liveGeom.masks) || MASK_RECTS[s.name] || []
+    // 屏蔽框一律取**运行时实测**（liveGeom.masks 一定存在，可能是空数组）；
+    // **不再回落到写死的 MASK_RECTS** —— 那会让"实测几何拿不到"的路径看起来还有救，
+    // 而且那些常量是按旧框位置标定的（已过期）。拿不到实测几何时上面已经判失败。
+    const masked = liveGeom ? (liveGeom.masks || []) : []
 
     for (const [label, finder] of (liveGeom ? PROBES : [])) {
       const got = await readState(`(()=>{const e=${finder}; if(!e) return JSON.stringify({absent:true});

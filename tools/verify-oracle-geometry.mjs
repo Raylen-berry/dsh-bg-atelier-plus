@@ -108,9 +108,12 @@ console.log('\n— ① 窗口变宽 + 面板右移 4px：内容相同 ⇒ 必须
 
 console.log('\n— ② 反证：沿用写死的绝对常量口径 ⇒ 同一个变化会被裁歪 —')
 {
-  // 不传 geom ⇒ oracle-compare 回落到表里的常量（x 515–1085 / 锚点 1418），
-  // 而 B 的面板实际在 525 ⇒ 左边吃进 10px 背景、右边少掉 10px 面板 ⇒ 必然报差异。
-  const r = compareStableImages(A, B, '03-settings-studio')
+  // 显式传一个"旧口径"的写死 geom（x 515–1085 / CSS 宽 1418）；B 的面板实际在 525
+  // ⇒ 左边吃进 10px 背景、右边少掉 10px 面板 ⇒ 必然报差异。
+  // ⚠️ 以前这里**不传 geom**，靠 oracle-compare 内部回落到写死常量 —— 那条兜底已删除
+  //    （实测几何缺失就该抛错，不能静默在写死矩形上跑完还给出"一致/有差异"的结论）。
+  const legacyGeom = { rect: { x0: 515, y0: 74, x1: 1085, y1: 745 }, masks: [], cssWidth: 1418 }
+  const r = compareStableImages(A, B, '03-settings-studio', legacyGeom, legacyGeom)
   ok('★ 写死常量的旧口径**会**报差异（证明 ① 的通过来自实测几何，不是碰巧）',
     r.same === false, 'diff=' + r.diff + ' maxΔ=' + r.maxChannelDelta)
 }
@@ -406,11 +409,17 @@ console.log('\n— ⑨ 源码门禁：不许把写死矩形当**运行时回落*
   // 而"一堆通过"比直接失败坏得多。STABLE_RECT_BY_STATE 只该作为**记录**进 manifest
   // （fallbackRectsCss，供人查），绝不参与比较。这条门禁防止它悄悄回来。
   const src = readFileSync(path.join(HERE, 'visual-baseline.mjs'), 'utf8')
+  const ocSrc = readFileSync(path.join(HERE, 'oracle-compare.mjs'), 'utf8')
   // 只查**代码行**：注释里会引用历史写法（"这里以前写的是 || STABLE_RECT_BY_STATE[s.name]"），
   // 那是文档不是回落。第一版门禁没区分，直接被自己的注释绊倒（实测）。
   const code = src.split(/\r?\n/).filter((l) => !/^\s*\/\//.test(l)).join('\n')
+  const ocCode = ocSrc.split(/\r?\n/).filter((l) => !/^\s*\/\//.test(l)).join('\n')
   ok('★ 源码里没有 `|| STABLE_RECT_BY_STATE[` 这种运行时回落',
     !/\|\|\s*STABLE_RECT_BY_STATE\s*\[/.test(code), '命中即说明实测几何拿不到时会回落到写死矩形')
+  ok('★ 源码里没有 `|| MASK_RECTS[` 这种运行时回落',
+    !/\|\|\s*MASK_RECTS\s*\[/.test(code + ocCode), '命中即说明屏蔽框会回落到写死常量')
+  ok('★ resolveGeom 缺实测几何时**抛错**（不静默用常量）',
+    /实测几何缺失（state=/.test(ocCode) && /throw new Error\(/.test(ocCode))
   ok('★ 实测几何缺失时 selftest 有明确的失败分支',
     /拿不到实测几何 ⇒ 本状态的位置类检查全部判失败/.test(src))
 }

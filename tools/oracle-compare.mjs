@@ -379,9 +379,20 @@ export function deriveGeom(hostKind, a, rel) {
     y0: Math.max(0, pTop - 24), y1: Math.min(host.b, pBot + 24),
   }
   if (rect.y1 - rect.y0 < 8) return null
+  // 屏蔽框 = **落在裁剪框内部**的"随时间变"的宿主文字（会话列表的日期/相对时间）。
+  // ⚠️ 这里以前是写死常量（MASK_RECTS：CSS x0–94 / y523–549），按当时的框位置标定；后来框跟着
+  //    插件挪到 orb 那一带（y700–775），那两条日期根本不在框内 —— 常量成了**过期兜底**，
+  //    而且会让"实测几何拿不到"的路径看起来还有救。现在按**运行时实测**的 volatile 矩形现算：
+  //    取与框相交的、补 3px 余量、再裁到框内；实测不到就是空数组（不猜、也不回落常量）。
+  const innerMasks = vol
+    .filter((v) => typeof v.top === 'number' && typeof v.bottom === 'number')
+    .map((v) => [v.l - 3, v.top - 3, v.r + 3, v.bottom + 3])
+    .filter(([l, t, r, b]) => l < rect.x1 && r > rect.x0 && t < rect.y1 && b > rect.y0)
+    .map(([l, t, r, b]) => [Math.max(l, rect.x0), Math.max(t, rect.y0), Math.min(r, rect.x1), Math.min(b, rect.y1)])
+  const relMasks = innerMasks.map(([x0, y0, x1, y1]) => [x0 - rect.x0, y0 - rect.y0, x1 - rect.x0, y1 - rect.y0])
   return {
-    cssWidth, hostKind: 'sidebar', host, rect, masks: [],
-    rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, w: rect.x1 - rect.x0, h: rect.y1 - rect.y0, masks: [] },
+    cssWidth, hostKind: 'sidebar', host, rect, masks: innerMasks,
+    rel: { left: rect.x0 - host.l, top: rect.y0 - host.t, right: host.r - rect.x1, bottom: host.b - rect.y1, w: rect.x1 - rect.x0, h: rect.y1 - rect.y0, masks: relMasks },
   }
 }
 
@@ -474,14 +485,25 @@ function rectFromRel(host, rel) {
   return { x0, y0, x1: x0 + w, y1: y0 + h }
 }
 
-/** 取本次比对用的几何：调用方实测的 geom 优先，表里常量兜底。 */
+/**
+ * 取本次比对用的几何：**必须**由调用方实测传入。
+ *
+ * ⚠️ 这里以前是"实测优先、表里常量兜底"（`geom.rect || STABLE_RECT_BY_STATE[stateName] || DEFAULT_RECT`）。
+ *    那条兜底是**静默**的：实测几何拿不到时，比对会照常在一个**写死矩形**上跑完并给出"一致/有差异"
+ *    —— 既可能假过也可能假挂，而且看不出是几何没拿到。写死的常量只该作为**记录**进 manifest
+ *    （fallbackRectsCss / fallbackMaskRectsCss，供人查），绝不参与判定。现在缺失就抛错。
+ */
 function resolveGeom(stateName, geom) {
+  if (!geom || !geom.rect) {
+    throw new Error('实测几何缺失（state=' + stateName + '）：拒绝回落到写死常量去比错地方。'
+      + '若确实要复现"写死矩形"的旧口径（例如证明它裁歪），请显式传一个 geom 进来。')
+  }
   return {
-    rect: (geom && geom.rect) || STABLE_RECT_BY_STATE[stateName] || DEFAULT_RECT,
-    // masks 用 "!== undefined" 判断：实测"这个状态没有需要屏蔽的框"是合法结果，
-    // 不能被 `||` 误当成"没传"而回落到表里的常量框。
-    masks: geom && geom.masks !== undefined ? geom.masks : (MASK_RECTS[stateName] || []),
-    cssWidth: geom && geom.cssWidth ? geom.cssWidth : REF_CSS_WIDTH,
+    rect: geom.rect,
+    // masks 用 "!== undefined" 判断：实测"这个状态没有需要屏蔽的框"是合法结果（空数组），
+    // 不能被 `||` 误当成"没传"。
+    masks: geom.masks !== undefined ? geom.masks : [],
+    cssWidth: geom.cssWidth ? geom.cssWidth : REF_CSS_WIDTH,
   }
 }
 

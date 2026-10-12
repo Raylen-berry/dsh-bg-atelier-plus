@@ -237,7 +237,7 @@ function makeServer(cfg) {
             // （实测：动效画布 .bga-dockfx 与它完全重合）。这个套件跳过了 07/08，
             // 但 02 没跳过 ⇒ 不给 surface 的话 02 会判"锚点缺失"⇒ 全场景 exit=4。
             surface: { l: 467, t: 679, r: 1233, b: 777 },
-            volatile: [{ l: 234, r: 261, t: '6分钟' }],
+            volatile: [{ l: 234, r: 261, top: 616, bottom: 631, t: '6分钟' }],
             // 侧栏纵向以**插件自己的元素**为锚（实测 .bga-orb 在 y724–751）
             plugin: [{ l: 12, t: 724, r: 40, b: 751 }],
           }))
