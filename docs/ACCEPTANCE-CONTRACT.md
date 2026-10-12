@@ -386,24 +386,39 @@ node tools/iso-instance.mjs run --name poc5 --root D:\DeepSeek\dsh-iso\poc5 \
   `Start-Process -ArgumentList` 按空格重拼，不加引号就报 `Cannot find module 'E:\DeepSeek'`；
 · `spawnSync` 会等 stdout 管道 EOF，而 `Start-Process` 起的孙子进程继承着管道 ⇒ 必须 `stdio:'ignore'`。
 
-### 零之五之六、审核方第十七轮的三项缺陷：**已修**（并用真实函数坏例钉住）
+### 零之五之六、隔离验收工具的三项缺陷 + 一个设置路径出口：**已修**（用真实函数坏例钉住）
 
 审核方用 4 个反例（`D:\ChatGPT\review-r17-counterexamples.mjs`）打这套工具，**我独立复跑 4/4 复现**；
-按"前提失败不出绿"逐条修掉，并新增**真实函数坏例套件** `tools/verify-iso-hardening.mjs`（19 项，进 CI）。
+按"前提失败不出绿"逐条修掉，并新增**真实函数坏例套件** `tools/verify-iso-hardening.mjs`（**27 项**，进 CI）。
+隔天审核方又用 `D:\ChatGPT\review-5c982a9-settings-isolation.mjs` 打穿了**设置路径**（下表第 4 条）。
 
 | # | 缺陷 | 根因 | 修法 |
 |---|---|---|---|
 | 1 | 总控**中止仍 exit 0** | `run()` 的 `catch` 只打印"中止"、没把失败写进 `results`；退出码只看 `results`；未执行的必测项没列"未测" | 异常计入失败（`abortReason`）；**步骤声明提前到任何 try 之前**（早期中止也能列出未测）；汇总**三态分开**（通过/失败/未测）；有异常或未测即非零退出 |
 | 2 | 隔离门槛弱于所述 | `run()` 只核图库目录（未核设置目录，`verify` 那份核两个 ⇒ 口径不一致）；判定用**字符串前缀** ⇒ 相邻目录 `poc5-other` 通过；未解析链接 | 抽出共用 `insideTree()`/`isolationFacts()`：**realpath 解析链接** + **路径段**判定（`path.relative` 不以 `..` 开头）；**两个实际目录**都核 + 设置文件落在树内 + 图库不得是生产图库。三处调用点统一 |
 | 3 | 固定相位**部分失败判成功** | `pinned` 统计的是**尝试数**（自增无条件执行）；判定只看 `total>0 && pinned>0`；没确认动画属于插件 | `pinned` 只计**成功**；`fail>0` 即失败；要求 **插件自身**动画（类名含 `bga` 的元素上的动画）存在且**全部暂停**，宿主动画不算 |
+| 4 | **设置路径可被环境变量整个绕开**（第二轮复核） | 门槛只查"树里有没有设置文件"；而插件选址规则（`index.js:settingsDirCandidates()`）把 `DSH_BG_ATELIER_SETTINGS_DIR` 当**唯一候选** ⇒ 环境里继承到它就读写**树外那份**，门槛照过（反例：`actualSettingsInsideTree=false` 而 `gateAccepts=true`）。对方另更正：`wallpapers.json` 的 `dir`/`writableDir` **都是图库路径**，设置路径必须**另核** | ① **钉住**两个路径：宿主与验收子进程都注入 `DSH_BG_ATELIER_SETTINGS_DIR` / `DSH_BG_ATELIER_WALLPAPERS` = 树内（展开顺序必须在 `...process.env` **之后**），并把"环境里的外部覆盖已中和"作为证明行；② **门槛自己判死**：`isolationFacts(roots, hostEnv)` 按 `index.js` 规则推算**实际选址**并要求其在树内（`settingsPathInTree`，路径级）；③ **行为核对**：本次运行 PUT 过底图 ⇒ 固定路径那份"刚被写过"，且**树外候选的哈希未变**（快照取在**起宿主之前**） |
 
 **证据**（可复跑）：
-- `node tools/verify-iso-hardening.mjs` ⇒ **19 通过 / 0 失败**：相邻目录判 false、链接指树外判 false、
+- `node tools/verify-iso-hardening.mjs` ⇒ **27 通过 / 0 失败**：相邻目录判 false、链接指树外判 false、
   外部图库判 false、生产图库被标记、缺信息判 false；**真调 CLI** 的早期中止 ⇒ **exit 1**
-  （汇总 `3 通过 / 1 失败 / 4 未测`）；固定相位 5 个坏例全判失败 + 1 个正常例判成功。
+  （汇总 `3 通过 / 1 失败 / 4 未测`）；固定相位 5 个坏例全判失败 + 1 个正常例判成功；
+  **门槛级**：宿主环境干净 ⇒ `settingsPathInTree=true`，环境指向树外 ⇒ **门槛自己判死**
+  （`settingsPathInTree=false`）；无 `process` 的 vm 上下文里也不许抛（审核方脚本就是这么调它的）。
+- **真机两情形**（隔离实例，同一基准 `iso-r10`）：
+  · 环境干净 + 默认步骤 ⇒ **24 通过 / 0 失败 / 0 未测**；
+  · 环境里**故意**设 `DSH_BG_ATELIER_SETTINGS_DIR=<树外目录>` ⇒ **21 通过 / 0 失败 / 0 未测**，
+    且打印 `✅ 环境里的外部覆盖已中和 [<树外> → 树内]` + `✅ 树外的旧覆盖目标未被本次运行改动 [已核 1 个树外候选]`；
+    事后独立核对那份树外 `settings.json` 的 sha256 **未变**。
+- **口径提醒**：`isolationFacts` 的第 2 参必须是**宿主进程真正拿到的环境**。拿验收进程自己的
+  `process.env` 去判是**错的**（里面带着生产 `DSH_HOME`，会把门槛误判死 —— 实测踩过）；
+  `up`/`verify` 检查的是**正在跑的实例**，用 `pinnedHostEnv()`（"按我们规定它该拿到的环境"）判。
+- **顺带修的两处工具卫生问题**（都是实测踩到才发现的）：① `down` 只杀 `instance.json` 里记的那一个
+  进程 ⇒ 残留宿主锁住 `_run.out`、下一次 `run` 报 EPERM；现在按**端口所有者 + 命令行端口参数**
+  兜底清扫（生产写死 19387、不含这些参数，不会被误杀）。② `_run.out` 被占用时退到**唯一文件名**并打印。
 - `iso-r10` 修后**三次完整重启**（宿主 PID 9432/15036/4052、浏览器 PID 28904/17740/21616）
   各 `8 一致 / 0 差异`；日志 `docs/evidence/r10-postfix-restart-{1,2,3}.log`。
-- 隔离实例默认步骤：**19 通过 / 0 失败 / 0 未测**；切换与动效 **16 通过 / 0 失败**。
+- 隔离实例默认步骤：**24 通过 / 0 失败 / 0 未测**（含设置路径两项新证明）；切换与动效 **16 通过 / 0 失败**。
 
 **⚠️ 顺带抓到第四个缺陷（同一家族，已修）**：`verify-oracle-entry.mjs` 的 **S1/S6/S7 偶发 exit 6**，
 同一套件多轮结果不一（`20/0`、`19/1`、`18/2`，失败断言在几个场景之间跳）。

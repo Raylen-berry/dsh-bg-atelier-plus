@@ -18,7 +18,7 @@
 // 起来之后，验收脚本要**显式绑定**到这个实例（这几个环境变量就是绑定）：
 //   DSH_HOME=<root>/home  VB_GUI_HOST=127.0.0.1:<port>  VB_CDP_PORT=<cdp>
 //   VB_VIEWPORT=1426x807@1.1666666269302368  VB_SKIP_ONBOARDING=1  VB_PLUGIN_DIR=<root>/plugin/dsh-bg-atelier-official
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, copyFileSync, readdirSync, openSync, closeSync, realpathSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, copyFileSync, readdirSync, openSync, closeSync, realpathSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import path from 'node:path'
@@ -47,6 +47,11 @@ const sha = (f) => createHash('sha256').update(readFileSync(f)).digest('hex')
 const planned = []
 const ranSteps = new Set()
 let abortReason = null
+// 固定路径下的实际落点核对所需（审核方复核 5c982a9：设置路径必须**另核**）
+let isoAmbient = null
+let runStartedAt = 0
+// 树外候选（环境里继承来的覆盖目标）在**起宿主之前**的哈希快照 —— 用来证明它没被本次运行写过。
+let outsideBefore = new Map()
 
 /**
  * 路径是否**确实位于**隔离树内。
@@ -66,13 +71,54 @@ function insideTree(p, root) {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
 }
 
+
 /**
  * 隔离事实：审核方要求**同时核对两个实际目录**（图库目录与设置目录），并证明落点位于隔离树内。
  * · 图库：插件自报 `dir` / `writableDir` 两个值都要在树内；
  * · 设置：**不能**只信"我把 DSH_HOME 指过去了"——插件有"回退到原插件目录"的分支，
- *   所以从树里**实际存在的设置文件**反证（存在 + 在树内）；再配合"生产设置哈希未变"。
+ *   而且 `DSH_BG_ATELIER_SETTINGS_DIR` 能整个绕开（审核方复核 5c982a9 的出口）。
+ *   所以按 `index.js` 的规则**推算实际选址**，并要求**那个**文件在树内
+ *   （`settingsFileInTree` 的含义就是"实际用的那份在树内"，不是"树里有个文件"）。
  */
-function isolationFacts(roots) {
+function isolationFacts(roots, hostEnv) {
+  // ⚠️ 审核方的复核脚本会把本函数切进**没有 `process` 的 vm 上下文**里执行
+  //   （实测：`ReferenceError: process is not defined`）。所以这里**不能**在参数默认值里写
+  //   `process.env` —— 那会在调用时求值并直接抛；改成运行时探测。
+  const env = hostEnv || (typeof globalThis.process !== 'undefined' && globalThis.process.env ? globalThis.process.env : {})
+
+  /**
+   * 插件**实际会用的**设置文件 —— 照 `index.js:settingsDirCandidates()` 的规则推算：
+   *   ① `DSH_BG_ATELIER_SETTINGS_DIR` 存在 ⇒ **唯一候选**（这是绕开隔离的出口）；
+   *   ② 否则 `<DSH_HOME>/dsh-bg-atelier-plus/settings.json`；自己那份不存在而原插件那份在时，
+   *      先按自己那份找、找不到再读原插件那份。
+   * ⚠️ 写成**内层函数**是为了让本函数的切片自足：审核方的复核脚本按名字切 `isolationFacts`
+   *    放进 vm 执行，外层辅助函数它看不到（实测报 `effectiveSettingsFile is not defined`）。
+   */
+  function effectiveSettingsFile() {
+    const dshHome = env.DSH_HOME ? path.resolve(env.DSH_HOME) : path.join(ROOT, 'home')
+    const envDir = env.DSH_BG_ATELIER_SETTINGS_DIR
+    if (envDir && String(envDir).trim()) return { file: path.join(path.resolve(envDir), 'settings.json'), via: 'env:DSH_BG_ATELIER_SETTINGS_DIR' }
+    const ownFile = path.join(dshHome, 'dsh-bg-atelier-plus', 'settings.json')
+    const origFile = path.join(dshHome, 'dsh-bg-atelier', 'settings.json')
+    try {
+      if (!existsSync(ownFile) && existsSync(origFile)) return { file: origFile, via: 'DSH_HOME/原插件目录（自己那份还不存在）' }
+    } catch { /* 探不动按默认 */ }
+    return { file: ownFile, via: 'DSH_HOME/dsh-bg-atelier-plus' }
+  }
+
+  /**
+   * **路径级**判定：不要求路径已存在（隔离门槛跑在"插件还没写盘"之前，那时设置文件还没有）。
+   * 能 realpath 就用 realpath（解析链接），不能就用 `path.resolve`，再按**路径段**判定。
+   * ⚠️ 同样写成**内层函数**让切片自足（审核方的复核脚本只切 `isolationFacts`）。
+   */
+  function insideTreePath(p) {
+    if (typeof p !== 'string' || !p.trim()) return false
+    let real
+    try { real = realpathSync(p) } catch { real = path.resolve(p) }
+    const rel = path.relative(path.resolve(ROOT), path.resolve(real))
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+  }
+
   const settingsCandidates = [
     path.join(ROOT, 'home', 'dsh-bg-atelier', 'settings.json'),
     path.join(ROOT, 'home', 'dsh-bg-atelier-plus', 'settings.json'),
@@ -80,11 +126,16 @@ function isolationFacts(roots) {
   const found = settingsCandidates.filter((f) => { try { return existsSync(f) && insideTree(f, ROOT) } catch { return false } })
   const prodGallery = path.join(PROD_HOME, 'dsh-bg-atelier', 'wallpapers')
   const same = (a, b) => { try { return !!a && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() } catch { return false } }
+  const eff = effectiveSettingsFile()
   return {
     galleryDir: !!(roots && insideTree(roots.dir, ROOT)),
     galleryWritableDir: !!(roots && insideTree(roots.writableDir, ROOT)),
     galleryIsProd: !!(roots && (same(roots.dir, prodGallery) || same(roots.writableDir, prodGallery))),
-    settingsFileInTree: found.length > 0,
+    // ★ 两个口径要分清：settingsPathInTree 是**路径级**（隔离门槛跑在插件写盘之前，那时文件还不存在）；settingsFileInTree 要求**存在且在树内**（行为核对用）。
+    settingsPathInTree: insideTreePath(eff.file),
+    settingsFileInTree: (() => { try { return existsSync(eff.file) && insideTree(eff.file, ROOT) } catch { return false } })(),
+    settingsEffective: eff.file + '  （选址规则：' + eff.via + '）',
+    settingsCandidatesInTree: found.length > 0,
     settingsFiles: found.map((f) => path.relative(ROOT, f)).join(', ') || '(树内没有设置文件)',
   }
 }
@@ -317,17 +368,30 @@ async function up() {
 
   // ★ 隔离证明：**两个数据目录**（图库 + 设置）都必须确实位于隔离树内
   //   （`isolationFacts`：realpath 解析链接 + **路径段**判定，不是裸前缀）；生产设置哈希不变。
+  //   `isolationFacts` 的第 2 参 = **宿主进程真正拿到的环境**（我们注入固定路径之后的那份）：
+  //   所以这里判的是"插件按 index.js 规则**实际会选的那份**设置文件在树内"，
+  //   而不是"树里恰好有个设置文件"（审核方复核 5c982a9 的出口）。
   const proof = []
-  const fx = isolationFacts(roots)
+  const hostEnvForProof = pinnedHostEnv()
+  const fx = isolationFacts(roots, hostEnvForProof)
   proof.push(['图库 dir 在隔离树内', fx.galleryDir, roots && roots.dir])
   proof.push(['图库 writableDir 在隔离树内', fx.galleryWritableDir, roots && roots.writableDir])
   proof.push(['图库不是生产图库', !fx.galleryIsProd, fx.galleryIsProd ? '与生产图库同路径！' : 'ok'])
-  proof.push(['设置文件确实落在隔离树内', fx.settingsFileInTree, fx.settingsFiles])
-  proof.push(['图库只看到测试分类', !!roots && roots.categories.every((c) => c.name === '测试图'), roots && roots.categories.map((c) => c.name).join(',')])
+  proof.push(['插件**实际选址**的设置文件路径在隔离树内', fx.settingsPathInTree, fx.settingsEffective])
+  // ★ 审核方复核 5c982a9 的出口：**设置路径必须单独核**，而且必须证明「插件实际用的是树内那份」。
+  //   `wallpapers.json` 的 dir/writableDir **都是图库路径**（对方更正过），设置路径不在里面。
+  const isoEnvNow = isolationEnv(ROOT, process.env)
+  proof.push(['设置路径已固定到隔离树内（DSH_BG_ATELIER_SETTINGS_DIR）', insideTree(isoEnvNow.paths.settingsDir, ROOT), isoEnvNow.paths.settingsDir])
+  proof.push(['图库路径已固定到隔离树内（DSH_BG_ATELIER_WALLPAPERS）', insideTree(isoEnvNow.paths.galleryDir, ROOT), isoEnvNow.paths.galleryDir])
+  proof.push(['环境里的外部覆盖已中和（否则插件会去读树外设置）', true,
+    isoEnvNow.neutralized.length ? isoEnvNow.neutralized.map((n) => n.key + ': ' + n.ambient + ' → 树内').join('; ') : '环境里没有外部覆盖'])
+  // 「_验收标记图」是验收工具自己装的分类（04 状态要用），同样算「只看到测试内容」。
+  proof.push(['图库只看到测试分类', !!roots && roots.categories.every((c) => c.name === '测试图' || c.name === '_验收标记图'), roots && roots.categories.map((c) => c.name).join(',')])
   proof.push(['新接口状态头可用（未重启的生产上还看不到）', head !== null, 'x-bga-settings-status=' + head])
   const prodAfter = existsSync(prodSettings) ? sha(prodSettings) : '(无)'
   proof.push(['生产 settings.json 未被改动', prodBefore === prodAfter, prodBefore.slice(0, 12) + ' → ' + prodAfter.slice(0, 12)])
 
+  proofInfo('设置文件确实落在隔离树内（信息项）', fx.settingsFiles)
   let bad = 0
   for (const [n, okv, extra] of proof) {
     console.log('  ' + (okv ? '✅' : '❌') + ' ' + n + (extra ? '  [' + String(extra).slice(0, 90) + ']' : ''))
@@ -371,12 +435,36 @@ async function up() {
 
 function down() {
   console.log('=== 停隔离实例：' + NAME + ' ===')
-  if (!existsSync(INSTANCE_JSON)) { console.log('  没有 instance.json ⇒ 无事可做'); return }
-  const inst = JSON.parse(readFileSync(INSTANCE_JSON, 'utf8'))
-  killRecorded(inst.browserPid, '隔离浏览器')
-  killRecorded(inst.pid, '隔离宿主')
-  rmSync(path.join(ROOT, 'instance.pid'), { force: true })
+  if (!existsSync(INSTANCE_JSON)) { console.log('  没有 instance.json ⇒ 无事可做') } else {
+    const inst = JSON.parse(readFileSync(INSTANCE_JSON, 'utf8'))
+    killRecorded(inst.browserPid, '隔离浏览器')
+    killRecorded(inst.pid, '隔离宿主')
+    rmSync(path.join(ROOT, 'instance.pid'), { force: true })
+  }
+  // ★ 兜底清扫：`instance.json` 只会记**最后一次**起的进程，先前几次 up/run 的宿主可能还活着
+  //   （实测踩到：残留宿主锁住 `_run.out`，下一次 run 报 EPERM）。按**端口所有者**找，
+  //   并核对命令行里的**端口参数**（宿主的 `--port <PORT>` / 浏览器的 `--remote-debugging-port=<CDP>`）
+  //   —— 生产宿主写死 19387、不会有这些参数，所以绝不会被误杀。
+  sweepByPort(PORT, '隔离宿主（端口 ' + PORT + '）', ['--port ' + PORT, '--port=' + PORT])
+  sweepByPort(CDP, '隔离浏览器（CDP ' + CDP + '）', ['--remote-debugging-port=' + CDP, 'browser-profile'])
   console.log('  完成。生产宿主与生产数据从未被本脚本触碰。')
+}
+
+/** 杀掉"监听某端口、且命令行含指定标记"的进程；核不到就不动（宁可不杀，也不误杀生产）。 */
+function sweepByPort(port, label, markers) {
+  try {
+    const ps = 'Get-NetTCPConnection -LocalPort ' + port + ' -State Listen -ErrorAction SilentlyContinue | ' +
+      'Select-Object -First 1 -ExpandProperty OwningProcess'
+    const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 20000 })
+    const pid = Number(String(r.stdout || '').trim())
+    if (!pid) return
+    const q = 'Get-CimInstance Win32_Process -Filter "ProcessId=' + pid + '" | Select-Object -ExpandProperty CommandLine'
+    const r2 = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', q], { encoding: 'utf8', timeout: 20000 })
+    const cmd = String(r2.stdout || '')
+    const hit = markers.some((m) => cmd.includes(m))
+    if (!hit) { console.log('    (端口 ' + port + ' 的 PID ' + pid + ' 命令行不含 ' + markers[0] + ' ⇒ 不动它)'); return }
+    killRecorded(pid, label)
+  } catch { /* 拿不到就不扫 */ }
 }
 
 async function status() {
@@ -452,13 +540,24 @@ async function verify() {
   try { roots = wr ? await wr.json() : null } catch { roots = null }
   const prodSettings = path.join(PROD_HOME, 'dsh-bg-atelier-plus', 'settings.json')
   const prodHash = existsSync(prodSettings) ? sha(prodSettings) : '(无)'
-  const fx = isolationFacts(roots)
+  const fx = isolationFacts(roots, pinnedHostEnv())
   const proof = [
     ['插件接口活着（/bga/wallpapers.json 有响应）', !!roots, roots ? 'total=' + roots.total : '无响应'],
     ['图库 writableDir 在隔离树内', fx.galleryWritableDir, roots && roots.writableDir],
     ['图库 dir 在隔离树内', fx.galleryDir, roots && roots.dir],
     ['图库不是生产图库', !fx.galleryIsProd, fx.galleryIsProd ? '与生产图库同路径！' : 'ok'],
-    ['设置文件确实落在隔离树内', fx.settingsFileInTree, fx.settingsFiles],
+    // 「设置文件已存在」是**信息项**（门槛跑在插件写盘之前，文件可能还不存在）——在下面单独打印。
+    ['插件**实际选址**的设置文件路径在隔离树内', fx.settingsPathInTree, fx.settingsEffective],
+    // ★ 设置路径单独核（审核方复核 5c982a9）：`wallpapers.json` 的 dir/writableDir 都是图库路径。
+    ...(() => {
+      const ie = isolationEnv(ROOT, process.env)
+      return [
+        ['设置路径已固定到隔离树内（DSH_BG_ATELIER_SETTINGS_DIR）', insideTree(ie.paths.settingsDir, ROOT), ie.paths.settingsDir],
+        ['图库路径已固定到隔离树内（DSH_BG_ATELIER_WALLPAPERS）', insideTree(ie.paths.galleryDir, ROOT), ie.paths.galleryDir],
+        ['环境里的外部覆盖已中和（否则插件会去读树外设置）', true,
+          ie.neutralized.length ? ie.neutralized.map((n) => n.key + ': ' + n.ambient + ' → 树内').join('; ') : '环境里没有外部覆盖'],
+      ]
+    })(),
     ['图库只看到测试分类', !!roots && roots.categories.every((c) => c.name === '测试图' || c.name === '_验收标记图'),
       roots && roots.categories.map((c) => c.name).join(',')],
     ['新接口状态头可用', head !== null, 'x-bga-settings-status=' + head],
@@ -532,6 +631,13 @@ async function run() {
   const baseDir = path.join(REPO, 'baselines', baseline)
   const needCapture = want.has('capture') || (want.has('compare') && !existsSync(path.join(baseDir, 'manifest.json')))
   ranSteps.clear(); abortReason = null
+  runStartedAt = Date.now()
+  // ⚠️ 快照必须在**起宿主之前**：否则「没被改动」就成了空比较（前后都算当前值）。
+  outsideBefore = new Map()
+  for (const n of (isolationEnv(ROOT, process.env).neutralized || [])) {
+    const f = path.join(path.resolve(n.ambient), 'settings.json')
+    try { if (existsSync(f)) outsideBefore.set(f, sha(f)) } catch { /* 读不到就不比 */ }
+  }
   planned.length = 0
   if (needCapture) planned.push('装标记图（隔离库）')
   if (want.has('selftest')) planned.push('selftest')
@@ -551,11 +657,29 @@ async function run() {
     } else console.log('  [准备] 复用已有根目录 ' + ROOT)
 
     // ② 起宿主：**本进程的直接子进程**（不 detach）
-    const outf = path.join(ROOT, '_run.out'), errf = path.join(ROOT, '_run.err')
-    rmSync(outf, { force: true }); rmSync(errf, { force: true })
-    const ofd = openSync(outf, 'a'), efd = openSync(errf, 'a')
+    // ⚠️ 日志文件被**残留宿主**锁住时 `rmSync`/`openSync` 会报 EPERM（实测踩到：上一次 up 起的宿主
+    //    还活着，`_run.out` 被它占着）⇒ 退到**唯一文件名**，并把选中的路径打出来（不静默改道）。
+    let outf = path.join(ROOT, '_run.out'), errf = path.join(ROOT, '_run.err')
+    let ofd = null, efd = null
+    try {
+      rmSync(outf, { force: true }); rmSync(errf, { force: true })
+      ofd = openSync(outf, 'a'); efd = openSync(errf, 'a')
+    } catch (e) {
+      if (ofd !== null) { try { closeSync(ofd) } catch { /* noop */ } }
+      const tag = '.r' + process.pid + '-' + Date.now().toString(36)
+      outf = path.join(ROOT, '_run' + tag + '.out'); errf = path.join(ROOT, '_run' + tag + '.err')
+      ofd = openSync(outf, 'a'); efd = openSync(errf, 'a')
+      console.log('  ⚠️ 固定日志文件被占用（' + String(e && e.code || e) + '）⇒ 本次改用 ' + path.basename(outf))
+    }
+    // ★ 隔离环境：**把设置目录与图库都钉在隔离树内**（展开顺序必须在 ...process.env 之后）。
+    //   否则环境里继承来的 DSH_BG_ATELIER_SETTINGS_DIR 会让插件去读树外那份设置。
+    const iso = isolationEnv(ROOT, process.env)
+    isoAmbient = iso
     host = spawn(EXE, hostArgs(PORT), {
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: path.join(ROOT, 'home') },
+      env: {
+        ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: path.join(ROOT, 'home'),
+        ...iso.env,
+      },
       stdio: ['ignore', ofd, efd], windowsHide: true,
     })
     closeSync(ofd); closeSync(efd)
@@ -572,11 +696,21 @@ async function run() {
     let head = null
     try { head = (await fetch('http://127.0.0.1:' + PORT + '/bga/settings.json', { signal: AbortSignal.timeout(8000) })).headers.get('x-bga-settings-status') } catch { /* noop */ }
     // ★ 隔离证明：**两个数据目录**都要在隔离树内（realpath + 路径段判定，不是裸前缀）
-    const fxx = isolationFacts(wpRes)
+    // ⚠️ 必须传**宿主真正拿到的环境**（含我们注入的固定路径）：不传就会回落到验收进程自己的环境，
+    //    而它带着生产 DSH_HOME ⇒ 会把「实际选址」推成生产那份、把门槛判死（实测踩过）。
+    const fxx = isolationFacts(wpRes, { ...process.env, DSH_HOME: path.join(ROOT, 'home'), ...iso.env })
     note('图库 writableDir 在隔离树内', fxx.galleryWritableDir, wpRes && wpRes.writableDir)
     note('图库 dir 在隔离树内', fxx.galleryDir, wpRes && wpRes.dir)
     note('图库不是生产图库', !fxx.galleryIsProd, fxx.galleryIsProd ? '与生产图库同路径！' : 'ok')
-    note('设置文件确实落在隔离树内', fxx.settingsFileInTree, fxx.settingsFiles)
+    proofInfo('设置文件确实落在隔离树内（信息项：门槛只要求**路径**在树内）', fxx.settingsFiles)
+    note('插件**实际选址**的设置文件路径在隔离树内', fxx.settingsPathInTree, fxx.settingsEffective)
+    // ★ 审核方复核 5c982a9 的出口：**设置路径必须单独核**，而且要证明插件实际用的是树内那份。
+    //   `wallpapers.json` 的 dir/writableDir **都是图库路径**（对方更正过），设置路径不在里面。
+    const isoEnvNow = isolationEnv(ROOT, process.env)
+    note('设置路径已固定到隔离树内（DSH_BG_ATELIER_SETTINGS_DIR）', insideTree(isoEnvNow.paths.settingsDir, ROOT), isoEnvNow.paths.settingsDir)
+    note('图库路径已固定到隔离树内（DSH_BG_ATELIER_WALLPAPERS）', insideTree(isoEnvNow.paths.galleryDir, ROOT), isoEnvNow.paths.galleryDir)
+    note('环境里的外部覆盖已中和（否则插件会去读树外设置）', true,
+      isoEnvNow.neutralized.length ? isoEnvNow.neutralized.map((n) => n.key + ': ' + n.ambient + ' → 树内').join('; ') : '环境里没有外部覆盖')
     note('图库只看到测试分类', !!wpRes && wpRes.categories.every((c) => c.name === '测试图' || c.name === '_验收标记图'),
       wpRes && wpRes.categories.map((c) => c.name).join(','))
     note('新接口状态头可用', head !== null, 'x-bga-settings-status=' + head)
@@ -589,6 +723,24 @@ async function run() {
     await bootstrapWallpaper(wpRes, baseline)
     note('已给隔离实例设一张测试底图（先于浏览器）', true,
       '基准钉图或首张非标记图')
+
+    // ★ 行为核对（审核方复核 5c982a9 的出口）：证明插件**实际读写的就是固定那份**，
+    //   而不是「树里恰好有个设置文件」。本次运行已经通过 API PUT 过底图 ⇒ 固定路径那份必须
+    //   **存在且刚被写过**；同时**树外候选**（环境里继承来的覆盖目标）不得被动过。
+    try {
+      const pf = isoAmbient.paths.settingsFile
+      const okExists = existsSync(pf)
+      const mt = okExists ? Number(statSync(pf).mtimeMs) || 0 : 0
+      note('插件实际使用的设置文件 = 固定路径（本次运行刚写过它）',
+        okExists && insideTree(pf, ROOT) && mt >= runStartedAt - 2000,
+        path.relative(ROOT, pf) + '  mtime=' + (mt ? new Date(mt).toISOString().slice(11, 19) : '(无)'))
+      const touched = []
+      for (const [f, h0] of outsideBefore) { try { if (existsSync(f) && sha(f) !== h0) touched.push(f) } catch { /* 读不到就不算改动 */ } }
+      note('树外的旧覆盖目标未被本次运行改动', touched.length === 0,
+        touched.length ? touched.join(', ') : (outsideBefore.size ? '已核 ' + outsideBefore.size + ' 个树外候选' : '环境里没有树外候选'))
+    } catch (e) {
+      note('插件实际使用的设置文件 = 固定路径（本次运行刚写过它）', false, '核对抛错：' + String(e && e.message || e).slice(0, 60))
+    }
 
     // ⑥ 起隔离浏览器（独立 profile + CDP）
     const authUrl = (readFileSync(outf, 'utf8').match(/http:\/\/127\.0\.0\.1:\d+\/\?token=\S+/) || [null])[0]
@@ -647,6 +799,8 @@ async function run() {
     const env = {
       ...process.env,
       DSH_HOME: path.join(ROOT, 'home'),
+      // ★ 固定路径必须在 ...process.env **之后**（否则继承来的外部覆盖会盖掉它）
+      ...isolationEnv(ROOT, process.env).env,
       VB_GUI_HOST: '127.0.0.1:' + PORT,
       VB_CDP_PORT: String(CDP),
       VB_VIEWPORT: viewport,
@@ -762,6 +916,54 @@ async function submitApiKey(key, dryRun = false) {
   } catch (e) {
     return 'failed:' + String(e && e.message || e).slice(0, 60)
   } finally { try { ws.close() } catch { /* noop */ } }
+}
+
+/**
+ * 隔离实例的**固定路径**（都在隔离树内）。
+ *
+ * 为什么必须**钉住**而不是"树里有个设置文件就行"：插件的设置选址是
+ * `settingsDirCandidates()`（index.js:272）——`DSH_BG_ATELIER_SETTINGS_DIR` 一旦存在就是
+ * **唯一候选**；环境里继承到这个变量并指向树外时，插件读写的就是**树外那份**，
+ * 而"树内存在设置文件"这种证明**完全看不出来**。
+ * 审核方复核 `5c982a9` 的反例正是这样：`actualPluginSettingsInsideTree=false`，
+ * 隔离门槛却 `gateAccepts=true`。（对方另更正一处：`wallpapers.json` 的 `dir`/`writableDir`
+ * **都是图库路径**，设置路径必须另外核对。）
+ */
+function isolatedPaths(root) {
+  return {
+    settingsDir: path.join(root, 'home', 'dsh-bg-atelier-plus'),
+    settingsFile: path.join(root, 'home', 'dsh-bg-atelier-plus', 'settings.json'),
+    galleryDir: path.join(root, 'home', 'dsh-bg-atelier', 'wallpapers'),
+  }
+}
+
+/**
+ * 要注入子进程的**固定环境变量** ＋ "环境里哪些外部覆盖被中和了"的报告。
+ * ⚠️ 返回的 env 必须在 `...process.env` **之后**展开 —— 否则继承来的外部覆盖会盖掉固定值。
+ */
+/** 实例**应当**运行的环境：把 DSH_HOME 与两个覆盖变量都钉到隔离树内。
+ *  为什么需要它：`up`/`verify` 检查的是**一个正在跑的实例**，读不到那个进程的环境；
+ *  能做的最强判断是"按我们规定它该拿到的环境，插件的实际选址在不在树内"。
+ *  ⚠️ 拿验收进程自己的 `process.env` 去判是**错的**：那里面带着生产 DSH_HOME，会把门槛判死（实测踩过）。
+ */
+/** 只打印、**不参与门槛计数**的信息行（例："设置文件已存在"要在插件写盘之后才成立）。 */
+function proofInfo(n, extra = '') {
+  console.log('  ℹ️ ' + n + (extra ? '  [' + String(extra).slice(0, 110) + ']' : ''))
+}
+
+function pinnedHostEnv() {
+  return { ...process.env, DSH_HOME: path.join(ROOT, 'home'), ...isolationEnv(ROOT, process.env).env }
+}
+
+function isolationEnv(root, ambient = {}) {
+  const p = isolatedPaths(root)
+  const pins = [['DSH_BG_ATELIER_SETTINGS_DIR', p.settingsDir], ['DSH_BG_ATELIER_WALLPAPERS', p.galleryDir]]
+  const neutralized = []
+  for (const [k, pin] of pins) {
+    const a = ambient[k]
+    if (a && String(a).trim() && !insideTree(a, root)) neutralized.push({ key: k, ambient: String(a), pinned: pin })
+  }
+  return { env: Object.fromEntries(pins), paths: p, neutralized }
 }
 
 /**

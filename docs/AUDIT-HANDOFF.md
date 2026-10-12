@@ -210,6 +210,24 @@ resolve 时才 abort"这条真实竞态。补上两条后，同一变异使套�
   **两个实际目录**都核 + 设置文件落在树内 + 图库不得是生产图库；三处调用点统一。
 - 证据：相邻目录 / 链接指树外 / 外部图库 ⇒ 全判 false；生产图库被标记（同套件 ①）。
 
+**0.2b [P1] 设置路径可被环境变量整个绕开**（第二轮复核打穿的出口）—— **已修**
+- 现象（审核方 `review-5c982a9-settings-isolation.mjs`）：隔离树里保留一份设置文件，
+  而 env `DSH_BG_ATELIER_SETTINGS_DIR` 指向树外 ⇒ 插件**真实选址**在树外，隔离门槛却仍通过。
+- 根因：门槛只查"树里有没有设置文件"；插件的 `settingsDirCandidates()` 把这个 env 当**唯一候选**。
+  （对方另更正：`wallpapers.json` 的 `dir`/`writableDir` **都是图库路径**，设置路径必须**另核**。）
+- 修法：① 宿主与验收子进程都**钉住** `DSH_BG_ATELIER_SETTINGS_DIR`/`DSH_BG_ATELIER_WALLPAPERS` = 树内
+  （展开顺序在 `...process.env` **之后**），并打印"外部覆盖已中和"；② **门槛自己判死**：
+  `isolationFacts(roots, hostEnv)` 按 `index.js` 规则推算**实际选址**并要求在树内（`settingsPathInTree`）；
+  ③ **行为核对**：本次 PUT 过底图 ⇒ 固定路径那份"刚被写过"，且**树外候选哈希未变**（快照在起宿主前取）。
+- 证据：套件 **27 通过 / 0 失败**（含门槛级两例）；真机干净 ⇒ **24 通过 / 0 失败 / 0 未测**；
+  **故意**设树外覆盖 ⇒ **21 通过 / 0 失败 / 0 未测**，事后独立核对树外那份 `settings.json` 的 sha256 未变。
+- 口径提醒：`isolationFacts` 第 2 参必须是**宿主真正拿到的环境**；拿验收进程自己的 `process.env`
+  会把门槛误判死（实测踩过）。`up`/`verify` 用 `pinnedHostEnv()`。
+- 顺带修的工具卫生：`down` 改为按**端口所有者 + 命令行端口参数**兜底清扫残留宿主
+  （原先只杀 `instance.json` 记的那一个 ⇒ 残留宿主锁住 `_run.out`，下一次 `run` 报 EPERM）；
+  `_run.out` 被占用时退到唯一文件名并打印出路。同时把 `up()` 的"只看到测试分类"判据
+  放宽到与 `run`/`verify` 一致（`_验收标记图` 是工具自己装的分类）。
+
 **0.3 [P2] 固定相位失败被计为成功** —— **已修**
 - 现象（`animation-freeze-failure-is-accepted`）：诊断值 `pinned=1, fail=1` 仍返回成功。
 - 根因：`pinned` 统计的是**尝试数**；判定只看 `total>0 && pinned>0`；没确认动画属于插件。

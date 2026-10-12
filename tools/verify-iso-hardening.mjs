@@ -50,6 +50,7 @@ console.log('\n— ① insideTree / isolationFacts：路径必须**确实**在�
   let linkMade = true
   try { symlinkSync(outside, path.join(tree, 'link-out'), 'junction') } catch { linkMade = false }
 
+  // effectiveSettingsFile 现在是 isolationFacts 的**内层函数**（切片自足），不用单独切。
   const src = sliceFn('tools/iso-instance.mjs', 'function insideTree') + '\n' +
     sliceFn('tools/iso-instance.mjs', 'function isolationFacts')
   const PROD_HOME = path.join(root, 'PROD')
@@ -69,7 +70,10 @@ console.log('\n— ① insideTree / isolationFacts：路径必须**确实**在�
     console.log('  ⚠️ 跳过链接用例（本机不能建 junction）')
   }
 
-  const f1 = isolationFacts({ dir: path.join(tree, 'home', 'dsh-bg-atelier', 'wallpapers'), writableDir: path.join(tree, 'home', 'dsh-bg-atelier', 'wallpapers') })
+  // ⚠️ 必须**显式**传宿主的干净环境：不传就回落到本套件自己的 `process.env`，
+  //    而它带着真实的 `DSH_HOME` ⇒ 实际选址会被推成**生产那份**（这恰好说明 DSH_HOME 也必须固定）。
+  const cleanEnv = { DSH_HOME: path.join(tree, 'home') }
+  const f1 = isolationFacts({ dir: path.join(tree, 'home', 'dsh-bg-atelier', 'wallpapers'), writableDir: path.join(tree, 'home', 'dsh-bg-atelier', 'wallpapers') }, cleanEnv)
   ok('★ 两个目录都在树内 + 设置文件在树内 ⇒ 全部成立',
     f1.galleryDir && f1.galleryWritableDir && f1.settingsFileInTree && !f1.galleryIsProd, f1.settingsFiles)
   const f2 = isolationFacts({ dir: 'C:\\production-gallery', writableDir: 'C:\\production-gallery' })
@@ -79,6 +83,79 @@ console.log('\n— ① insideTree / isolationFacts：路径必须**确实**在�
   const f4 = isolationFacts(null)
   ok('★ 拿不到插件自报目录 ⇒ 一律 false（不猜）',
     f4.galleryDir === false && f4.galleryWritableDir === false)
+  rmSync(root, { recursive: true, force: true })
+}
+
+// ─────────────────────────────────────────────────── ①b 设置路径必须**固定**（不是"树里有文件就行"）
+console.log('\n— ①b isolationEnv：环境里的外部设置覆盖必须被中和（审核方复核 5c982a9）—')
+{
+  // 复现场景：隔离树内保留一份设置文件，但环境变量指向树外 —— 插件的选址函数
+  // （index.js settingsDirCandidates）把该变量当**唯一候选**，于是它读的是树外那份，
+  // 而"树里存在设置文件"这种证明完全看不出来。
+  const root = mkdtempSync(path.join(tmpdir(), 'iso-env-'))
+  const tree = path.join(root, 'poc5')
+  mkdirSync(path.join(tree, 'home', 'dsh-bg-atelier-plus'), { recursive: true })
+  // 图库目录也要真建出来：`insideTree` 用 realpath（路径不存在就判 false，这是有意的保守）。
+  mkdirSync(path.join(tree, 'home', 'dsh-bg-atelier', 'wallpapers'), { recursive: true })
+  writeFileSync(path.join(tree, 'home', 'dsh-bg-atelier-plus', 'settings.json'), '{}')
+  const outside = path.join(root, 'production-settings')
+  mkdirSync(outside, { recursive: true })
+  const inside = (x) => {
+    try {
+      const rel = path.relative(path.resolve(tree), path.resolve(realpathSync(x)))
+      return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+    } catch { return false }
+  }
+
+  const src = sliceFn('tools/iso-instance.mjs', 'function insideTree') + '\n' +
+    sliceFn('tools/iso-instance.mjs', 'function isolatedPaths') + '\n' +
+    sliceFn('tools/iso-instance.mjs', 'function isolationEnv')
+  const fn = new Function('path', 'existsSync', 'realpathSync', 'ROOT', src + '\nreturn { isolationEnv, isolatedPaths }')
+  const { isolationEnv, isolatedPaths } = fn(path, existsSync, realpathSync, tree)
+
+  const p = isolatedPaths(tree)
+  ok('★ 固定路径全在隔离树内（设置目录与图库目录）',
+    p.settingsDir.startsWith(tree) && p.galleryDir.startsWith(tree), p.settingsDir)
+
+  const clean = isolationEnv(tree, {})
+  ok('★ 环境无覆盖 ⇒ 注入值仍在树内，且没有被中和的项',
+    clean.neutralized.length === 0 && inside(clean.env.DSH_BG_ATELIER_SETTINGS_DIR),
+    clean.env.DSH_BG_ATELIER_SETTINGS_DIR)
+
+  const dirty = isolationEnv(tree, { DSH_BG_ATELIER_SETTINGS_DIR: outside, DSH_BG_ATELIER_WALLPAPERS: outside })
+  ok('★ **环境指向树外** ⇒ 注入值被改回树内（插件不会再去读树外那份）',
+    !String(dirty.env.DSH_BG_ATELIER_SETTINGS_DIR).includes('production-settings') &&
+    inside(dirty.env.DSH_BG_ATELIER_SETTINGS_DIR) && inside(dirty.env.DSH_BG_ATELIER_WALLPAPERS),
+    dirty.env.DSH_BG_ATELIER_SETTINGS_DIR)
+  ok('★ 外部覆盖被**记录**下来（可核对，不是静默改掉）',
+    dirty.neutralized.length === 2 && dirty.neutralized.every((n) => n.ambient === outside),
+    dirty.neutralized.map((n) => n.key).join(','))
+
+  // ★★ 审核方复核 5c982a9 的形状：**门槛函数本身**（`isolationFacts`）在"环境指向树外"时就必须判死，
+  //    而不是靠调用点额外加几行 —— 否则任何按老字段判断的调用方仍会放行。
+  const gateSrc = sliceFn('tools/iso-instance.mjs', 'function insideTree') + '\n' +
+    sliceFn('tools/iso-instance.mjs', 'function isolationFacts')
+  const ROOT = tree
+  const PROD_HOME = path.join(root, 'PROD')
+  const gate = new Function('path', 'existsSync', 'realpathSync', 'ROOT', 'PROD_HOME',
+    gateSrc + '\nreturn isolationFacts')(path, existsSync, realpathSync, ROOT, PROD_HOME)
+
+  const gallery = { dir: path.join(tree, 'home', 'dsh-bg-atelier', 'wallpapers'), writableDir: path.join(tree, 'home', 'dsh-bg-atelier', 'wallpapers') }
+  const gClean = gate(gallery, { DSH_HOME: path.join(tree, 'home') })
+  ok('★★ 门槛：宿主环境干净 ⇒ 实际选址的**路径**在树内（settingsPathInTree=true）',
+    gClean.settingsPathInTree === true, gClean.settingsEffective)
+  const gDirty = gate(gallery, { DSH_HOME: path.join(tree, 'home'), DSH_BG_ATELIER_SETTINGS_DIR: outside })
+  ok('★★ 门槛：宿主环境指向树外 ⇒ **门槛自己判死**（这就是审核方复核的那个出口）',
+    gDirty.settingsPathInTree === false, gDirty.settingsEffective)
+  // 路径级（门槛用）与存在级（行为核对用）两个口径都要有：
+  //   门槛跑在"插件还没写盘"之前，那时文件确实不存在 ⇒ 只能用路径级。
+  ok('★★ 两个口径都在：路径级（门槛）与存在级（行为核对）',
+    typeof gClean.settingsPathInTree === 'boolean' && typeof gClean.settingsFileInTree === 'boolean',
+    'path=' + gClean.settingsPathInTree + ' file=' + gClean.settingsFileInTree)
+  const gNoProcess = gate(gallery)   // 模拟"没有 process 的 vm 上下文"：不许抛
+  ok('★ 门槛：拿不到进程环境时也不许抛（审核方脚本在无 process 的 vm 里执行）',
+    !!gNoProcess && typeof gNoProcess.settingsPathInTree === 'boolean', 'settingsPathInTree=' + (gNoProcess && gNoProcess.settingsPathInTree))
+
   rmSync(root, { recursive: true, force: true })
 }
 
