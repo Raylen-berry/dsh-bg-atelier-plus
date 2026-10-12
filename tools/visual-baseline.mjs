@@ -1856,13 +1856,23 @@ if (mode === 'capture') {
     const shot = await screenshot()
     const raw = decodePng(Buffer.from(shot.data, 'base64'))
     const sc = cssScale(raw, prep && prep.geom ? prep.geom.cssWidth : REF_CSS_WIDTH)
-    // 用**实测导出的几何**（不是写死常量）—— 否则 selftest 在别的窗口尺寸下会验到错的块
-    const rect = (prep && prep.geom && prep.geom.rect) || STABLE_RECT_BY_STATE[s.name]
+    // 用**实测导出的几何**（不是写死常量）—— 否则 selftest 在别的窗口尺寸下会验到错的块。
+    // ⚠️ 这里以前写的是 `|| STABLE_RECT_BY_STATE[s.name]`：实测几何拿不到时**静默回落到写死矩形**，
+    //    再拿它断言探针位置 —— 而那正是本脚本反复禁止的"回落到写死常量去比错地方"
+    //    （compare 路径会拒绝，selftest 却会照常给出一堆"通过"，比直接失败坏得多）。
+    //    现在：拿不到实测几何 ⇒ 位置类检查**全部判失败**、探针集合置空（一句都不许蒙）。
     const liveGeom = prep && prep.geom
-    const inRect = (r) => r.l >= rect.x0 - 2 && r.r <= rect.x1 + 2 && r.t >= rect.y0 - 2 && r.b <= rect.y1 + 2
+    if (!liveGeom) {
+      console.error('  ✗ selftest：' + s.name + ' 拿不到实测几何 ⇒ 本状态的位置类检查全部判失败'
+        + '（绝不回落到写死的 STABLE_RECT_BY_STATE 去比错地方）')
+      stOk('截图前图片就绪（' + s.name + '）', false, '实测几何缺失')
+      for (const [lbl] of PROBES) stOk(lbl + ' 落在比较矩形内', false, '实测几何缺失，未做检查')
+    }
+    const rect = liveGeom ? liveGeom.rect : null
+    const inRect = (r) => !!rect && r.l >= rect.x0 - 2 && r.r <= rect.x1 + 2 && r.t >= rect.y0 - 2 && r.b <= rect.y1 + 2
     const masked = (liveGeom && liveGeom.masks) || MASK_RECTS[s.name] || []
 
-    for (const [label, finder] of PROBES) {
+    for (const [label, finder] of (liveGeom ? PROBES : [])) {
       const got = await readState(`(()=>{const e=${finder}; if(!e) return JSON.stringify({absent:true});
         const r=e.getBoundingClientRect();
         return JSON.stringify({l:Math.round(r.left),t:Math.round(r.top),r:Math.round(r.right),b:Math.round(r.bottom)})})()`)

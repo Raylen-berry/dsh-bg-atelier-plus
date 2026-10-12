@@ -21,6 +21,10 @@ import {
   compareStableImages, cropStable, cssScale, deriveGeom,
   pluginRectRel, assertLayoutContract,
 } from './oracle-compare.mjs'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+const HERE = path.dirname(fileURLToPath(import.meta.url))
 let pass = 0, fail = 0
 const ok = (name, cond, extra = '') => {
   if (cond) { pass++; console.log('  ✅ ' + name + (extra ? '  [' + extra + ']' : '')) }
@@ -392,6 +396,23 @@ console.log('\n— ⑨ 主题/透明度状态的宿主表面锚点（第 3 项�
       makeShot2(1426, 807, { x0: 456, y0: 397, x1: 1244, y1: 511 }, [40, 40, 40], { ringColor: [200, 30, 30], ringWidth: 6 }),
       'surface', gBase, gBase,
     ).same === false)
+}
+
+console.log('\n— ⑨ 源码门禁：不许把写死矩形当**运行时回落** —')
+{
+  // 为什么加：visual-baseline.mjs 的 selftest 里曾写着
+  //   const rect = (prep && prep.geom && prep.geom.rect) || STABLE_RECT_BY_STATE[s.name]
+  // —— 实测几何拿不到时**静默回落到写死矩形**，再拿它断言探针位置：既可能假过也可能假挂，
+  // 而"一堆通过"比直接失败坏得多。STABLE_RECT_BY_STATE 只该作为**记录**进 manifest
+  // （fallbackRectsCss，供人查），绝不参与比较。这条门禁防止它悄悄回来。
+  const src = readFileSync(path.join(HERE, 'visual-baseline.mjs'), 'utf8')
+  // 只查**代码行**：注释里会引用历史写法（"这里以前写的是 || STABLE_RECT_BY_STATE[s.name]"），
+  // 那是文档不是回落。第一版门禁没区分，直接被自己的注释绊倒（实测）。
+  const code = src.split(/\r?\n/).filter((l) => !/^\s*\/\//.test(l)).join('\n')
+  ok('★ 源码里没有 `|| STABLE_RECT_BY_STATE[` 这种运行时回落',
+    !/\|\|\s*STABLE_RECT_BY_STATE\s*\[/.test(code), '命中即说明实测几何拿不到时会回落到写死矩形')
+  ok('★ 实测几何缺失时 selftest 有明确的失败分支',
+    /拿不到实测几何 ⇒ 本状态的位置类检查全部判失败/.test(src))
 }
 
 console.log('\n几何回归：' + pass + ' 通过 / ' + fail + ' 失败')

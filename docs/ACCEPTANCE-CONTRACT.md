@@ -180,6 +180,23 @@ node tools/iso-instance.mjs run --name poc4 --root D:\DeepSeek\dsh-iso\poc4 \
 
 **不需要任何密钥环境变量**：隔离 home 里已由应用存过凭据、且已有会话时，脚本会打印
 `✅ 隔离实例已存过凭据（无需 VB_ISO_API_KEY）` 与 `✅ 隔离实例已有会话（动效状态的前提）`。
+### 零之五之五、去掉最后一处"写死几何当运行时回落"（已修 + 源码门禁）
+
+`03-settings-studio` 的**裁剪框**本来就是运行时实测的（`hostKind:'dialog'` + `measureLiveGeom()` 的
+`dlg` 锚点 + 录下的相对量 `rel`），写死的 `STABLE_RECT_BY_STATE` 只作**记录**进 manifest
+（`fallbackRectsCss`，供人查）。但 **selftest** 那段曾经写着：
+
+    const rect = (prep && prep.geom && prep.geom.rect) || STABLE_RECT_BY_STATE[s.name]
+
+—— 实测几何拿不到时**静默回落到写死矩形**，再拿它断言探针位置。compare 路径遇到这种情况会拒绝，
+selftest 却会照常输出一串"通过"：**既可能假过、也可能假挂**，比直接失败坏得多。
+现在改成：拿不到实测几何 ⇒ 该状态的位置类检查**全部判失败**、探针集合置空（一句都不许蒙）。
+
+并加了一条**源码门禁**（`verify-oracle-geometry.mjs` 第 ⑨ 节）：源码里不得再出现
+`|| STABLE_RECT_BY_STATE[` 这种运行时回落；同时要求"实测几何缺失"分支存在。
+（门禁第一版被**自己的注释**绊倒 —— 注释里引用了历史写法；已改为只查代码行。）
+几何回归：**50 通过 / 0 失败**；隔离实例真机 selftest **13 通过 / 0 失败**。
+
 只有当应用**又弹出**首次运行引导时才会要 `VB_ISO_API_KEY`（那时才应显式提供，见 §零之五之四）。
 **一次性人工前提**：全新隔离 home 需要在**应用界面里建一个会话**（脚本不代替你做，
 因为那需要模型调用）；没有会话时 `02-fx-nodes` 会大声拒绝参与比较，不会静默放过。
