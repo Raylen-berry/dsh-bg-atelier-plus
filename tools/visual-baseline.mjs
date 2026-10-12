@@ -839,17 +839,40 @@ async function pinAnimations(ms, log) {
     if(!st){ st=document.createElement('style'); st.id='vb-fxpin'; document.head.appendChild(st) }
     st.textContent = '[class*="bga"]{animation-play-state:paused!important}[class*="bga"] *{animation-play-state:paused!important}';
     // ② 时间线钉在同一个绝对 t（含 delay 的时间轴 ⇒ 各粒子保持相对错位）
-    const as=document.getAnimations(); let n=0, fail=0;
-    for(const a of as){ try{ a.currentTime=${ms}; a.pause() }catch(e){ fail++ } n++ }
-    // ③ 强制一次样式/布局提交 + 两帧 rAF，让暂停后的画面**真的**被光栅化
+    // ⚠️ 审核方第十七轮打中过这里：返回的 pinned 曾经是**尝试数**（自增无条件执行），
+    //    于是 {pinned:1, fail:1} 也会被判成功。现在 pinned 只统计**成功**，fail 单独计。
+    const as=document.getAnimations();
+    let pinned=0, fail=0;
+    for(const a of as){ try{ a.currentTime=${ms}; a.pause(); pinned++ }catch(e){ fail++ } }
+    // ③ **必须是插件自己的动画**：宿主动画（页面过渡、宿主 SVG 指示器…）不能拿来充数。
+    //    判据：动画的 effect.target 命中插件元素（类名含 bga）。实测动效层的粒子都有 bga-* 类。
+    const isPlugin=(a)=>{ try{ const t=a.effect&&a.effect.target;
+      return !!(t&&t.classList&&[...t.classList].some(c=>String(c).indexOf('bga')===0)) }catch(e){ return false } };
+    const pluginAnimations=as.filter(isPlugin);
+    // 已暂停 = playbackRate 为 0 **或** playState 是 paused（pause() 之后测量时机不同）
+    const pluginPaused=pluginAnimations.filter((a)=>{ try{
+      return a.playState==='paused' || a.playbackRate===0 }catch(e){ return false } }).length;
+    // ④ 强制一次样式/布局提交 + 两帧 rAF，让暂停后的画面**真的**被光栅化
     void document.body.offsetHeight;
     return new Promise((res)=>requestAnimationFrame(()=>requestAnimationFrame(()=>{
-      res(JSON.stringify({total:as.length, pinned:n, fail}))})));
+      res(JSON.stringify({total:as.length, pinned, fail,
+        pluginTotal:pluginAnimations.length, pluginPaused}))})));
   })()`).catch(() => null)
   if (log) console.log('     动效相位: 固定在 t=' + ms + 'ms  ' + r)
   if (!r) return false
   const j = JSON.parse(r)
-  return j.total > 0 && j.pinned > 0
+  // 判失败的条件（任一命中即 false，调用方据此判该状态不可信）：
+  //   · 一个动画都没拿到 ⇒ 动效层没挂载；
+  //   · 有任何 try 失败（fail > 0）⇒ **部分失败也不能算成功**；
+  //   · **插件自己的**动画一个都没拿到 ⇒ 拿宿主动画充数不算；
+  //   · 插件动画没全部处于暂停态 ⇒ 相位没真钉住。
+  if (j.total === 0 || j.pinned === 0 || j.fail > 0) return false
+  if (!(j.pluginTotal > 0)) { if (log) console.log('     ✗ 没有一个是插件自己的动画（宿主动画不算）'); return false }
+  if (j.pluginPaused !== j.pluginTotal) {
+    if (log) console.log('     ✗ 插件动画未全部暂停：' + j.pluginPaused + '/' + j.pluginTotal)
+    return false
+  }
+  return true
 }
 
 /**

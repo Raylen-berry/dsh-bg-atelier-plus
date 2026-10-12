@@ -255,10 +255,13 @@ function makeServer(cfg) {
         // 动效状态（02-fx-nodes）新增两条表达式，桩必须给**有意义**的答复：
         //  ① pinAnimations（含 getAnimations）：不回报"钉住了动画"的话，该状态判
         //     "动效层没挂载"而拒绝参与比较 ⇒ 全场景 exit=4（实测：本套件 10 通过 / 10 失败）。
+        //     ⚠️ 第十七轮起判据收紧（审核方 P2）：pinned 只算成功、fail>0 即失败、
+        //     且**必须是插件自己的动画**（pluginTotal>0）并全部暂停（pluginPaused===pluginTotal）。
+        //     桩缺这两个字段 ⇒ 又会整片 exit=4（踩过一次，就是这次）。
         //  ② openRealClick 的目标坐标（真实鼠标点击用）。
         //  ③ requireSelector 的验证（!!document.querySelector(".bga-dockfx")）。
         if (/getAnimations/.test(e)) {
-          return val(JSON.stringify({ total: 3, pinned: 3, fail: 0 }))
+          return val(JSON.stringify({ total: 3, pinned: 3, fail: 0, pluginTotal: 3, pluginPaused: 3 }))
         }
         if (/sessionRow/.test(e)) {
           return val(JSON.stringify({ x: 120, y: 260, t: '会话' }))
@@ -284,10 +287,22 @@ function makeServer(cfg) {
 
 function runScript(mode, dir, port) {
   return new Promise((resolve) => {
+    // ★ **给子进程一个自己的 DSH_HOME**（套件自己的临时目录）—— 否则它用环境里的真实 DSH_HOME，
+    //   而字节级边界会核对那棵**生产数据树**：跑一次要几分钟，期间任何无关写入（应用自身存设置、
+    //   派生缓存、别的实例）都会让它报 `❌ 用户数据被改动了` ⇒ exit 6。
+    //   实测症状：同一套件多轮结果不一（20/0、19/1、18/2），失败断言在 S1/S6/S7 之间跳，
+    //   伴随的正是这条"用户数据被改动"。**根因是套件不封闭**，不是被测代码 —— 修成自封闭。
+    const sandboxHome = path.join(OUT_ROOT, '.entry-sandbox-home')
+    fs.mkdirSync(sandboxHome, { recursive: true })
     const child = spawn(process.execPath, [SCRIPT, mode, dir], {
       // 跳过标记图状态：它要读底图清单、换图、再确认渲染，假服务器抄不全就会假失败。
       // 入口套件验的是**入口控制流与退出码**；标记图的真实交互由真机 + 几何离线套件覆盖。
-      env: { ...process.env, VB_CDP_PORT: String(port), VB_SKIP_STATES: '04-preview-framing,05-theme-light-veil,06-theme-dark-veil,07-surface-veil,08-surface-solid' },
+      env: {
+        ...process.env,
+        DSH_HOME: sandboxHome,
+        VB_CDP_PORT: String(port),
+        VB_SKIP_STATES: '04-preview-framing,05-theme-light-veil,06-theme-dark-veil,07-surface-veil,08-surface-solid',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let out = ''

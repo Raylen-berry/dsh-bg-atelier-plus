@@ -184,38 +184,43 @@ resolve 时才 abort"这条真实竞态。补上两条后，同一变异使套�
 
 ## 六、仍未解决的（**不以连过抵消**）
 
-### 0. **本轮新增的三项待修**（P1/P1/P2；均已由审核方的反例脚本独立复现，**未修**）
+### 0. **本轮三项缺陷：已修**（P1/P1/P2；均已由审核方的反例脚本独立复现后用真实函数坏例钉住）
+
+> 修法见约定 §零之五之六；回归套件 `tools/verify-iso-hardening.mjs`（**19 项，已进 CI**）。
+> 另抓到并修掉**第四个**（同一家族）：入口套件不封闭 ⇒ 偶发 exit 6，见本节 0.4。
 
 > 反例脚本：`node D:\ChatGPT\review-r17-counterexamples.mjs` —— 我复跑得到 **4/4 复现**
 > （`pipeline-exception-reports-success` / `external-gallery-passes-isolation-gate` /
 > `sibling-directory-passes-containment` / `animation-freeze-failure-is-accepted`）。
 > 三条都属于既有的"**前提失败不出绿**"要求，**不需要扩大验收范围**。
 
-**0.1 [P1] 验收中止仍退出成功**（`tools/iso-instance.mjs` 的 `run()` catch 分支，L614 一带）
-- 现象：底图准备抛错后，总控打印"中止"，最终仍报 `8 通过 / 0 失败`、**exit=0**，而真正的验收步骤
-  一步都没跑。
-- 根因：`catch` 只 `console.error('中止')`，**没有把失败写进结果**；末尾的退出码只看
-  `results.filter(r => !r.ok).length` ⇒ 异常本身不计入失败；**未执行的必测项也没有列为"未测"**。
-- 要改成：异常计入失败；按 `--steps` 声明的必测项，未执行的**逐项列为未测**；有未测或异常 ⇒ 非零退出。
+**0.1 [P1] 验收中止仍退出成功** —— **已修**
+- 现象（审核方反例 `pipeline-exception-reports-success`）：底图准备抛错后打印"中止"，
+  最终仍报 `8 通过 / 0 失败`、**exit=0**，而真正的验收步骤一步都没跑。
+- 根因：`catch` 只打印"中止"、**没把失败写进 `results`**；退出码只看 `results`；未执行的必测项没列"未测"。
+- 修法：异常计入失败（`abortReason`）；**步骤声明提前到任何 try 之前**；汇总**三态分开**；有异常或未测即非零退出。
+- 证据：真调 CLI 的坏例 ⇒ **exit 1**、汇总 `3 通过 / 1 失败 / 4 未测`（`verify-iso-hardening.mjs` ②）。
 
-**0.2 [P1] 隔离门槛弱于简报所述**
-- 现象 A（`external-gallery-passes-isolation-gate`）：插件图库指向外部目录（`C:\production-gallery`）
-  仍能通过隔离证明。
-- 现象 B（`sibling-directory-passes-containment`）：根 `…\poc5`，而 `…\poc5-other\settings`
-  被判定"在根内"。
-- 根因：`run()` 里只核了**图库目录**（`writableDir`）、**没核设置目录**（`verify` 子命令那份核了两个
-  ⇒ 两处口径不一致）；且判定是**字符串前缀** `path.resolve(p).startsWith(ROOT)` ⇒ 相邻目录
-  （`poc5-other`）会通过；**没有解析 junction/符号链接**（真实环境里图库本身就是 Junction）。
-- 要改成：**同时核对两个实际目录**；`realpath` 解析链接后判定；用**路径段**比较（或
-  `path.relative` 不以 `..` 开头）而不是裸前缀；落点必须位于隔离树内，否则拒绝继续。
+**0.2 [P1] 隔离门槛弱于简报所述** —— **已修**
+- 现象 A（`external-gallery-passes-isolation-gate`）：外部图库（`C:\production-gallery`）仍通过；
+  现象 B（`sibling-directory-passes-containment`）：`…\poc5-other\settings` 被判"在根内"。
+- 根因：`run()` 只核图库目录（`verify` 那份核两个 ⇒ 口径不一致）；判定是**字符串前缀**；
+  没有解析链接（真实环境里图库本身就是 Junction）。
+- 修法：共用 `insideTree()`/`isolationFacts()`：**realpath 解析链接** + **路径段**判定；
+  **两个实际目录**都核 + 设置文件落在树内 + 图库不得是生产图库；三处调用点统一。
+- 证据：相邻目录 / 链接指树外 / 外部图库 ⇒ 全判 false；生产图库被标记（同套件 ①）。
 
-**0.3 [P2] 固定相位失败被计为成功**（`tools/visual-baseline.mjs` 的 `pinAnimations`，L842 一带）
-- 现象（`animation-freeze-failure-is-accepted`）：诊断值为 `pinned=1, fail=1`，函数仍返回成功。
-- 根因：`for(...){ try{...}catch(e){fail++} n++ }` —— `n`（返回为 `pinned`）统计的是**尝试数**，
-  不是**成功数**；判定 `total > 0 && pinned > 0` 因此对"部分失败"也放行；且**没有确认被钉住的动画
-  属于插件自己**（宿主动画可以充数）。
-- 要改成：`pinned` 只统计**成功**；`fail > 0` 即判失败；额外要求插件自身的动画（`.bga-*` 元素上的
-  `getAnimations()`）确实存在且已暂停 —— 宿主动画不算。
+**0.3 [P2] 固定相位失败被计为成功** —— **已修**
+- 现象（`animation-freeze-failure-is-accepted`）：诊断值 `pinned=1, fail=1` 仍返回成功。
+- 根因：`pinned` 统计的是**尝试数**；判定只看 `total>0 && pinned>0`；没确认动画属于插件。
+- 修法：`pinned` 只计**成功**；`fail>0` 即失败；要求**插件自身**动画存在且**全部暂停**。
+- 证据：5 个坏例全判失败 + 1 个正常例判成功（同套件 ③）。
+
+**0.4 [同家族，本轮抓到的第四个] 入口套件不封闭 ⇒ 偶发 exit 6** —— **已修**
+- 现象：`verify-oracle-entry.mjs` 多轮结果不一（`20/0`、`19/1`、`18/2`），失败断言在 S1/S6/S7 之间跳。
+- 根因（有证据）：伴随报错 `❌ **用户数据被改动了**` —— 子进程用**环境里的真实 `DSH_HOME`**，
+  字节级边界核对的是**生产数据树**；一次跑几分钟，期间任何无关写入都会让边界判失败 ⇒ exit 6。
+- 修法：给子进程**自己的临时 `DSH_HOME`**（`baselines/.entry-sandbox-home`）。修后连跑两轮 **20/0**。
 
 ### 1. 偶发失败（第 3 次，未复现）
 

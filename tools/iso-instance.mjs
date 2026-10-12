@@ -18,7 +18,7 @@
 // 起来之后，验收脚本要**显式绑定**到这个实例（这几个环境变量就是绑定）：
 //   DSH_HOME=<root>/home  VB_GUI_HOST=127.0.0.1:<port>  VB_CDP_PORT=<cdp>
 //   VB_VIEWPORT=1426x807@1.1666666269302368  VB_SKIP_ONBOARDING=1  VB_PLUGIN_DIR=<root>/plugin/dsh-bg-atelier-official
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, copyFileSync, readdirSync, openSync, closeSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, copyFileSync, readdirSync, openSync, closeSync, realpathSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import path from 'node:path'
@@ -43,6 +43,51 @@ const PROD_HOME = process.env.DSH_HOME || path.join(process.env.USERPROFILE || '
 const INSTANCE_JSON = path.join(ROOT, 'instance.json')
 
 const sha = (f) => createHash('sha256').update(readFileSync(f)).digest('hex')
+// 本次声明的步骤 / 已跑的步骤 / 中止原因 —— 供「未测」与「异常计入失败」使用（审核方第十七轮 P1）。
+const planned = []
+const ranSteps = new Set()
+let abortReason = null
+
+/**
+ * 路径是否**确实位于**隔离树内。
+ *
+ * ⚠️ 审核方第十七轮用两个反例打掉了原来的写法（`path.resolve(p).startsWith(path.resolve(ROOT))`）：
+ *    · `…\poc5-other\settings` 会被判成"在 `…\poc5` 内"（**裸前缀**比较的经典错法）；
+ *    · 没有解析链接 —— 真实环境里 `dsh-bg-atelier/wallpapers` 本身就是 **Junction**，
+ *      前缀比的是链接路径、不是真实落点。
+ * 现在：先 `realpath`（解析链接与 `..`），再用**路径段**判定（`path.relative` 不以 `..` 开头）。
+ * 路径不存在 / 解析失败 ⇒ **判 false**（证明不了就不算成立；宁可拒绝继续）。
+ */
+function insideTree(p, root) {
+  if (typeof p !== 'string' || !p.trim()) return false
+  let real
+  try { real = realpathSync(p) } catch { return false }
+  const rel = path.relative(path.resolve(root), path.resolve(real))
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+}
+
+/**
+ * 隔离事实：审核方要求**同时核对两个实际目录**（图库目录与设置目录），并证明落点位于隔离树内。
+ * · 图库：插件自报 `dir` / `writableDir` 两个值都要在树内；
+ * · 设置：**不能**只信"我把 DSH_HOME 指过去了"——插件有"回退到原插件目录"的分支，
+ *   所以从树里**实际存在的设置文件**反证（存在 + 在树内）；再配合"生产设置哈希未变"。
+ */
+function isolationFacts(roots) {
+  const settingsCandidates = [
+    path.join(ROOT, 'home', 'dsh-bg-atelier', 'settings.json'),
+    path.join(ROOT, 'home', 'dsh-bg-atelier-plus', 'settings.json'),
+  ]
+  const found = settingsCandidates.filter((f) => { try { return existsSync(f) && insideTree(f, ROOT) } catch { return false } })
+  const prodGallery = path.join(PROD_HOME, 'dsh-bg-atelier', 'wallpapers')
+  const same = (a, b) => { try { return !!a && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() } catch { return false } }
+  return {
+    galleryDir: !!(roots && insideTree(roots.dir, ROOT)),
+    galleryWritableDir: !!(roots && insideTree(roots.writableDir, ROOT)),
+    galleryIsProd: !!(roots && (same(roots.dir, prodGallery) || same(roots.writableDir, prodGallery))),
+    settingsFileInTree: found.length > 0,
+    settingsFiles: found.map((f) => path.relative(ROOT, f)).join(', ') || '(树内没有设置文件)',
+  }
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const alive = (pid) => { try { process.kill(pid, 0); return true } catch { return false } }
 const listening = async (port) => {
@@ -270,11 +315,14 @@ async function up() {
   let roots = null
   try { roots = await (await fetch('http://127.0.0.1:' + PORT + '/bga/wallpapers.json')).json() } catch { /* noop */ }
 
-  // ★ 隔离证明：插件的数据落点必须在隔离根下；生产设置在起停前后哈希不变
+  // ★ 隔离证明：**两个数据目录**（图库 + 设置）都必须确实位于隔离树内
+  //   （`isolationFacts`：realpath 解析链接 + **路径段**判定，不是裸前缀）；生产设置哈希不变。
   const proof = []
-  const inRoot = (p) => typeof p === 'string' && path.resolve(p).toLowerCase().startsWith(path.resolve(ROOT).toLowerCase())
-  proof.push(['插件 writableDir 在隔离根下', roots ? inRoot(roots.writableDir) : false, roots && roots.writableDir])
-  proof.push(['插件图库 dir 在隔离根下', roots ? inRoot(roots.dir) : false, roots && roots.dir])
+  const fx = isolationFacts(roots)
+  proof.push(['图库 dir 在隔离树内', fx.galleryDir, roots && roots.dir])
+  proof.push(['图库 writableDir 在隔离树内', fx.galleryWritableDir, roots && roots.writableDir])
+  proof.push(['图库不是生产图库', !fx.galleryIsProd, fx.galleryIsProd ? '与生产图库同路径！' : 'ok'])
+  proof.push(['设置文件确实落在隔离树内', fx.settingsFileInTree, fx.settingsFiles])
   proof.push(['图库只看到测试分类', !!roots && roots.categories.every((c) => c.name === '测试图'), roots && roots.categories.map((c) => c.name).join(',')])
   proof.push(['新接口状态头可用（未重启的生产上还看不到）', head !== null, 'x-bga-settings-status=' + head])
   const prodAfter = existsSync(prodSettings) ? sha(prodSettings) : '(无)'
@@ -404,11 +452,13 @@ async function verify() {
   try { roots = wr ? await wr.json() : null } catch { roots = null }
   const prodSettings = path.join(PROD_HOME, 'dsh-bg-atelier-plus', 'settings.json')
   const prodHash = existsSync(prodSettings) ? sha(prodSettings) : '(无)'
-  const inRoot = (p) => typeof p === 'string' && path.resolve(p).toLowerCase().startsWith(path.resolve(ROOT).toLowerCase())
+  const fx = isolationFacts(roots)
   const proof = [
     ['插件接口活着（/bga/wallpapers.json 有响应）', !!roots, roots ? 'total=' + roots.total : '无响应'],
-    ['插件 writableDir 在隔离根下', !!roots && inRoot(roots.writableDir), roots && roots.writableDir],
-    ['插件图库 dir 在隔离根下', !!roots && inRoot(roots.dir), roots && roots.dir],
+    ['图库 writableDir 在隔离树内', fx.galleryWritableDir, roots && roots.writableDir],
+    ['图库 dir 在隔离树内', fx.galleryDir, roots && roots.dir],
+    ['图库不是生产图库', !fx.galleryIsProd, fx.galleryIsProd ? '与生产图库同路径！' : 'ok'],
+    ['设置文件确实落在隔离树内', fx.settingsFileInTree, fx.settingsFiles],
     ['图库只看到测试分类', !!roots && roots.categories.every((c) => c.name === '测试图' || c.name === '_验收标记图'),
       roots && roots.categories.map((c) => c.name).join(',')],
     ['新接口状态头可用', head !== null, 'x-bga-settings-status=' + head],
@@ -476,6 +526,22 @@ async function run() {
   const prodClientHash0 = sha(path.join(PROD_PLUGIN, 'client.js'))
   let host = null, browser = null
 
+  // ★ **先声明本次要跑的步骤**（在任何 try 之前）—— 这样"准备阶段就抛错"这类**早期中止**，
+  //   那些必测项也会被逐条列为**未测**（审核方第十七轮 P1：中止了却报 8 通过 / 0 失败 / exit 0）。
+  //   声明只依赖 want/repeat/baseline，不需要宿主或浏览器，所以能提前。
+  const baseDir = path.join(REPO, 'baselines', baseline)
+  const needCapture = want.has('capture') || (want.has('compare') && !existsSync(path.join(baseDir, 'manifest.json')))
+  ranSteps.clear(); abortReason = null
+  planned.length = 0
+  if (needCapture) planned.push('装标记图（隔离库）')
+  if (want.has('selftest')) planned.push('selftest')
+  if (needCapture) planned.push('capture ' + baseline)
+  if (want.has('compare')) {
+    for (let i = 1; i <= repeat; i++) planned.push('compare ' + baseline + (repeat > 1 ? ' #' + i + '/' + repeat : ''))
+  }
+  if (want.has('mutate')) planned.push('A 级变异')
+  if (want.has('audit')) planned.push('覆盖审计')
+
   try {
     console.log('=== 隔离验收（一条命令跑完）：' + NAME + ' @' + PORT + ' ===')
     // ① 准备（幂等：已有副本就不重建）
@@ -505,8 +571,12 @@ async function run() {
     const wpRes = await fetchJson('http://127.0.0.1:' + PORT + '/bga/wallpapers.json')
     let head = null
     try { head = (await fetch('http://127.0.0.1:' + PORT + '/bga/settings.json', { signal: AbortSignal.timeout(8000) })).headers.get('x-bga-settings-status') } catch { /* noop */ }
-    const inRoot = (p) => typeof p === 'string' && path.resolve(p).toLowerCase().startsWith(path.resolve(ROOT).toLowerCase())
-    note('插件数据落点在隔离根下', !!wpRes && inRoot(wpRes.writableDir), wpRes && wpRes.writableDir)
+    // ★ 隔离证明：**两个数据目录**都要在隔离树内（realpath + 路径段判定，不是裸前缀）
+    const fxx = isolationFacts(wpRes)
+    note('图库 writableDir 在隔离树内', fxx.galleryWritableDir, wpRes && wpRes.writableDir)
+    note('图库 dir 在隔离树内', fxx.galleryDir, wpRes && wpRes.dir)
+    note('图库不是生产图库', !fxx.galleryIsProd, fxx.galleryIsProd ? '与生产图库同路径！' : 'ok')
+    note('设置文件确实落在隔离树内', fxx.settingsFileInTree, fxx.settingsFiles)
     note('图库只看到测试分类', !!wpRes && wpRes.categories.every((c) => c.name === '测试图' || c.name === '_验收标记图'),
       wpRes && wpRes.categories.map((c) => c.name).join(','))
     note('新接口状态头可用', head !== null, 'x-bga-settings-status=' + head)
@@ -597,9 +667,8 @@ async function run() {
       note('诊断脚本 ' + path.basename(extra), rr.status === 0, 'exit ' + rr.status)
     }
 
-    const baseDir = path.join(REPO, 'baselines', baseline)
-    // 04 状态要用「标记图」；装进**隔离图库**（脚本用的是隔离 DSH_HOME，不碰用户图库）
-    const needCapture = want.has('capture') || (want.has('compare') && !existsSync(path.join(baseDir, 'manifest.json')))
+    // （步骤声明与 baseDir/needCapture 已在 try 之前算好 —— 早期中止也要能把必测项列为"未测"。）
+
     if (needCapture) await runStep('装标记图（隔离库）', [path.join(HERE, 'make-marker-wallpaper.mjs')], env, note)
     if (want.has('selftest')) await runStep('selftest', [path.join(HERE, 'visual-baseline.mjs'), 'selftest'], env, note)
     if (needCapture) await runStep('capture ' + baseline, [path.join(HERE, 'visual-baseline.mjs'), 'capture', baseline], env, note)
@@ -612,7 +681,9 @@ async function run() {
     if (want.has('mutate')) await runStep('A 级变异', [path.join(HERE, 'mutate-real-style.mjs'), baseline], env, note)
     if (want.has('audit')) await runStep('覆盖审计', [path.join(HERE, 'audit-oracle-coverage.mjs'), baseline], env, note)
   } catch (e) {
+    // ★ 异常**必须计入失败**（不是只打印一行"中止"）：审核方反例证明原来会 exit=0。
     console.error('  ✗ 中止：' + String(e && e.message || e))
+    abortReason = String(e && e.message || e)
   } finally {
     // ⑧ 收尾：杀掉**自己起的**子进程（含树），再复核生产未被碰
     console.log('  [收尾] 结束隔离宿主与浏览器')
@@ -626,9 +697,20 @@ async function run() {
     note('隔离宿主端口已关闭', !(await listening(PORT)), '端口 ' + PORT)
   }
 
-  const bad = results.filter((r) => !r.ok).length
-  console.log('\n隔离验收汇总：' + (results.length - bad) + ' 通过 / ' + bad + ' 失败')
-  process.exit(bad ? 1 : 0)
+  // ★ 三者**分别记录**（约定 §零 的硬要求）：通过 / 失败（含异常）/ 未测。
+  //   未测 = 已在 `planned` 里声明、但 `ranSteps` 里没有 ⇒ 必测项没跑到就是**阻塞**，不是通过。
+  const untested = planned.filter((p) => !ranSteps.has(p))
+  for (const p of untested) {
+    results.push({ n: p, ok: false, untested: true })
+    console.log('  ⬜ ' + p + '  —— **未测**（本次没跑到）')
+  }
+  const failed = results.filter((r) => !r.ok && !r.untested).length + (abortReason ? 1 : 0)
+  const passed = results.filter((r) => r.ok).length
+  console.log('\n隔离验收汇总：' + passed + ' 通过 / ' + failed + ' 失败 / ' + untested.length + ' 未测'
+    + (abortReason ? '（**中止**：' + abortReason.slice(0, 80) + '）' : ''))
+  if (abortReason) console.error('  ✗ 本次验收**被异常中止** ⇒ 一律非零退出（不允许"中止仍成功"）')
+  if (untested.length) console.error('  ✗ 有必测项**未执行** ⇒ 未测按阻塞处理（不算通过）')
+  process.exit(passed > 0 && failed === 0 && untested.length === 0 ? 0 : 1)
 }
 
 /** 取 JSON（带超时，避免没有 AbortSignal 时挂死）。 */
@@ -734,6 +816,7 @@ async function runStep(label, argv, env, note) {
   })
   const verdict = (r.out.match(/自检：.*|视觉回归：.*|A 级坏例：.*|覆盖审计：.*/) || [''])[0].trim()
   const fails = (r.out.match(/❌[^\n]*/g) || []).slice(0, 3).map((s) => s.trim().slice(0, 110))
+  ranSteps.add(label)
   note(label + ' ⇒ exit ' + r.code, r.code === 0, verdict)
   for (const f of fails) console.log('        ' + f)
   // 失败时把**输出尾部**打出来 —— 有些失败走的是 ✗/拒绝 路径、不带 ❌，只看 ❌ 会两眼一抹黑。
