@@ -163,12 +163,77 @@ async function waitPort(port, ms) {
 
 /** 只杀本脚本记录过的 PID（**绝不用命令行模式匹配** —— 我自己工具调用的 runner 命令行里
  *  也含我写的脚本文本，实测误伤过一次）。 */
-function killRecorded(pid, why) {
+function killRecorded(pid, why, expectedStartedAt) {
   if (!pid || !alive(pid)) return false
+  // ★ 防 **PID 复用**：PID 会被系统回收给新进程。记录里有创建时间就必须对上，
+  //   对不上 ⇒ **不杀**，只报告（宁可留残留，也不能杀错）。
+  if (expectedStartedAt) {
+    const now = procStartedAt(pid)
+    if (!now || !sameMoment(now, expectedStartedAt)) {
+      console.log('    ⚠️ PID ' + pid + ' 的创建时间与记录不符（记录 ' + expectedStartedAt + '，实际 ' + (now || '拿不到') + '）'
+        + ' ⇒ **不结束**，按残留报告（可能是 PID 复用）')
+      return false
+    }
+  }
   try { process.kill(pid, 'SIGKILL'); console.log('    已结束 PID ' + pid + '（' + why + '）'); return true } catch (e) {
     console.error('    ✗ 结束 PID ' + pid + ' 失败：' + String(e && e.message)); return false
   }
 }
+
+/** 两个 ISO 时间是否同一时刻（容差 2 秒：不同接口取到的精度略有出入）。 */
+function sameMoment(a, b) {
+  const ta = Date.parse(a), tb = Date.parse(b)
+  if (!Number.isFinite(ta) || !Number.isFinite(tb)) return false
+  return Math.abs(ta - tb) <= 2000
+}
+
+/** 取进程的创建时间（ISO 字符串）；拿不到返回 null。 */
+function procStartedAt(pid) {
+  try {
+    const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+      '(Get-CimInstance Win32_Process -Filter "ProcessId=' + pid + '").CreationDate.ToString("o")'],
+      { encoding: 'utf8', timeout: 15000 })
+    const s = String(r.stdout || '').trim()
+    return s || null
+  } catch { return null }
+}
+
+/**
+ * **归属判定**（纯函数，可离线用真实函数测）：监听某端口的进程到底是不是**本实例**的。
+ *
+ * 为什么不能只看端口 + 命令行子串：审核方的反例 `review-process-cleanup.mjs` ——
+ * 另一个项目目录下的浏览器 `--user-data-dir="D:\another-project\browser-profile" --remote-debugging-port=19512`
+ * 会被原来的 `markers.includes('browser-profile')` 判成"poc5 的浏览器"并结束掉。
+ *
+ * 判据（全部要过才算本实例的）：
+ *   · 宿主：命令行含 `--port <PORT>` **且** 它的 `/bga/wallpapers.json` 自报的 `dir`/`writableDir`
+ *     都在**本隔离根内**（活体探针，比命令行文本可靠）；
+ *   · 浏览器：命令行里的 `--user-data-dir` **完整绝对路径**必须等于本实例的 profile 目录；
+ *   · 其余情况一律 `ours:false` —— 调用方**保留进程**并报告残留。
+ */
+function processOwnership(kind, info, root) {
+  const cmd = String(info && info.cmdline || '')
+  if (kind === 'browser') {
+    const prof = path.join(path.resolve(root), 'browser-profile')
+    const m = cmd.match(/--user-data-dir=(?:"([^"]+)"|(\S+))/)
+    const got = m ? (m[1] || m[2]) : ''
+    if (!got) return { ours: false, why: '命令行没有 --user-data-dir ⇒ 无法证明归属' }
+    if (path.resolve(got).toLowerCase() !== prof.toLowerCase()) {
+      return { ours: false, why: 'profile 不是本实例的（实际 ' + got + '，本实例 ' + prof + '）' }
+    }
+    return { ours: true, why: '--user-data-dir 完整路径与本实例 profile 一致' }
+  }
+  if (kind === 'host') {
+    const p = String(info.port)
+    if (!cmd.includes('--port ' + p) && !cmd.includes('--port=' + p)) return { ours: false, why: '命令行不含 --port ' + p }
+    const d = info.galleryDir, w = info.galleryWritableDir
+    if (!d || !w) return { ours: false, why: '活体探针拿不到插件的图库落点 ⇒ 无法证明归属' }
+    if (!insideTree(d, root) || !insideTree(w, root)) return { ours: false, why: '插件图库落点不在本隔离根内（' + d + '）' }
+    return { ours: true, why: '端口匹配 + 插件落点在本隔离根内（活体探针）' }
+  }
+  return { ours: false, why: '未知类型 ' + kind }
+}
+
 
 function buildPluginCopy() {
   const dst = path.join(ROOT, 'plugin', 'dsh-bg-atelier-official')
@@ -403,7 +468,7 @@ async function up() {
     process.exit(1)
   }
 
-  const inst = { name: NAME, root: ROOT, port: PORT, cdpPort: CDP, pid, home: path.join(ROOT, 'home'), plugin, authUrl, startedAt: new Date().toISOString() }
+  const inst = { name: NAME, root: ROOT, port: PORT, cdpPort: CDP, pid, hostStartedAt: procStartedAt(pid), home: path.join(ROOT, 'home'), plugin, authUrl, startedAt: new Date().toISOString() }
   let browserPid = null
   if (WITH_BROWSER) {
     const bprof = path.join(ROOT, 'browser-profile')
@@ -423,6 +488,7 @@ async function up() {
     if (!okCdp) { killRecorded(browserPid, 'CDP 起不来'); killRecorded(pid, '连带'); process.exit(1) }
   }
   inst.browserPid = browserPid
+    inst.browserStartedAt = procStartedAt(browserPid)
   writeFileSync(INSTANCE_JSON, JSON.stringify(inst, null, 2), 'utf8')
   console.log('\n  实例已就绪：' + INSTANCE_JSON)
   console.log('  绑定用环境变量（验收脚本必须显式带上）：')
@@ -435,36 +501,66 @@ async function up() {
 
 function down() {
   console.log('=== 停隔离实例：' + NAME + ' ===')
+  const residues = []
   if (!existsSync(INSTANCE_JSON)) { console.log('  没有 instance.json ⇒ 无事可做') } else {
     const inst = JSON.parse(readFileSync(INSTANCE_JSON, 'utf8'))
-    killRecorded(inst.browserPid, '隔离浏览器')
-    killRecorded(inst.pid, '隔离宿主')
+    // 记录里的 PID 也要**先证明身份再杀**（防 PID 复用）：创建时间对上才动手。
+    killRecorded(inst.browserPid, '隔离浏览器', inst.browserStartedAt)
+    killRecorded(inst.pid, '隔离宿主', inst.hostStartedAt)
     rmSync(path.join(ROOT, 'instance.pid'), { force: true })
   }
-  // ★ 兜底清扫：`instance.json` 只会记**最后一次**起的进程，先前几次 up/run 的宿主可能还活着
-  //   （实测踩到：残留宿主锁住 `_run.out`，下一次 run 报 EPERM）。按**端口所有者**找，
-  //   并核对命令行里的**端口参数**（宿主的 `--port <PORT>` / 浏览器的 `--remote-debugging-port=<CDP>`）
-  //   —— 生产宿主写死 19387、不会有这些参数，所以绝不会被误杀。
-  sweepByPort(PORT, '隔离宿主（端口 ' + PORT + '）', ['--port ' + PORT, '--port=' + PORT])
-  sweepByPort(CDP, '隔离浏览器（CDP ' + CDP + '）', ['--remote-debugging-port=' + CDP, 'browser-profile'])
+  // ★ 兜底清扫：`instance.json` 只记**最后一次**起的进程，先前几次的宿主可能还活着
+  //   （实测踩到：残留宿主锁住 `_run.out`，下一次 run 报 EPERM）。
+  //   ⚠️ **证明不了归属就不杀**（审核方反例 review-process-cleanup.mjs：别的项目目录下的浏览器
+  //   占着 19512、命令行里也有 browser-profile 字样，会被原来的子串判据误杀）。
+  sweepByPort('host', PORT, residues, processOwnership)
+  sweepByPort('browser', CDP, residues, processOwnership)
+  if (residues.length) {
+    console.log('  ⚠️ 有 ' + residues.length + ' 个监听进程**无法证明属于本实例** ⇒ **保留不动**，按残留报告：')
+    for (const r of residues) console.log('     · PID ' + r.pid + '（端口 ' + r.port + '）：' + r.why)
+    console.log('     （要人工确认后再处理；本脚本不替你猜。）')
+  }
   console.log('  完成。生产宿主与生产数据从未被本脚本触碰。')
 }
 
-/** 杀掉"监听某端口、且命令行含指定标记"的进程；核不到就不动（宁可不杀，也不误杀生产）。 */
-function sweepByPort(port, label, markers) {
+/**
+ * 按端口找监听者，**用 `processOwnership` 证明归属后才结束**；证明不了就记进 `residues` 并保留。
+ * 宿主用活体探针（该端口上插件的图库落点是否在本隔离根内），浏览器比对 profile 完整路径。
+ */
+function sweepByPort(kind, port, residues, judge) {
+  let pid = null, cmd = ''
   try {
     const ps = 'Get-NetTCPConnection -LocalPort ' + port + ' -State Listen -ErrorAction SilentlyContinue | ' +
       'Select-Object -First 1 -ExpandProperty OwningProcess'
     const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 20000 })
-    const pid = Number(String(r.stdout || '').trim())
+    pid = Number(String(r.stdout || '').trim())
     if (!pid) return
     const q = 'Get-CimInstance Win32_Process -Filter "ProcessId=' + pid + '" | Select-Object -ExpandProperty CommandLine'
     const r2 = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', q], { encoding: 'utf8', timeout: 20000 })
-    const cmd = String(r2.stdout || '')
-    const hit = markers.some((m) => cmd.includes(m))
-    if (!hit) { console.log('    (端口 ' + port + ' 的 PID ' + pid + ' 命令行不含 ' + markers[0] + ' ⇒ 不动它)'); return }
-    killRecorded(pid, label)
-  } catch { /* 拿不到就不扫 */ }
+    cmd = String(r2.stdout || '')
+  } catch { return }
+
+  const info = { cmdline: cmd, port }
+  if (kind === 'host') {
+    // 活体探针（**同步**，用 PowerShell 的 Invoke-RestMethod）：这个端口上的插件自报的图库落点，
+    // 是不是**本隔离根内**的。写成同步是因为审核方的复核脚本会把这个函数切进 vm 里跑，
+    // 顶层 `await` 在那里非法（实测报 "await is only valid in async functions"）。
+    try {
+      const ps = '(Invoke-RestMethod -TimeoutSec 5 -Uri "http://127.0.0.1:' + port + '/bga/wallpapers.json") | ConvertTo-Json -Depth 4 -Compress'
+      const r3 = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 20000 })
+      const j = JSON.parse(String(r3.stdout || '').trim() || '{}')
+      if (j && j.dir) { info.galleryDir = j.dir; info.galleryWritableDir = j.writableDir }
+    } catch { /* 探不到就不算证据 */ }
+  }
+  // ⚠️ 判据**显式传入**（不在这里按名字引用模块级函数）：这样本函数可以被单独切出来执行
+  //   （审核方的复核脚本就是这么做的）。判据缺失或隔离根拿不到 ⇒ 一律**无法证明归属** ⇒ **不杀**。
+  const decide = typeof judge === 'function' ? judge : null
+  const root = (typeof ROOT === 'string' && ROOT) ? ROOT : ''
+  const verdict = (decide && root)
+    ? decide(kind, info, root)
+    : { ours: false, why: !decide ? '没有归属判定函数 ⇒ 无法证明归属' : '拿不到隔离根 ⇒ 无法证明归属' }
+  if (!verdict.ours) { residues.push({ pid, port, why: verdict.why }); return }
+  killRecorded(pid, (kind === 'host' ? '隔离宿主' : '隔离浏览器') + '（端口 ' + port + '）', procStartedAt(pid))
 }
 
 async function status() {
@@ -588,7 +684,7 @@ async function verify() {
     if (!okCdp) bad++
   }
   if (bad) process.exit(1)
-  const inst = { name: NAME, root: ROOT, port: PORT, cdpPort: CDP, pid: hostPid, browserPid, home: path.join(ROOT, 'home'), plugin: path.join(ROOT, 'plugin', 'dsh-bg-atelier-official'), authUrl, startedAt: new Date().toISOString(), prodSettingsHashAtVerify: prodHash }
+  const inst = { name: NAME, root: ROOT, port: PORT, cdpPort: CDP, pid: hostPid, hostStartedAt: procStartedAt(hostPid), browserPid, browserStartedAt: procStartedAt(browserPid), home: path.join(ROOT, 'home'), plugin: path.join(ROOT, 'plugin', 'dsh-bg-atelier-official'), authUrl, startedAt: new Date().toISOString(), prodSettingsHashAtVerify: prodHash }
   writeFileSync(INSTANCE_JSON, JSON.stringify(inst, null, 2), 'utf8')
   console.log('  → 已写 ' + INSTANCE_JSON)
   console.log('  绑定用：')

@@ -203,5 +203,49 @@ console.log('\n— ③ pinAnimations：部分失败 / 宿主动画充数 / 插�
   }
 }
 
+// ─────────────────────────────────────────────────── ④ 进程归属判定（清扫不得误杀别的实例）
+console.log('\n— ④ processOwnership：证明不了归属就不许杀（审核方 review-process-cleanup）—')
+{
+  const root = mkdtempSync(path.join(tmpdir(), 'iso-own-'))
+  const tree = path.join(root, 'poc5')
+  const prof = path.join(tree, 'browser-profile')
+  const gallery = path.join(tree, 'home', 'dsh-bg-atelier', 'wallpapers')
+  mkdirSync(gallery, { recursive: true })
+  mkdirSync(prof, { recursive: true })
+
+  const src = sliceFn('tools/iso-instance.mjs', 'function insideTree') + '\n' +
+    sliceFn('tools/iso-instance.mjs', 'function processOwnership')
+  const own = new Function('path', 'existsSync', 'realpathSync', 'ROOT',
+    src + '\nreturn processOwnership')(path, existsSync, realpathSync, tree)
+
+  // 审核方的反例：**另一个项目**的浏览器占同一个 CDP 端口，命令行里也有 "browser-profile" 字样
+  const foreign = '"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="D:\\another-project\\browser-profile" --remote-debugging-port=19512'
+  const vForeign = own('browser', { cmdline: foreign, port: 19512 }, tree)
+  ok('★★ 别的项目的浏览器（同端口、名字里也有 browser-profile）⇒ **判不属于本实例**',
+    vForeign.ours === false, vForeign.why)
+
+  const vOurs = own('browser', { cmdline: '"chrome.exe" --user-data-dir="' + prof + '" --remote-debugging-port=19512', port: 19512 }, tree)
+  ok('★ 本实例 profile 的完整路径 ⇒ 判属于本实例', vOurs.ours === true, vOurs.why)
+
+  const vNoProf = own('browser', { cmdline: '"chrome.exe" --remote-debugging-port=19512', port: 19512 }, tree)
+  ok('★ 拿不到 profile 路径 ⇒ 判不属于（不猜）', vNoProf.ours === false, vNoProf.why)
+
+  // 宿主：光有端口不够，必须活体探针的图库落点在本隔离根内
+  const vHostNoProbe = own('host', { cmdline: '"DeepSeek Harness.exe" web --port 19412', port: 19412 }, tree)
+  ok('★ 宿主：只有端口、没有落点证据 ⇒ 判不属于', vHostNoProbe.ours === false, vHostNoProbe.why)
+  const vHostForeign = own('host', { cmdline: '"DeepSeek Harness.exe" web --port 19412', port: 19412, galleryDir: 'C:\\production-gallery', galleryWritableDir: 'C:\\production-gallery' }, tree)
+  ok('★ 宿主：落点在别的目录 ⇒ 判不属于', vHostForeign.ours === false, vHostForeign.why)
+  const vHostOurs = own('host', { cmdline: '"DeepSeek Harness.exe" web --port 19412', port: 19412, galleryDir: gallery, galleryWritableDir: gallery }, tree)
+  ok('★ 宿主：端口匹配 + 落点在本隔离根内 ⇒ 判属于', vHostOurs.ours === true, vHostOurs.why)
+
+  // PID 复用防护：记录里的创建时间对不上 ⇒ 不许杀（`sameMoment` 是这段判据的核心）
+  const f = new Function(sliceFn('tools/iso-instance.mjs', 'function sameMoment') + '\nreturn sameMoment')()
+  ok('★ 同一时刻（差 0.6 秒）⇒ 认为 PID 还是那个进程', f('2026-10-12T22:42:56.897Z', '2026-10-12T22:42:57.500Z') === true)
+  ok('★ 创建时间差很远 ⇒ 判 PID 已被复用（不杀）', f('2026-10-12T22:42:56.897Z', '2026-10-12T23:30:00.000Z') === false)
+  ok('★ 创建时间拿不到（null）⇒ 判对不上（不杀）', f(null, '2026-10-12T22:42:56.897Z') === false)
+
+  rmSync(root, { recursive: true, force: true })
+}
+
 console.log('\n三项修复回归：' + pass + ' 通过 / ' + fail + ' 失败')
 process.exit(fail === 0 ? 0 : 1)
