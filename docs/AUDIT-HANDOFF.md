@@ -6,6 +6,31 @@
 
 ---
 
+## 零、**当前状态（本节是唯一有效的"现在"）**
+
+> 本文件是**台账**：下面 §一～§十二 是按轮次追加的历史，**保留原样**（含当时的错判）。
+> 凡与本节冲突的，以本节与 §十三 为准；历史结论被撤回的地方在 §十三 里逐条标注"原文/替代证据"。
+
+**状态：待复审。** 三项已独立复现的缺陷**未修**（列在 §六 第 0 组，也在 §十三）。
+
+| 绑定项 | 值 |
+|---|---|
+| 当前提交 | `c7bb8f8`（第十六～十七轮文档同步前的最新提交） |
+| 送审简报 | `docs/REVIEW-BRIEF-r17.md`（副本 `D:\ChatGPT\review-brief-r17.md`） |
+| 当前基准 | **`iso-r10`**（隔离实例；不是生产基准 `audit-r28/r29`） |
+| 隔离实例 | 根 `D:\DeepSeek\dsh-iso\poc5`；宿主/浏览器端口 `19412` / CDP `19512` |
+| 插件副本哈希 | `client.js` `449db767ac6a…`、`index.js` `81596cea1c71…` —— 与仓库文件**逐字节一致**（已核对） |
+| 三次重启证据 | `D:\DeepSeek\iso-evidence\r10-restart-{1,2,3}.log`（宿主 PID 14728/14064/15900、浏览器 PID 11476/19084/7464；每次 `8 一致 / 0 差异 / 0 尺寸不符`、exit 0） |
+| 差异定位证据 | `D:\DeepSeek\iso-evidence\diff-01-iso-r2-vs-iso-r3.png` |
+| 覆盖口径真源 | 约定 `docs/ACCEPTANCE-CONTRACT.md` **§零之六「能验 / 不能验」** |
+| 本轮反例脚本 | `D:\ChatGPT\review-r17-counterexamples.mjs`（我独立复跑：**4/4 复现**） |
+
+**这一轮验证到的（可复跑）**：`npm test` 语法门禁 18/18 · 套件 21/21；
+几何 52 通过 / 0 失败；入口级 20 通过 / 0 失败；隔离实例一条命令（默认步骤）16 通过 / 0 失败；
+`iso-r10` 三次完整重启各 8/8；覆盖审计 38/38；A 级真实样式坏例 4 条（含动效节点缺失）全部被检出。
+
+---
+
 ## 一、台账更正（上一轮的错）
 
 上一轮我标题写"7 个提交"、正文列 8 个。准确计数：
@@ -159,6 +184,39 @@ resolve 时才 abort"这条真实竞态。补上两条后，同一变异使套�
 
 ## 六、仍未解决的（**不以连过抵消**）
 
+### 0. **本轮新增的三项待修**（P1/P1/P2；均已由审核方的反例脚本独立复现，**未修**）
+
+> 反例脚本：`node D:\ChatGPT\review-r17-counterexamples.mjs` —— 我复跑得到 **4/4 复现**
+> （`pipeline-exception-reports-success` / `external-gallery-passes-isolation-gate` /
+> `sibling-directory-passes-containment` / `animation-freeze-failure-is-accepted`）。
+> 三条都属于既有的"**前提失败不出绿**"要求，**不需要扩大验收范围**。
+
+**0.1 [P1] 验收中止仍退出成功**（`tools/iso-instance.mjs` 的 `run()` catch 分支，L614 一带）
+- 现象：底图准备抛错后，总控打印"中止"，最终仍报 `8 通过 / 0 失败`、**exit=0**，而真正的验收步骤
+  一步都没跑。
+- 根因：`catch` 只 `console.error('中止')`，**没有把失败写进结果**；末尾的退出码只看
+  `results.filter(r => !r.ok).length` ⇒ 异常本身不计入失败；**未执行的必测项也没有列为"未测"**。
+- 要改成：异常计入失败；按 `--steps` 声明的必测项，未执行的**逐项列为未测**；有未测或异常 ⇒ 非零退出。
+
+**0.2 [P1] 隔离门槛弱于简报所述**
+- 现象 A（`external-gallery-passes-isolation-gate`）：插件图库指向外部目录（`C:\production-gallery`）
+  仍能通过隔离证明。
+- 现象 B（`sibling-directory-passes-containment`）：根 `…\poc5`，而 `…\poc5-other\settings`
+  被判定"在根内"。
+- 根因：`run()` 里只核了**图库目录**（`writableDir`）、**没核设置目录**（`verify` 子命令那份核了两个
+  ⇒ 两处口径不一致）；且判定是**字符串前缀** `path.resolve(p).startsWith(ROOT)` ⇒ 相邻目录
+  （`poc5-other`）会通过；**没有解析 junction/符号链接**（真实环境里图库本身就是 Junction）。
+- 要改成：**同时核对两个实际目录**；`realpath` 解析链接后判定；用**路径段**比较（或
+  `path.relative` 不以 `..` 开头）而不是裸前缀；落点必须位于隔离树内，否则拒绝继续。
+
+**0.3 [P2] 固定相位失败被计为成功**（`tools/visual-baseline.mjs` 的 `pinAnimations`，L842 一带）
+- 现象（`animation-freeze-failure-is-accepted`）：诊断值为 `pinned=1, fail=1`，函数仍返回成功。
+- 根因：`for(...){ try{...}catch(e){fail++} n++ }` —— `n`（返回为 `pinned`）统计的是**尝试数**，
+  不是**成功数**；判定 `total > 0 && pinned > 0` 因此对"部分失败"也放行；且**没有确认被钉住的动画
+  属于插件自己**（宿主动画可以充数）。
+- 要改成：`pinned` 只统计**成功**；`fail > 0` 即判失败；额外要求插件自身的动画（`.bga-*` 元素上的
+  `getAnimations()`）确实存在且已暂停 —— 宿主动画不算。
+
 ### 1. 偶发失败（第 3 次，未复现）
 
 某轮连跑 5 次时第 3 次失败，之后 5 次全过。**保持未解决**。
@@ -209,11 +267,13 @@ resolve 时才 abort"这条真实竞态。补上两条后，同一变异使套�
 ```powershell
 # ① 底图插件：离线验收（不需要 GUI/浏览器）
 cd E:\dsh-plugins\dsh-bg-atelier-official; npm test
-#   → 语法门禁 18/18 · 套件 18/18
+#   → 语法门禁 18/18 · 套件 21/21
+cd E:\dsh-plugins\dsh-bg-atelier-official; node tools/verify-oracle-geometry.mjs
+#   → 几何 52 通过 / 0 失败（含 4 条"不许回落写死常量"的源码门禁）
+cd E:\dsh-plugins\dsh-bg-atelier-official; node tools/verify-oracle-entry.mjs
+#   → 入口级 20 通过 / 0 失败（假 CDP 桩 + 真退出码）
 cd E:\dsh-plugins\dsh-bg-atelier-official; node tools/verify-we-source-async.mjs
 #   → 41 项（含调用方隔离 8 项 + abort 竞态 2 项）
-cd E:\dsh-plugins\dsh-bg-atelier-official; node tools/audit-oracle-coverage.mjs audit-20261007
-#   → 15 项（需 baselines/<名字>/；名字按实际存在的基准填）
 
 # ② 另两个仓库
 cd E:\dsh-plugins\dsh-browser-live; npm test
@@ -222,8 +282,14 @@ cd E:\dsh-plugins\dsh-WE-library; npm test
 #   → 语法门禁 6/6 · 套件 3/3
 
 # ③ 视觉 oracle（**额外**需要：GUI 在 127.0.0.1:19387 跑着 + 浏览器已连 CDP）
-cd E:\dsh-plugins\dsh-bg-atelier-official; node tools/visual-baseline.mjs compare audit-20261007
-#   → 期望 3/3 diff=0、exit=0；exit=3 表示页面 fetch 通道挂了（重启浏览器）
+cd E:\dsh-plugins\dsh-bg-atelier-official; node tools/visual-baseline.mjs compare audit-r28
+#   → 期望 8 一致 / 0 差异、exit=0；exit=3 表示页面 fetch 通道挂了（重启浏览器）
+
+# ④ 隔离实例：一条命令跑完（**已准备环境**下无需再次传入凭据）
+cd E:\dsh-plugins\dsh-bg-atelier-official; node tools/iso-instance.mjs run `
+  --name poc5 --root D:\DeepSeek\dsh-iso\poc5 --port 19412 --cdp 19512 `
+  --baseline iso-r10 --steps selftest,compare,mutate,audit
+#   → 16 通过 / 0 失败（默认步骤；--repeat N 只在**同一环境内**连跑 compare，不等于重启）
 ```
 
 **命令不是纯离线的**：③ 依赖一个正在跑的 DSH GUI 与会话里的浏览器。① 里的 oracle 审计只依赖
@@ -463,3 +529,66 @@ selftest：15/15   覆盖审计：15/15   入口级：20/20   几何级：17/17
 - 原始基准已丢 ⇒ 不能声称"证明行为等价"。
 - 动效层被冻结 ⇒ 动画本身靠功能验证，不靠像素。
 
+
+---
+
+## 十三、第十三～十七轮（本轮同步；**当前状态 = 待复审**）
+
+> 历史段落一律**保留原样**（含当时的错判）。本节只做三件事：**绑定证据**、**标注撤回**、
+> **列未解决**。能被 §零 与约定 `docs/ACCEPTANCE-CONTRACT.md` §零之六 覆盖的，这里只给指针。
+
+### 13.1 本轮已验证的进展（都有提交与可复跑命令）
+
+| 进展 | 提交 | 证据 |
+|---|---|---|
+| 独立反例 6/6 复现并修掉（并发写、读写判据不一致、边界四条假绿、capture 无收尾边界） | `d662de8` | `verify-host-settings-io.mjs` 39 项；审核方脚本 4 条不再复现 |
+| 建立**隔离验收实例**（独立 DSH_HOME/端口/浏览器 profile/插件副本） | `f4efdf1` `7611ec0` | 隔离证明 + 生产哈希不变；`poc1`/`poc5` |
+| 新保护真机取证（生产 `GET` 带 `x-bga-settings-status: ok`）+ 隔离实例跑完整保护链 | `7611ec0` | 隔离实例：半截 JSON ⇒ `corrupt`／`PUT` ⇒ **409**／坏文件未被覆盖／`allow-overwrite` 才放行 |
+| `run`：**一条命令跑完**隔离验收（宿主为本进程子进程） | `128cf49` `db69014` | 全新根 16 通过 / 0 失败 |
+| 空转对照抓到"跨会话不可复现"，并**定位根因** | `fb0c779` `0284f40` | 差异定位图 + `--force-color-profile=srgb` 的 A/B |
+| `02-fx-nodes` 从**假覆盖**改成真覆盖（真实节点 + 固定时间点采样） | `6d4ea07` `da0263b` | 探针实测 19 fly / 14 star / 2 meteor；坏例"`DockFx` 返回 null"被检出 |
+| 去掉对密钥环境变量的依赖 | `08265fe` | 已准备环境下 16 通过 / 0 失败 |
+| 写死与静默兜底全部拿掉（几何/掩膜运行时实测）+ 4 条源码门禁 | `e4e5c9b` `9ac2ba4` | 几何 52/0（含门禁）；`iso-r10` 实测掩膜为空/由倍率推出 |
+| 约定重排 + 「能验 / 不能验」立为单一真源 | `ceb8978` `c7bb8f8` | 约定 §零之六 |
+| 三次完整重启（同基准 `iso-r10`） | —（证据文件未入库） | `D:\DeepSeek\iso-evidence\r10-restart-{1,2,3}.log`；宿主 PID 14728/14064/15900 |
+
+### 13.2 撤回的结论（原文 → 替代证据）
+
+1. **"Windows Job 会回收宿主"**（我曾写进约定"零之五之二"与简报 §2/§6）
+   → **撤回机制断言**。已观察到的现象：宿主在同一次工具调用内能长期存活，而**跨调用**会结束；
+   已确认的原因：**我的判活探针写错**（先请求 CDP 专用路径 `/json/version`，DSH web 端口返回 404
+   ⇒ `fetch` 不抛异常 ⇒ 判"没在听"、永不回退 `/`），于是脚本**自己把宿主杀掉**。
+   其余机制**保持未知**，不再写成"Job 回收"这种确定教训。
+2. **"跨会话不可复现的根因是动效相位没冻结"**
+   → **撤回**（审核方以三条证据驳回）。替代证据：单变量定位后，**只加 `--force-color-profile=srgb`**
+   即让两次独立会话 **8/8 字节完全相同**。**且措辞进一步收紧**：这只支持"本机固定色彩配置后恢复稳定"，
+   **不足以证明**故障机制就是"启动时采样显示器配置"；Chromium 文档说明该参数强制使用指定色彩配置，
+   替代系统报告的当前显示器配置 → [Chromium flag 说明](https://chromium.googlesource.com/chromium/src/%2B/9b7ec72b5c5b40ebfc797520406b881228f827f7/chrome/browser/flag_descriptions.cc)。
+   换机器/浏览器需**重做空转对照**。
+3. **"零密钥"**（简报原文）→ 改为"**已准备环境下无需再次传入凭据**"。环境变量只是**传递方式**，
+   **不能**据此声称"避免明文落盘"——应用自己会写凭据文件（写在隔离 home，仓库外）。
+4. **"`--repeat 3` 代表三次重启"** → **不成立**：它只在**同一进程生命周期内**连跑 compare。
+   三次完整重启的正式证据见 §13.1 末行（`r10-restart-*.log`，宿主/浏览器 PID 各不相同）。
+5. **"01/02 只覆盖 orb 周围一条带"**（约定 §三 与 12.7）
+   → 措辞过期：现在**仍然用侧栏带**的是 **01 / 05 / 06**；**02 已改锚到宿主 composer 画布**
+   （`hostKind:'fx'`）。约定 §三 已同步。
+
+### 13.3 未解决（本轮新增三项 + 历史遗留）
+
+**新增（P1/P1/P2，均已独立复现，未修）**：见 §六 第 0 组 —— ① 中止仍 exit 0；
+② 隔离门槛（双目录 + 链接解析 + 路径段判定）；③ 固定相位把"部分失败"计为成功。
+
+**历史遗留（仍未解决，不以连过抵消）**：§六 第 1～3 条（偶发失败、三个无法自证字段、2c-2 实时链路）
+＋ 约定 §零之六「不能验」全部 9 条（动效运动过程、缩略图位图、别名层 2/3/4、
+`glass`/`styles`/`imageFraming` 组合、大图壁纸区、Edge、真实大批量图库、运行期性能、历史等价）。
+
+**审核方对我 5 个开放问题的答复已收到**（`D:\ChatGPT\review-r17.md` §5），逐条对照见送审简报
+`docs/REVIEW-BRIEF-r17.md` §10；其中"三次重启应成为**必做项**"与"把首次引导/凭据/会话准备
+写进正式前提清单"两条，我已按答复改了措辞，**执行上的改动（把三次重启做成强制流程、
+门禁改为调用真实函数的坏例）列入待办**。
+
+### 13.4 审核方指出的文档问题（已在本轮修掉）
+
+- 约定 §三 的"01/02 只覆盖 orb"与新 02 冲突 → 已改为 **01/05/06**；
+- 简报里 `iso-r10` 的"三次重启"缺证据 → 已补 `r10-restart-{1,2,3}.log`（并标明此前那三份日志是 `iso-r9`）；
+- `--repeat 3` / "零密钥" / sRGB 机制 三处措辞 → 已收紧（见 §13.2）。
