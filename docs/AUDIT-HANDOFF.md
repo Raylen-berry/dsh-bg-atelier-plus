@@ -11,22 +11,24 @@
 > 本文件是**台账**：下面 §一～§十二 是按轮次追加的历史，**保留原样**（含当时的错判）。
 > 凡与本节冲突的，以本节与 §十三 为准；历史结论被撤回的地方在 §十三 里逐条标注"原文/替代证据"。
 
-**状态：待复审。** 三项已独立复现的缺陷**未修**（列在 §六 第 0 组，也在 §十三）。
+**状态：可交付**（2026-10-12 用户按"看当前使用体验"确认配置符合期望；停止点三条件均已满足）。
+验收工具的**新一轮修复（三项缺陷 + 设置路径出口）仍标"待复审"**；三项缺陷**已修**（见 §六 第 0 组）。
 
 | 绑定项 | 值 |
 |---|---|
-| 当前提交 | `c7bb8f8`（第十六～十七轮文档同步前的最新提交） |
+| 当前提交 | `d266466`（三项缺陷 + 设置路径出口 + 文档同步；此前的送审时点是 `c7bb8f8`） |
 | 送审简报 | `docs/REVIEW-BRIEF-r17.md`（副本 `D:\ChatGPT\review-brief-r17.md`） |
 | 当前基准 | **`iso-r10`**（隔离实例；不是生产基准 `audit-r28/r29`） |
 | 隔离实例 | 根 `D:\DeepSeek\dsh-iso\poc5`；宿主/浏览器端口 `19412` / CDP `19512` |
 | 插件副本哈希 | `client.js` `449db767ac6a…`、`index.js` `81596cea1c71…` —— 与仓库文件**逐字节一致**（已核对） |
-| 三次重启证据 | `D:\DeepSeek\iso-evidence\r10-restart-{1,2,3}.log`（宿主 PID 14728/14064/15900、浏览器 PID 11476/19084/7464；每次 `8 一致 / 0 差异 / 0 尺寸不符`、exit 0） |
+| 三次重启证据 | 修前 `docs/evidence/r10-restart-{1,2,3}.log`（宿主 PID 14728/14064/15900）；**修后** `docs/evidence/r10-postfix-restart-{1,2,3}.log`（宿主 PID 9432/15036/4052）；原件在 `D:\DeepSeek\iso-evidence\`（宿主 PID 14728/14064/15900、浏览器 PID 11476/19084/7464；每次 `8 一致 / 0 差异 / 0 尺寸不符`、exit 0） |
 | 差异定位证据 | `D:\DeepSeek\iso-evidence\diff-01-iso-r2-vs-iso-r3.png` |
 | 覆盖口径真源 | 约定 `docs/ACCEPTANCE-CONTRACT.md` **§零之六「能验 / 不能验」** |
 | 本轮反例脚本 | `D:\ChatGPT\review-r17-counterexamples.mjs`（我独立复跑：**4/4 复现**） |
 
-**这一轮验证到的（可复跑）**：`npm test` 语法门禁 18/18 · 套件 21/21；
-几何 52 通过 / 0 失败；入口级 20 通过 / 0 失败；隔离实例一条命令（默认步骤）16 通过 / 0 失败；
+**这一轮验证到的（可复跑）**：`npm test` 语法门禁 18/18 · 套件 **22/22**；
+几何 52 通过 / 0 失败；入口级 20 通过 / 0 失败（封闭化后连跑两轮稳定）；
+隔离硬化套件 `verify-iso-hardening.mjs` **27 通过 / 0 失败**；隔离实例一条命令（默认步骤）**24 通过 / 0 失败 / 0 未测**；
 `iso-r10` 三次完整重启各 8/8；覆盖审计 38/38；A 级真实样式坏例 4 条（含动效节点缺失）全部被检出。
 
 ---
@@ -186,7 +188,7 @@ resolve 时才 abort"这条真实竞态。补上两条后，同一变异使套�
 
 ### 0. **本轮三项缺陷：已修**（P1/P1/P2；均已由审核方的反例脚本独立复现后用真实函数坏例钉住）
 
-> 修法见约定 §零之五之六；回归套件 `tools/verify-iso-hardening.mjs`（**19 项，已进 CI**）。
+> 修法见约定 §零之五之六；回归套件 `tools/verify-iso-hardening.mjs`（**27 项，已进 CI**）。
 > 另抓到并修掉**第四个**（同一家族）：入口套件不封闭 ⇒ 偶发 exit 6，见本节 0.4。
 
 > 反例脚本：`node D:\ChatGPT\review-r17-counterexamples.mjs` —— 我复跑得到 **4/4 复现**
@@ -312,7 +314,7 @@ cd E:\dsh-plugins\dsh-bg-atelier-official; node tools/visual-baseline.mjs compar
 cd E:\dsh-plugins\dsh-bg-atelier-official; node tools/iso-instance.mjs run `
   --name poc5 --root D:\DeepSeek\dsh-iso\poc5 --port 19412 --cdp 19512 `
   --baseline iso-r10 --steps selftest,compare,mutate,audit
-#   → 16 通过 / 0 失败（默认步骤；--repeat N 只在**同一环境内**连跑 compare，不等于重启）
+#   → 24 通过 / 0 失败 / 0 未测（默认步骤；--repeat N 只在**同一环境内**连跑 compare，不等于重启）
 ```
 
 **命令不是纯离线的**：③ 依赖一个正在跑的 DSH GUI 与会话里的浏览器。① 里的 oracle 审计只依赖
@@ -573,7 +575,7 @@ selftest：15/15   覆盖审计：15/15   入口级：20/20   几何级：17/17
 | 去掉对密钥环境变量的依赖 | `08265fe` | 已准备环境下 16 通过 / 0 失败 |
 | 写死与静默兜底全部拿掉（几何/掩膜运行时实测）+ 4 条源码门禁 | `e4e5c9b` `9ac2ba4` | 几何 52/0（含门禁）；`iso-r10` 实测掩膜为空/由倍率推出 |
 | 约定重排 + 「能验 / 不能验」立为单一真源 | `ceb8978` `c7bb8f8` | 约定 §零之六 |
-| 三次完整重启（同基准 `iso-r10`） | —（证据文件未入库） | `D:\DeepSeek\iso-evidence\r10-restart-{1,2,3}.log`；宿主 PID 14728/14064/15900 |
+| 三次完整重启（同基准 `iso-r10`） | `d266466`（修后复跑） | 仓库内 `docs/evidence/r10-postfix-restart-{1,2,3}.log`（宿主机 PID 9432/15036/4052）；修前那份在 `docs/evidence/r10-restart-{1,2,3}.log`；宿主 PID 14728/14064/15900 |
 
 ### 13.2 撤回的结论（原文 → 替代证据）
 
